@@ -1,3 +1,12 @@
+Dameng JDBC driver (com.dameng:DmJdbcDriver18:8.1.3.140)
+https://gitee.com/dmedu/dm-jdbc-jars
+
+The published Maven POM declares the Apache License, Version 2.0:
+https://repo.maven.apache.org/maven2/com/dameng/DmJdbcDriver18/8.1.3.140/DmJdbcDriver18-8.1.3.140.pom
+The license text is included in LICENSE.txt in this distribution.
+
+====================================================================
+
 https://github.com/protocolbuffers/protobuf/blob/master/LICENSE
 Copyright 2008 Google Inc.  All rights reserved.
 
@@ -3231,4 +3240,3 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
 Version 1.0
 
 Last updated:  28 June 2022
-

@@ -1,0 +1,391 @@
+= Debezium connector for Dameng
+
+The {prodname} connector for Dameng captures changes from a DM8 database through `DBMS_LOGMNR`, connecting either to one server or to the writable primary of a configured primary/standby pair.
+It uses JDBC for table metadata and the initial snapshot, and mines archived redo logs for subsequent changes.
+The connector runs one task and publishes the standard {prodname} change event envelope.
+
+This connector has been tested with DM8 build `08134283904-20220804-166351-20005` in native compatibility mode, using `DmJdbcDriver18` version `8.1.3.140`.
+Other DM8 builds require validation of their JDBC metadata and LogMiner output.
+Oracle XStream, Oracle RAC, pluggable databases, OpenLogReplicator, and Oracle flashback queries are not supported.
+The implementation follows the https://eco.dameng.com/document/dm/zh-cn/pm/dbms_logmnr-package.html[Dameng DBMS_LOGMNR documentation].
+
+== Preparing the database
+
+For a DBA checklist with verification SQL, account grants and primary/standby checks, see xref:connectors/dameng-database-setup.adoc[Dameng database configuration].
+
+Enable local archive logging and logical redo logging before starting the connector.
+Use `RLOG_APPEND_LOGIC=2` so that update and delete records contain the non-LOB values required to reconstruct row images.
+Set `RLOG_IGNORE_TABLE_SET=1` so logical logging also covers captured tables created after the connector starts.
+On DM versions that expose `RLOG_LLOG_COMPRESS`, set it to `0` so LogMiner can provide complete INSERT values.
+Older versions without this parameter are accepted.
+Use `COMPATIBLE_MODE=0`; other compatibility modes change data type semantics and are rejected.
+The connector also requires `LENGTH_IN_CHAR=0`, the verified native byte length mode.
+Other or unknown length modes are rejected because historical DDL does not identify the original session's default character length semantics.
+Some logging parameter changes require a database restart.
+Follow the instructions for your DM8 version in the https://eco.dameng.com/document/dm/zh-cn/pm/logmnr-interface-instructions.html[Dameng LogMiner documentation].
+
+The connector account must be able to read the captured tables and their metadata, acquire shared table locks, query the relevant dynamic views, and execute `DBMS_LOGMNR`.
+Database administrators must configure and retain archived logs for the connector.
+The connector does not enable archive logging or change database parameters automatically.
+
+A dedicated account can capture changes without the `DBA` role.
+The following permission set has been verified against the DM8 build listed above for JDBC metadata, shared snapshot locks, and LogMiner operations:
+
+[source,sql]
+----
+GRANT SOI TO CDC_USER;
+GRANT VTI TO CDC_USER;
+GRANT EXECUTE ON DBMS_LOGMNR TO CDC_USER;
+GRANT SELECT ON APP.CUSTOMERS TO CDC_USER;
+GRANT SELECT ON APP.ORDERS TO CDC_USER;
+----
+
+An administrator creates the account and applies these grants; newly created DM users have `CREATE SESSION` by default unless that permission is revoked.
+`SOI` permits reads of non-security/non-audit system tables, including the object and constraint catalogs used by the connector.
+`VTI` permits reads of system dynamic views, including the runtime and LogMiner views.
+These are broader catalog read roles, not proof of an absolute minimum permission set.
+The tested server rejects direct object-level grants on `SYS.SYSOBJECTS` and `SYS.SYSCONS`; granting `DBA` or `SELECT ANY TABLE` is unnecessary for the verified workflow.
+Grant `SELECT` explicitly for each captured business table, including newly added tables; source signaling also requires the permissions needed to write its signal and watermark rows.
+Refer to the https://eco.dameng.com/document/dm/zh-cn/pm/discretionary-access-control.html[DM discretionary access control documentation] for role definitions and object grants, and validate privileges on the deployed DM version.
+
+Because Dameng LogMiner reads archived files, the delay before a log is archived also affects change event latency.
+Keep the archives that contain the connector's oldest required LSN until their changes have been processed.
+Deleting required archives prevents the connector from resuming safely.
+Plan archive retention for the oldest open transaction, processing lag, downstream outages, and recovery time.
+The connector checks archive coverage and database identity before mining; it does not reserve archive files or prevent their deletion.
+
+== Snapshots and transaction handling
+
+The initial snapshot acquires shared locks on the captured tables, reads the current log sequence number (LSN), then reads table schemas and rows.
+After choosing the LSN, it checks for newly created tables that match the snapshot filters.
+If it finds any, it locks those tables and chooses a new LSN before repeating the check; tables created after the final check are captured by streaming.
+Locks remain held until the snapshot transaction finishes, so concurrent writes to captured tables can wait for a long snapshot.
+The snapshot uses ordinary queries rather than Oracle `AS OF SCN` queries.
+`snapshot.max.duration.ms` sets a total snapshot budget, defaulting to 600000 milliseconds (10 minutes).
+The budget includes waiting for table locks, reading schemas and rows, and event queue waits when downstream delivery slows.
+On expiry, the connector interrupts the snapshot and requests JDBC connection abort to release its session and locks; the task fails instead of continuing the snapshot.
+In primary/standby mode, it checks the primary identity again before marking an initial snapshot complete. If a manual role change interrupts the snapshot, recovery starts a new snapshot on the eligible primary; rows already emitted from the interrupted attempt can be emitted again until the replacement snapshot completes.
+Allow enough time for the expected initial data volume before startup.
+Session termination and lock release depend on the JDBC driver and server; validate timeout behavior on the deployed DM version.
+`snapshot.max.threads` must remain `1`; parallel snapshot connections are rejected.
+
+Streaming emits changes only when their transaction commits.
+Delivery is at least once: a restart can replay changes whose offsets were not yet committed.
+A primary key update produces a delete and a create; recovery after the delete can repeat the delete before emitting the create.
+Kafka Connect exactly-once source support is not advertised by this connector.
+It discards rolled-back transactions and retains the earliest position needed to replay unfinished transactions after a restart.
+Offsets include the replay LSN, change LSN, commit LSN, and event sequence within a transaction.
+The LogMiner transaction identity is stored as `mining_transaction_id`, separately from the common transaction metadata state.
+Offsets also retain Dameng's database magic identifier.
+Single-server connections reject a changed database magic instead of applying an old LSN to a recreated or replaced database.
+Primary/standby connections additionally validate the database family and retained primary history before accepting a member with another magic, as described below.
+Log mining uses object identifiers and historical column positions rather than the current online dictionary, which can apply renamed columns or changed types to older redo.
+Snapshot schema history retains the object identifiers, and supported DDL updates the historical schema before subsequent DML is decoded.
+
+Each mining window reconstructs its transactions in memory before delivery.
+Long-running transactions keep the replay position pinned and can increase both memory consumption and repeated archive reads.
+`log.mining.batch.size` limits forward progress per iteration, but does not cap this retained transaction history.
+Two separate limits bound each complete mining window: `log.mining.buffer.max.bytes` defaults to 536870912 estimated bytes (512 MiB), and `log.mining.buffer.max.records` defaults to 1000000 input LogMiner rows.
+The budget includes all tables and transactions read in the window, transaction markers, discarded rollback rows, and SQL continuation pieces.
+Byte accounting estimates row and string storage and reserves additional space for continuation assembly; reservations are cumulative and are not refunded for discarded rows.
+This conservative accounting is not a measurement of live heap and does not include every JDBC, event queue or conversion allocation.
+
+Exceeding either limit fails the task before the incomplete window is published or its replay position advances.
+It does not drop a large transaction or skip its changes.
+Restarting with the same limits can fail again, so retain the required archives while resolving the capacity problem.
+A smaller mining window can reduce unrelated buffered work, but cannot remove the history needed by one open transaction.
+Increase limits only after sizing additional JVM heap, or reduce future transaction sizes at the source.
+Capacity failures require operator intervention; transaction data is not spilled to disk.
+`DamengLargeTransactionIT` exercises finite large-transaction correctness scenarios, including queue backpressure, an open transaction observed alongside other commits, full and savepoint rollback, and restart from a durable mid-transaction offset. It does not establish throughput, memory ceilings, or a supported maximum transaction size; disk-backed transaction buffers are not implemented.
+
+The connector also supports incremental snapshots requested through a source signal table.
+It reads primary-key ranges in chunks, removes snapshot rows superseded by streamed changes between chunk watermarks, and persists progress for restart recovery.
+Keep the table schema stable during an incremental snapshot.
+The connector requires `incremental.snapshot.allow.schema.changes=false` and rejects `true`.
+
+Create one signal table and set `signal.data.collection` to its schema-qualified name, for example `APP.DBZ_SIGNAL`.
+Multiple signal tables are not supported.
+The connector account needs permission to insert watermark records in that table:
+
+[source,sql]
+----
+CREATE TABLE APP.DBZ_SIGNAL (
+    ID VARCHAR(64) PRIMARY KEY,
+    TYPE VARCHAR(64),
+    DATA VARCHAR(2000)
+);
+INSERT INTO APP.DBZ_SIGNAL VALUES (
+    'customers-snapshot-1',
+    'execute-snapshot',
+    '{"type":"incremental","data-collections":["APP.CUSTOMERS"]}'
+);
+COMMIT;
+----
+
+== Configuration
+
+The following example captures `APP.CUSTOMERS` and `APP.ORDERS`:
+
+[source,json]
+----
+{
+  "name": "dameng-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.dameng.DamengConnector",
+    "tasks.max": "1",
+    "topic.prefix": "dameng",
+    "database.hostname": "dm.example.com",
+    "database.port": "5236",
+    "database.user": "CDC_USER",
+    "database.password": "${file:/secrets/dameng.properties:password}",
+    "database.dbname": "DAMENG",
+    "table.include.list": "APP.CUSTOMERS,APP.ORDERS",
+    "snapshot.mode": "initial",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "schema-changes.dameng"
+  }
+}
+----
+
+Schema and table filters match `schema.table`, without a database catalog prefix.
+Topic names use the configured prefix, schema, and table name.
+The password expression in this example requires the Kafka Connect file configuration provider.
+Dameng snapshot schema history currently contains the tables selected by the connector's data collection filters. `snapshot.include.collection.list` only limits which selected tables receive snapshot rows; it does not remove their schemas from history.
+The common `schema.history.internal.store.only.captured.tables.ddl` setting does not broaden Dameng history when set to `false`; storing DDL for every table outside the capture filters is not implemented. Dameng retains subsequent DDL for a table that was already captured and is then renamed out of the filter, so that a later rename back can be decoded.
+Offsets persist a versioned `capture_scope` signature for `database.include.list`, `database.exclude.list`, `schema.include.list`, `schema.exclude.list`, `table.include.list`, `table.exclude.list`, `table.ignore.builtin`, and `signal.data.collection`.
+Restart rejects any change to these settings, including narrowing a filter or rewriting a regular expression with equivalent meaning, because arbitrary expressions cannot establish that the retained historical definitions cover the new scope.
+The signature is independent of the current database catalog and remains present even when no captured tables exist.
+Changing these settings requires a new connector identity, a fresh schema history, and an initial snapshot; the connector never silently discards an existing offset to perform this migration.
+For Kafka Connect, use a new connector name and `topic.prefix`, and a new schema history topic; do not reuse or manually rewrite the old offsets.
+An offset written by an earlier version without `capture_scope` is also rejected and requires the same explicit migration, because its historical capture scope cannot be verified.
+Changing `snapshot.include.collection.list`, column filters, connection credentials, or polling settings does not change this signature.
+With unchanged capture filters, tables created while the connector is running or stopped, including dropped and recreated tables, are discovered through their captured DDL, provided the required archive logs remain available.
+If no historical definition is available, for example because the table was excluded when the snapshot was taken, renaming that table into the filter fails; initialize a fresh snapshot and schema history before capturing it.
+Snapshot history records named primary-key, unique, foreign-key, and check constraints from `SYS.SYSCONS` and `SYS.SYSOBJECTS`, so subsequent `DROP CONSTRAINT` statements can be replayed after restart without consulting the current table definition.
+Default event keys use declared primary keys only.
+A table with only a unique constraint or unique index has a null event key unless `message.key.columns` explicitly supplies one; the snapshot does not promote a unique index to a primary key that could become invalid when the index or constraint is dropped.
+Captured DDL with a missing or nonpositive `DATA_OBJ#` fails before modifying the historical schema or its offset.
+
+[cols="2,1,4",options="header"]
+|===
+|Property |Default |Description
+|`database.hostname` |No default |Resolvable host name or IP address. Required unless `database.failover.hosts` is configured.
+|`database.port` |`5236` |DM JDBC listener port.
+|`database.failover.hosts` |Empty |Comma-separated `host:port` endpoints for one DM primary/standby database, for example `dm-a.example.com:5236,dm-b.example.com:5236`. IPv6 uses `[address]:port`. Overrides `database.hostname` and `database.port`; connects only to an `OPEN PRIMARY`.
+|`database.dbname` |`DAMENG` |Database name reported in source metadata.
+|`database.connection.adapter` |`logminer` |Only the Dameng LogMiner adapter is supported.
+|`database.socket.timeout.ms` |`600000` |Positive network communication timeout in milliseconds, mapped to the DM JDBC `socketTimeout` property. The raw `database.socketTimeout` setting is rejected.
+|`database.query.timeout.ms` |`600000` |Nonnegative statement timeout in milliseconds. Positive values are rounded up to whole seconds, so values below 1000 still enable a timeout. `0` disables the statement timeout; the finite socket timeout and snapshot duration budget still apply.
+|`snapshot.mode` |`initial` |`initial` captures schemas and data on first startup; `initial_only` stops after the snapshot; `no_data` captures schemas and streams changes. `never` is a legacy alias for `no_data`.
+|`snapshot.include.collection.list` |All tables selected by `table.include.list` |Optional comma-separated regular expressions selecting which captured tables receive rows during an initial or resumed snapshot. Matching is against the complete `schema.table` name. The setting does not change streaming or incremental snapshot selection.
+|`snapshot.locking.mode` |`shared` |Shared locks protect the complete snapshot. Other locking modes are not supported.
+|`snapshot.max.duration.ms` |`600000` |Positive total initial snapshot budget in milliseconds, including lock waits, reads and event queue waits. Expiry fails the snapshot and requests connection abort.
+|`snapshot.max.threads` |`1` |Must remain `1`. Parallel snapshot connections are rejected.
+|`query.fetch.size` |`2000` |Number of LogMiner rows fetched per JDBC batch.
+|`log.mining.batch.size` |`1000` |Maximum LSN span by which the mining upper bound advances in an iteration. Replaying unfinished transactions can require reading a larger range.
+|`log.mining.buffer.max.bytes` |`536870912` |Positive cumulative estimated byte budget for one complete mining window, including all transactions and continuation assembly. Exceeding it fails the task without publishing a partial window. Additional JVM heap is required outside this budget.
+|`log.mining.buffer.max.records` |`1000000` |Positive input row budget per complete mining window. Counts transaction markers, discarded rows and continuation pieces, as well as DML. Exceeding it fails the task.
+|`signal.data.collection` |No default |Single schema-qualified source signal table used to request and coordinate incremental snapshots.
+|`incremental.snapshot.chunk.size` |`1024` |Maximum number of rows in an incremental snapshot chunk.
+|`incremental.snapshot.allow.schema.changes` |`false` |Must remain `false`; schema changes during incremental snapshots are not supported.
+|===
+
+The connector also uses the common {prodname} options for filters, decimal and temporal handling, queue sizes, polling, schema history, and event serialization.
+This connector currently implements only the snapshot modes listed above.
+Blocking snapshots, parallel initial-snapshot chunking and custom snapshotter implementations have not been implemented and validated for this connector; this is a connector limitation, not a claim that DM lacks the underlying database capabilities.
+Common configuration fields related to those workflows might appear in generated configuration metadata, but their presence does not establish Dameng connector support.
+Oracle-specific capture modes such as XStream are not Dameng capture mechanisms.
+
+Use `snapshot.select.statement.overrides` and `snapshot.select.statement.overrides.<schema.table>` to restrict the rows read by the initial snapshot.
+These predicates do not filter subsequent streaming events.
+Snapshot query construction delegates to the common snapshot query service, including a configured `snapshot.query.mode=custom` query implementation.
+
+[id="dameng-primary-standby-recovery"]
+== Primary/standby recovery without a virtual IP
+
+Configure `database.failover.hosts` with both members' reachable JDBC addresses when database administrators perform manual role changes without a virtual IP.
+The implementation is limited to single-instance members (`N_EP=1`), with a single writable primary and DM-managed synchronized archives.
+DMDSC, multiple writable primaries, reading changes from a standby, and arbitrary archive copying are outside this recovery model.
+Configure archive retention, replication and fencing through DM data guard before enabling CDC.
+Use the official https://eco.dameng.com/document/dm/zh-cn/pm/data-watch-overview.html[DM data guard description] for replication and archive identity semantics.
+
+For the example above, replace the single-host connection settings with:
+
+[source,json]
+----
+"database.failover.hosts": "dm-a.example.com:5236,dm-b.example.com:5236"
+----
+
+The connector uses the DM JDBC service-group address syntax and sets `loginMode=1`, `loginStatus=4`, `rwSeparate=0`, `autoReconnect=0`, `switchTimes=1`, and `switchInterval=200`.
+These settings select an open primary when establishing a connection and leave task recovery, offsets and schema history under connector control.
+Conflicting overrides through `database.*` or `driver.*`, transparent reconnect aliases, read/write separation, and alternate URL routing are rejected.
+Do not configure a driver to silently move an existing mining session to another member.
+
+The administrator or the separately configured DM management system performs switchover or takeover; the connector never promotes a standby, repairs replication, or fences another server.
+After a connection failure or a role change, the connector retries according to `errors.max.retries`, opens a new primary session and restores its acknowledged offset and schema history.
+Records not acknowledged before the interruption can be replayed.
+The endpoint list is not a split-brain detector: ensure the former primary cannot continue serving writes before promoting another member.
+
+For a planned manual switchover, first verify that the standby has applied the required redo and that both JDBC addresses remain reachable from the Connect workers.
+Perform the role change with DM's data-guard administration tools, then verify that exactly one member reports `PRIMARY` and `OPEN` in `V$INSTANCE` and that its realtime archive channel is healthy.
+Keep the configured endpoint list and the connector's offset and schema-history stores intact while it reconnects.
+Monitor task status, archive retention and the resumed `OldestReplayLsn`; already published records may be delivered again after recovery.
+
+For an unplanned primary failure, isolate the former primary from writes and use the administrator's normal, non-forced takeover procedure only after confirming that the standby has applied the changes needed for recovery.
+If no open primary is available during the manual procedure, the task retries within its configured retry policy.
+If the new primary is behind the acknowledged offset, its open history is missing, or its archive chain is inconsistent, the connector stops instead of silently resetting the offset.
+Investigate the source and downstream state before starting a new connector identity and snapshot; do not treat a forced, potentially lossy takeover as an already verified recovery path.
+
+Recovery requires the same `PERMANENT_MAGIC`, a retained `SYS.SYSOPENHISTORY` anchor matching the stored `database_magic`, a continuous previous-primary identity chain, and every intervening open record's applied LSN at or beyond the stored replay/change/commit positions.
+The current primary must also have reached those positions.
+Offsets persist `permanent_magic` and `primary_open_guid`; the connector refreshes the verified primary history while mining and abandons a window if its open anchor changes before publication.
+A newly promoted server's higher current LSN alone does not prove that it received the former primary's acknowledged changes.
+
+DM retains at most 128 open-history records.
+Recovery stops if the required anchor has rotated away, if timestamps make history ordering ambiguous, if applied LSNs regress in that order, or if database lineage is inconsistent.
+Synchronize database clocks and monitor archive retention and primary-open churn.
+Such failures require investigation and source/downstream reconciliation before establishing a new snapshot; repeatedly changing the offset cannot make divergent history safe.
+An existing single-server offset without the primary/standby anchor cannot be upgraded by adding `database.failover.hosts` alone.
+Use a new connector name, topic prefix and schema-history topic with a fresh initial snapshot before enabling this mode.
+
+For archives, `DB_MAGIC` identifies the local writer and `SRC_DB_MAGIC` identifies the member that generated the redo; the two can differ on a member that received replicated logs.
+The connector verifies the database family, source-primary range and complete file boundaries, requires retained coverage and rejects overlapping file ranges beyond a shared inclusive endpoint.
+Do not manually mix archives from old branches or other database copies.
+These checks complement DM's managed archive consistency; they do not authenticate an arbitrary collection of manually assembled files.
+
+== Monitoring
+
+The streaming MBean uses the common name `debezium.dameng:type=connector-metrics,context=streaming,server=<topic.prefix>`, with any configured custom metric tags.
+It includes the common queue, connection and event metrics, plus these Dameng attributes:
+
+[cols="2,4",options="header"]
+|===
+|Attribute |Meaning
+|`WindowBufferEstimatedBytes`, `PeakWindowBufferEstimatedBytes` |Current or most recently sampled cumulative window byte reservation, and its peak since metric reset. Updated every 1024 input rows and when a scan ends. These values are estimates, not live JVM heap usage.
+|`WindowBufferRecords`, `PeakWindowBufferRecords` |Input LogMiner rows in the current or most recently sampled window, and the peak since reset. Includes markers, discarded rows and continuation pieces.
+|`OpenTransactions` |Transactions still requiring replay in the buffer observed when the most recent scan completed, failed or was interrupted. It is not recalculated for every row.
+|`OldestReplayLsn` |Oldest position retained for replay. A long-running transaction can keep it unchanged while later transactions commit.
+|`ScannedUpperLsn` |Upper LSN of the completed scan.
+|`LatestArchivedLsn` |Most recently observed upper archived LSN. It does not include redo still awaiting archival.
+|`BufferLimitFailures` |Window capacity failures since reset. A failed task requires intervention before it can make progress beyond the same capacity boundary.
+|`LastMiningDurationMillis`, `MaxMiningDurationMillis` |Last scan attempt duration and the maximum since reset, including LogMiner setup, JDBC fetch, transaction reconstruction and mining-session cleanup. Excludes later DML parsing, dispatch and downstream acknowledgement.
+|===
+
+Compare replay progress with archive retention and monitor increasing buffer reservations and mining duration.
+These metrics do not prevent log deletion or replace JVM heap and database session monitoring.
+Separate redo reread amplification, parsing and dispatch timing, and archive-wait duration are not yet measured; the attributes do not constitute a complete performance profile.
+They belong to the task lifecycle and reset when a new metrics instance starts or its JMX `reset` operation is invoked.
+
+== Data types
+
+Fixed precision `DECIMAL(p,s)`, `NUMERIC(p,s)`, and `NUMBER(p,s)` use the common decimal mapping and retain their declared scale.
+With `decimal.handling.mode=precise`, an unconstrained `NUMBER` or `NUMERIC` uses `io.debezium.data.VariableScaleDecimal` so that each value can retain its own scale.
+The `string` and `double` decimal modes also apply to these types.
+`CHAR` and `NCHAR` values retain their fixed-length space padding.
+In the supported native byte length mode, the connector uses the historical column byte length and the database character set to reconstruct padding omitted from LogMiner output.
+`TIMESTAMP WITH TIME ZONE` uses `io.debezium.time.ZonedTimestamp`, preserving the instant and fractional seconds and normalizing its representation to UTC.
+Dameng JDBC can present the same stored instant in the session time zone while LogMiner emits the original literal's offset, so the original offset is not preserved.
+`TIME WITH TIME ZONE` uses `io.debezium.time.ZonedTime` and normalizes the time of day to UTC, wrapping at midnight without adding a date.
+
+Snapshots read complete `CLOB` and `BLOB` values.
+During streaming, inline LOB values are captured when LogMiner includes them in the redo statement.
+Dameng can emit `OUT_CLOB` or `OUT_BLOB` markers instead of out-of-row values, and omit LOB columns from before images.
+The connector represents those unavailable values with `unavailable.value.placeholder`, which defaults to `__debezium_unavailable_value`, rather than SQL `NULL`.
+For `BLOB`, the placeholder is encoded in UTF-8 and follows the configured binary handling mode.
+Explicit SQL `NULL` values remain null.
+
+Older DM8 builds, including the tested 2022 build, omit fractional seconds from LogMiner `TIME WITH TIME ZONE` literals even when JDBC snapshots retain them.
+Streaming cannot recover fractional digits absent from the log output.
+Types without a connector mapping, including native interval and complex object types, cause a schema error.
+Exclude those columns with `column.exclude.list`; the connector does not silently omit them.
+
+LogMiner temporal functions are decoded only with supported ISO formats such as `YYYY-MM-DD`, `YYYY-MM-DD HH24:MI:SS.FF6`, and `YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM`.
+The connector fails on unsupported expressions or formats instead of interpreting them with the JVM locale.
+
+== Building and testing
+
+Use the repository Maven wrapper with the build JDK required by the root POM (JDK 21 or newer).
+The connector bytecode targets Java 17; this does not make JDK 17 sufficient to run the build tools.
+
+Build the connector and its local dependencies from the repository root:
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng -am install -DskipITs
+----
+
+Run the integration tests against an existing database that is already configured for CDC:
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng verify -Pdameng-tests \
+  -Ddameng.hostname=localhost -Ddameng.port=5236 \
+  -Ddameng.user=SYSDBA -Ddameng.password=YOUR_PASSWORD
+----
+
+When `dameng.hostname` is omitted, the integration suite starts a Docker container and configures that test-owned instance for archive logging.
+To use the local DM8 image, run:
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng verify -Pdameng-tests \
+  -Ddameng.image=hub.badxiao.top/xuxuclassmate/dameng:latest
+----
+
+If the default Testcontainers Ryuk image is unavailable and `testcontainers/ryuk:0.12.0` is available locally, set `TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0` before this command.
+This optional override retains automatic container cleanup.
+The suite stops containers it creates and leaves externally supplied databases running.
+
+Run the independent large-transaction correctness suite with its default finite load (10,000 rows, 512-byte payload, 300-second timeout):
+
+[source,shell]
+----
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -pl debezium-connector-dameng verify -Pdameng-tests \
+  -Dit.test=DamengLargeTransactionIT
+----
+
+The test reads `dameng.stress.rows`, `dameng.stress.payload.bytes`, `dameng.stress.timeout.seconds`, and `dameng.stress.mining.batch.size` from JVM system properties. These checks cover delivery and recovery behavior under a finite load; they do not define throughput, memory limits, or a maximum supported transaction size. Increase the values only for a separately measured run.
+Its `workloadRowChanges` log field includes attempted row changes, rollbacks, and marker rows, while `deliveredDataEvents` also counts events replayed after restart. `elapsedMs` includes writes, CDC, assertions, and a final two-second quiet period, but excludes container startup. The 100-millisecond `testJvmSampledHeapPeakBytes` measurement covers the whole test JVM, including JDBC, framework objects, and garbage not yet collected; it is not connector retained heap, process RSS, or database memory.
+
+The `assembly` profile packages the connector and runtime dependencies for Kafka Connect deployment.
+Include the local assembly descriptor module when preparing a clean Maven repository:
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng,debezium-assembly-descriptors -am install -Passembly -DskipITs
+----
+
+The separate Kafka Connect process suite uses the assembled plugin in an isolated worker container, together with a KRaft broker and DM database:
+
+[source,shell]
+----
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -pl debezium-connector-dameng verify -Pdameng-connect-tests,assembly
+----
+
+The fixture defaults to the locally available Java 21 base image `hub.badxiao.top/library/flink:2.2.1-java21` and copies the repository-managed Kafka runtime into the broker and worker containers.
+Use `dameng.connect.java.image` to select a compatible base; image pulls require `dameng.connect.allow.image.pull=true`.
+`DamengKafkaConnectIT` is excluded from the default embedded-engine suite.
+Its scenarios cover plugin loading, Kafka records, REST task stop/resume and replacement of a killed worker using persisted history and offsets.
+One scenario interrupts publication of a committed 3,000-row transaction after only its first eight records can be sent, then verifies complete recovery without a new initial snapshot.
+The producer gate is a test-only worker fixture and is absent from the packaged connector.
+Execution results are recorded in Failsafe reports, with process logs under `target/dameng-connect-logs`.
+
+The clean coverage regression `/tmp/dameng-coverage-final2.log` completed successfully on 2026-09-28 with 572 unit tests, 2 architecture checks and 78 database integration tests, including both manual primary/standby scenarios and five 100,000-row transaction scenarios. JaCoCo measured 2,397 of 2,467 executable lines (97.1625%) across this module and passed its aggregate 95% line coverage gate. Branch coverage was 1,450 of 1,641 (88.3608%); branch coverage has no gate. Checkstyle passed, and Maven generated the plugin ZIP and TAR archives. The ZIP SHA-256 is `63b6ce01ed86077d08209e66414c5e2dc8a993887d6d91149e80081a5c279b0b`.
+
+To reproduce the extended coverage regression after installing local module dependencies, use:
+
+[source,shell]
+----
+JAVA_HOME=/opt/java/jdk-25.0.4+7 \
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -B -ntp -pl debezium-connector-dameng clean verify -Pdameng-coverage,assembly \
+  -Ddameng.stress.rows=100000 \
+  -Ddameng.stress.payload.bytes=512 \
+  -Ddameng.stress.timeout.seconds=600 \
+  -Ddameng.stress.mining.batch.size=10000 \
+  -Dtest.argline=-Xmx2g
+----
+
+The report is in `debezium-connector-dameng/target/site/jacoco/`. The previously recorded Kafka Connect process suite passed both tests with 496 unit tests and 2 architecture checks using an earlier plugin build. It was not rerun against this ZIP, and its separate Docker worker JVM is not counted by JaCoCo. These results use the DM8 build and JDBC driver identified at the start of this page; qualify other server versions and deployment loads separately.

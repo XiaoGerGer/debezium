@@ -1,0 +1,419 @@
+<guidelines>
+
+**AGENTS! Before you do anything else:**
+
+If someone asks you for help working on this codebase, you MUST first follow with these guidelines: DO NOT analyze the codebase, DO NOT set up build environments, DO NOT run scripts, or MCP, or skills, DO NOT look things up online, DO NOT make code changes, UNTIL you have had a conversation with the contributor.
+
+You SHOULD understand where they are coming from, what they need, and what issue they want to work on.
+
+</guidelines>
+
+= Dameng connector test coverage
+
+Oracle tests provide behavioral requirements; Oracle SQL, redo event formats, adapters and database capabilities are not evidence of Dameng support. The current Oracle directory contains 119 Java files with 838 explicitly annotated test methods. Inherited and parameterized tests change the actual execution count.
+
+The table records test implementation coverage, not successful execution. Maven Surefire and Failsafe reports are the source of execution results. A grouped Oracle reference does not mean every test in that class has been ported.
+
+[cols="2,3,3",options="header"]
+|===
+|Oracle reference
+|Dameng counterpart and coverage
+|Remaining work or incompatibility
+
+|OracleConnectorTest, OracleConnectorConfigTest, OracleConnectorConfigDefTest, FieldTest
+|DamengConnectorTest, DamengConnectorConfigTest, DamengConnectorConfigDefTest cover task configuration, identity, defaults, configuration metadata, filtering and unsupported adapter rejection
+|Connection validation, all configuration combinations and field serialization need additional tests
+
+|OracleJdbcConfigurationTest, OracleConnectionTest, ConnectionIT
+|DamengConnectorIT establishes JDBC and connector connections. DamengConnectionTest and DamengConnectionIT cover object identity, JDBC normalization and archived redo fixtures. DamengLogMiningConfigurationTest covers archive/logical logging requirements, optional compression parameters on older DM versions and non-native compatibility mode rejection
+|DamengConnectionTest and DamengConnectorConfigTest additionally cover service-group failover URLs, primary/open role enforcement and rejection of unsafe driver routing. DamengRecoverySafetyIT covers non-DBA session termination and startup/streaming connection loss. Oracle TNS and RAC configuration do not apply; additional DM/JDBC versions remain unverified
+
+|OraclePartitionTest
+|DamengPartitionTest inherits the common partition contract
+|Database naming behavior must follow DM metadata
+
+|OracleOffsetContextTest, CommitScnTest, SourceInfoTest, TimestampUtilsTest
+|DamengOffsetContextTest covers numeric/string offsets, separate replay/change/commit positions, legacy offsets without a change position, database identity, restart serialization, snapshot state and source identity/timestamps. DamengHistoryRecordComparatorTest checks completed/incomplete transactions and same-position ordering
+|Additional crash-boundary delivery cases remain; Oracle redo-thread commit positions and XStream LCR positions do not apply
+
+|OracleTableIdParserTest, OracleUtilsTest
+|LogMinerDmlParserTest covers quoted table/column identities and metadata mismatch; DamengConnectorIT checks mixed-case quoted table and key/column names in snapshot and streaming events
+|Additional catalog and case-sensitivity combinations remain
+
+|OracleConnectorIT, OraclePrimaryKeyIT, OracleConnectorFilterIT, OracleSkipMessagesWithoutChangeConfigIT
+|DamengConnectorIT covers initial snapshot, committed CRUD, JDBC batch inserts, set-based multi-row updates/deletes, primary-key changes and headers, tombstones, tables without a primary key, table inclusion, newly matching tables, column include/exclude filters, unchanged-event and skipped-operation policies, truncation, nulls and offset restart. DamengChangeRecordEmitterTest checks primary-key dispatch and missing LOB values
+|Unique-index keys, masked columns, heartbeat, cloud events, custom key mappings, retry/reconnect and snapshot boundary races remain
+
+|TransactionMetadataIT, DropTransactionActionTest
+|DamengConnectorIT verifies commit visibility, full rollback, savepoint rollback, concurrent long transactions, rollback while the connector is stopped, transaction BEGIN/END metadata and per-table event counts. It additionally checks multi-table metadata after interrupted dispatch and a fixed-seed transaction model across restart. DamengLargeTransactionIT adds bounded-queue mixed CRUD, an open transaction alongside other commits, full and savepoint rollback, and restart from a durable mid-transaction offset at a configurable finite row count
+|Administrative transaction signals and additional dispatch boundaries remain; the stress suite does not establish throughput, memory ceilings or a maximum supported transaction size
+
+|BlockingSnapshotIT, IncrementalSnapshotIT, IncrementalSnapshotCaseSensitiveIT, OracleChunkedSnapshotIT, CustomSnapshotterIT, SnapshotSelectOverridesIT
+|DamengConnectorIT tests initial and initial_only data snapshots, no_data and its never alias, empty tables, snapshot select overrides, waiting for a pre-existing writer, concurrent creation of a matching table, lock release after success/failure, primary-key schemas and column defaults. DamengSnapshotChangeEventSourceTest controls table discovery between LSN reads to verify new-table locking, repeated discovery and snapshot/table/signal filtering, preservation of schema history and locking for captured tables omitted from the row snapshot, and delegation to configured snapshot query implementations. DamengSnapshotFilterIT verifies that snapshotting only table A retains the schema and object identity needed to stream and recover table B, including the correct historical column positions when a middle column is excluded from events. DamengIncrementalSnapshotIT covers source signals, multiple chunks, watermark-window update/delete/key-move deduplication and acknowledged-row restart with simple and composite keys
+|Blocking, parallel initial-snapshot chunking and custom snapshot workflows remain unimplemented or unvalidated by this connector. Common configuration fields do not imply a working DM workflow. Concurrent schema changes during incremental snapshots are unsupported and `incremental.snapshot.allow.schema.changes=true` is rejected. These are connector coverage gaps, not assertions that the database lacks the necessary capabilities
+
+|OracleDdlParserTest, OracleDatabaseSchemaTest, OracleSchemaHistoryTest, SchemaHistoryTopicIT, OracleSchemaMigrationIT
+|DamengConnectorIT tests new tables, rename-table topic changes, rename out of and back into the capture filter across acknowledged restarts, drop/recreate of the same name, add-column capture, consecutive add/rename/drop-column DDL with intervening inserts while stopped, middle-column removal followed by a different type, and schema recovery after another restart. DamengStreamingFilterBoundaryTest verifies persisted schema history across filter boundaries and rejects unknown historical definitions. DamengDdlParserTest covers historical sequential definitions, quoted identifiers, primary keys, named constraint metadata (with primary keys driving key schemas), type/default changes, non-table object classification, atomic rejection and malformed syntax. DamengDatabaseSchemaTest checks registry cleanup after rename/drop
+|DamengConstraintIT verifies catalog-derived named constraints followed by `DROP CONSTRAINT` and restart, and verifies that a UNIQUE-only table retains null event keys after its constraint is dropped. DamengConnectorIT additionally replays historical DECIMAL/TIMESTAMP precision changes and an INT-to-VARCHAR change. Additional type changes, DDL capture races and exhaustive historical replay remain. Oracle grammar must not be assumed compatible
+
+|AbstractOracleDatatypesTest, SnapshotDatatypesIT, StreamingDatatypesIT, OracleValueConvertersTest, OracleDefaultValueIT
+|DamengValueConvertersTest, DamengTemporalValueConvertersTest and DamengDecimalValueConvertersTest cover numeric and temporal conversions. DamengDatatypesIT compares native numeric, decimal modes, date/time precision, character padding, Unicode, binary and null values across snapshot/streaming; it also checks unsupported interval rejection and column exclusion. DamengConnectorIT checks column defaults and key schemas
+|Additional bitwise floating-point and JDBC-derived full CRUD/JSON round-trip tests are implemented below. The local LogMiner precision failures remain unresolved. The full DM type/version matrix, additional expressions and temporal edge cases require further real database samples
+
+|OracleNumberOneIT, OracleNumberNegativeScaleIT, OracleBinaryModeIT, OracleRawDataTypeIT, OracleRawToStringIT, converters/RawToStringConverterTest
+|Numeric boundaries and binary hex decoding have unit coverage
+|Custom boolean/RAW converters, binary output modes and negative scales are not yet ported
+
+|OracleBlobDataTypesIT, OracleClobDataTypeIT, OracleXmlDataTypesIT, OracleExtendedStringIT, OracleRowIdDataTypeIT, OraclePrimaryKeyLobReselectIT, OracleReselectColumnsProcessorIT
+|DamengConnectorIT exercises non-LOB text whose escaped redo exceeds 4000 characters, complete snapshot LOB values, inline streamed LOBs and unavailable-value placeholders for OUT_CLOB/OUT_BLOB and missing before images. DamengLobValueConvertersTest covers placeholder conversion and custom placeholder settings
+|Oracle LOB fragment operations, XML redo and ROWID codecs are not portable. Complete external LOB streaming/reselection is not implemented; placeholders are not complete LOB contents
+
+|logminer/LogMinerDmlParserTest, logminer/UnistrHelperTest
+|LogMinerDmlParserTest covers quoted identifiers and strings, missing/null values, partial updates, key changes, numeric precision, native 0x binary and temporal literals, LOB markers, function expressions, long SQL and strict rejection
+|Oracle unsupported-value substitution is deliberately not copied; ambiguous OR predicates fail instead of inventing a before image
+
+|logminer/SqlUtilsTest, logminer/LogMinerQueryBuilderTest, logminer/LogMinerColumnIndexesTest, logminer/LogMinerEventRowTest, logminer/LogMinerUtilsTest
+|LogMinerSqlTest covers DM options, inclusive windows, archive quoting and unfiltered transaction tracking. LogMinerBatchTest covers operation codes, rollback flags, complete/missing/interleaved continuation fragments and missing transaction IDs; real CDC tests exercise the query/result path
+|Additional real DM fixtures for each column, operation and continuation boundary remain. The long-text integration test checks complete events; it does not by itself prove that a particular DM build returned CSF fragments
+
+|logminer/SelectLobParserTest, logminer/ExtendedStringParserTest, logminer/XmlBeginParserTest, logminer/parser/XmlWriteParserTest, logminer/LobUnderConstructionTest, logminer/events/RowIdCodecTest
+|No counterparts
+|Oracle-specific encodings must not be copied; DM LOB/XML behavior needs independent evidence
+
+|ArchiveDestinationResolverTest, logminer/LogFileCollectorTest, logminer/LogFileCollectorIT, logminer/CappedLogFileSessionSelectorTest, logminer/UnboundedLogFileSessionSelectorTest, logminer/FlushStrategyIT, logminer/CteQueryIT
+|Real CDC tests exercise archive mining. DamengArchiveLogTest covers missing archives, gaps, inclusive boundaries, overlapping files, archive chain continuity and mismatched database identity
+|DamengDatabaseIdentityTest covers retained primary lineage, apply boundaries, clock-order ambiguity and legacy offset rejection; DamengArchiveLogTest additionally checks HA source ranges and rejects overlapping or divergent archives. DamengRuntimeSafetyIT now injects required archive loss during restart, including a pinned open transaction. Loss during an active mining window and forced lossy takeover remain separate fault tests
+
+|logminer/AnyLogMinerAdapterIT, logminer/LogMinerSourceInfoRedoSqlIT, logminer/UsernameFilterIT, logminer/ClientIdFilterIT
+|Basic LogMiner CDC only
+|Optional source SQL and user/client filters are not claimed as supported
+
+|logminer/AbstractLogMinerAdapterTest, logminer/buffered/BufferedLogMinerAdapterTest, logminer/unbuffered/UnbufferedLogMinerAdapterTest, logminer/unbuffered/UnbufferedLogMinerAdapterIT, logminer/unbuffered/UnbufferedStreamingChangeEventSourceTest
+|No direct adapter counterparts
+|Oracle buffered/unbuffered adapters are not DM adapters
+
+|logminer/buffered/AbstractBufferedLogMinerStreamingChangeEventSourceTest, logminer/buffered/AbstractBufferedLogMinerStreamingChangeEventSourceIT, MemoryStreamingChangeEventSourceTest/IT, DeferredMemoryStreamingChangeEventSourceTest
+|DamengConnectorIT tests actual transaction commit/rollback behavior, transaction event ordering and restart while another transaction remains open. DamengLargeTransactionIT drives a finite large transaction through queue backpressure and restart scenarios. LogMinerBatchTest checks replay-position pinning, deterministic commit ordering and START/PRE_COMMIT/XA_COMMIT/SEQ MODIFY/UNSUPPORTED handling. DamengStreamingChangeEventSourceTest exercises interrupted-transaction replay and unhandled operation failure policy with controlled result sets
+|Interrupted dispatch, crash recovery and exhaustive duplicate suppression matrices remain; no throughput or memory limit is claimed
+
+|logminer/buffered/AbstractFindRolledBackRangeTest, MemoryFindRolledBackRangeTest, EhcacheFindRolledBackRangeTest, EmbeddedInfinispanFindRolledBackRangeTest, logminer/TransactionCommitConsumerIT, logminer/unbuffered/ConcurrentTransactionIT
+|Savepoint and concurrent transaction behavior have real-engine tests; LogMinerBatchTest checks retained savepoint changes and full rollback release independently of the database
+|Detailed rollback-range and commit-consumer fault matrices remain
+
+|logminer/buffered/EhcacheIT, EhcacheStreamingChangeEventSourceIT, EmbeddedInfinispanStreamingChangeEventSourceIT, EmbeddedInfinispanStreamingChangeEventSourceTest
+|No counterparts
+|Additional cache backends are not implemented
+
+|logminer/buffered/HybridMiningStrategyIT
+|No counterpart
+|Oracle hybrid mining strategy does not apply
+
+|OracleMetricsIT, OracleStreamingMetricsTest, logminer/LogMinerStreamMetricsTest
+|DamengStreamingMetricsTest covers cumulative window gauges, peaks, replay/archive positions and timing, and uses the platform MBean server to verify custom and inherited attributes, reset, unregister and registration after restart
+|Complete end-to-end metric values during stalls and retention failures need additional fault-injection tests
+
+|SignalsIT, NotificationsIT, OutboxEventRouterIT
+|DamengIncrementalSnapshotIT exercises source-table execute-snapshot signals
+|Other signal actions/channels, notifications and outbox routing require additional explicit DM integration coverage
+
+|xstream/XStreamStreamingMetricsTest, olr/OpenLogReplicatorStreamingMetricsTest
+|Not applicable
+|XStream and OpenLogReplicator are Oracle-specific capture mechanisms
+
+|===
+
+Oracle helper classes and JUnit extensions configure Oracle-only adapters, privileges, options and fixtures. Dameng tests must use their own database setup and capabilities rather than copying those skip conditions.
+
+== Data consistency regression added on 2026-10-10
+
+The additional tests retain the repository's Kafka dependency version (`4.3.0`). They change only test fixtures and documentation. They neither enable non-native compatibility modes nor add complete external LOB streaming.
+
+[cols="2,4",options="header"]
+|===
+|Test
+|Independent checks
+
+|`DamengDatatypesIT.shouldPreserveStoredFloatingPointBitsInSnapshotAndStreaming`
+|REAL, FLOAT(24), FLOAT, FLOAT(53) and DOUBLE with long fractional values, negative values, tiny finite values, large finite values, zero and negative zero. Additional cases cover DOUBLE's maximum finite value, REAL's documented upper boundary, minimum normal values, minimum subnormal values and the adjacent DOUBLE values on either side of one. Prepared JDBC floating point parameters avoid imposing decimal SQL literal parsing on the extreme values. JDBC reads the value actually stored by DM; snapshot and streamed values must retain exactly those floating point bits. There is no tolerance that can hide rounding to six decimal places.
+
+|`DamengDatatypesIT.shouldPreserveStoredDecimalBoundariesAndUpdateBeforeImages`
+|38-digit integers, high-scale DECIMAL, small unconstrained NUMBER, declared trailing zeros and database-side scale rounding. Snapshot, INSERT, UPDATE before/after and DELETE images are checked against JDBC, including the declared fixed decimal scale. Native NUMERIC's documented scale range is zero through its precision; Oracle negative-scale assumptions are not copied into the native-mode fixture.
+
+|`DamengDatatypesIT.shouldPreserveNativeCrudImagesNullTransitionsAndOfflineReplay`
+|Twenty-two non-key native columns spanning numbers, booleans, character padding, Unicode, binary padding, DATE, TIME, TIMESTAMP and offset temporal values. Checks full-row and selective updates, unchanged columns, value-to-NULL transitions, a restart at the acknowledged NULL update, offline NULL-to-value restoration and deletion. Every independently checked row also passes a schema-enabled JSON converter round trip, preserving its schema and logical values. Expected values come from independent JDBC getters and standard temporal representations, not the connector's converters.
+
+|`DamengConnectorIT` historical precision and composite-key cases
+|Offline DECIMAL/TIMESTAMP precision changes and an INT-to-VARCHAR change after clearing populated values, with DML on both sides of historical definitions and another restart. A composite primary key update is restarted after acknowledging only its DELETE or tombstone; the old key, new key, row images and key-change headers are checked.
+
+|`DamengConnectorIT` multi-table metadata and seeded model cases
+|One interrupted transaction touches two tables; resumed transaction IDs, total order, collection order and END counts must agree. A fixed random seed drives forty mixed transactions, full rollback, savepoint rollback, NULLs and escaped text. An independent in-memory model checks each committed event's operation, key and before/after values in order, and separately compares current JDBC rows. Half of the workload runs while the connector is stopped.
+
+|`DamengIncrementalSnapshotIT` watermark and composite-key cases
+|A database trigger places a DELETE or primary key move inside the watermark transaction. The deleted old key cannot reappear in snapshot rows; a moved current key may legitimately enter a later chunk. Events materialize the same rows as JDBC. Composite-key chunks with repeated trailing keys resume from an acknowledged row without losing another tenant's rows.
+
+|`DamengRuntimeSafetyIT` missing-archive cases
+|Only fixture-owned disposable database archives are moved out of the archive path. Both a normal acknowledged restart and an open transaction pinned across another transaction's commit are tested. After the missing logs are needed, the connector must fail without publishing data or advancing the durable offset. Archives are restored during test cleanup. This fault test is intentionally skipped for an explicitly configured external database, whose files must not be changed.
+
+|`DamengKafkaConnectIT` typed deployment case
+|The packaged plugin sends exact decimal strings, BIGINT boundaries, pre-epoch/microsecond timestamps, binary bytes, padded CHAR, BIT and NULL values through the existing JSON converters. Three brokers/controllers use replication factor three and minimum ISR two. The business partition's actual leader is paused; another leader must be elected and publish the complete source UPDATE before the former leader resumes. A second distributed worker joins and the assigned worker is killed. The survivor recovers Kafka-managed state and publishes a primary key move, INSERT and DELETE without another initial snapshot. JDBC-derived complete row images and first-delivery operation order are checked.
+|===
+
+The floating point tests expose existing discrepancies: high-precision stored values become rounded streamed values, some tiny nonzero values become zero, and negative zero loses its sign during the schema-enabled JSON converter round trip. The raw snapshot Struct preserves negative zero in all five declarations tested; its subsequent JSON decoding does not. The earlier direct LogMiner probe located ordinary fractional rounding in SQL_REDO/MINE_VALUE before connector conversion. The JSON round-trip discrepancy is a separate issue in the current Kafka conversion path, not evidence that DM LogMiner lost the snapshot value. These assertions remain enabled and require the original stored value. A failure is evidence of the data discrepancy; it must not be interpreted as a successful compatibility test. The earlier successful coverage/build results below predate these additional semantic assertions.
+
+The REAL upper-bound fixture follows the https://eco.dameng.com/document/dm/zh-cn/pm/dm_sql-introduction.html[official DM SQL type specification]: its documented range ends at `3.4E38`, below Java's `Float.MAX_VALUE`. The local JDBC driver's `setFloat` rejects the latter as overflow. Such a rejected input is not a connector data-loss result; the regression uses the float representation of the documented bound instead.
+
+Run the engine/database regression with `verify -Pdameng-tests`; run the packaged worker regression separately with `verify -Pdameng-connect-tests,assembly`. Ordinary `test` does not run these Failsafe integration tests. Surefire/Failsafe XML, rather than this implementation inventory, determines the result of each invocation.
+
+=== Recorded execution on 2026-10-10
+
+The methods listed above add 57 embedded-engine integration test instances after parameter expansion (38 floating point, eight decimal, one full-type CRUD, five connector recovery/transaction, three incremental snapshot and two missing-archive instances), plus one packaged Kafka Connect instance. This is an inventory of added instances, not a claim that every Oracle test has been ported.
+
+[cols="2,3,4",options="header"]
+|===
+|Invocation
+|Result
+|Scope and evidence
+
+|`/tmp/dameng-gap-full.log`, finished at 14:09:24
+|573 unit tests and two architecture checks passed. Database tests: 136 executed, 109 passed, 26 assertion failures, one error, no skips. `BUILD FAILURE`.
+|A clean full `dameng-coverage,assembly` run, including both real primary/standby cases, both network/session recovery cases and all five 100,000-row transaction workloads. All failures were in the new floating point method. The one error was the initial, out-of-range REAL fixture input; it is not evidence of connector data loss.
+
+|`/tmp/dameng-gap-types-final.log`, finished at 14:14:24
+|56 datatype cases: 30 passed, 26 assertion failures, no errors or skips. `BUILD FAILURE`.
+|Reruns the complete datatype class with the corrected documented REAL upper bound and explicit assertion-stage labels. The upper-bound case now passes. Twenty-one failures compare raw streamed floating point values with stored JDBC bits; five compare negative-zero snapshot values after JSON decoding. The raw snapshot values in those five cases match JDBC. All eight decimal cases, full native CRUD/NULL/offline replay and other existing datatype cases pass.
+
+|`/tmp/dameng-gap-coverage.log`, finished at 14:12:03
+|JaCoCo 95% aggregate line gate and Checkstyle passed. LINE 2,398/2,467 (97.2031%); BRANCH 1,454/1,641 (88.6045%); CLASS 56/56 (100%).
+|Report/check goals were invoked separately on the clean full run's execution data because Failsafe stopped the original lifecycle before those goals. No failure was ignored and no class was excluded to obtain this result. This successful coverage invocation does not make the failed full regression an accepted build. Independent Docker worker JVM execution remains outside this report.
+
+|`/tmp/dameng-gap-connect-leader.log`, finished at 13:49:33
+|The new packaged three-broker/two-worker case passed, with no failures, errors or skips; 142.7 seconds including fixture setup. `BUILD SUCCESS` and Checkstyle passed.
+|Confirms business-partition leader failure while the old leader remains paused, followed by task reassignment after killing its actual worker. Kafka remains at the repository version, `4.3.0`.
+
+|`/tmp/dameng-gap-connect-existing-final.log`, finished at 14:19:06
+|Both original packaged worker cases passed with no failures, errors or skips. `BUILD SUCCESS` and Checkstyle passed.
+|Reruns the original cases using the final fixture after adding optional three-broker support. The 3,000-row transaction-publication kill/recovery case took 112.727 seconds; task stop/resume and worker replacement took 97.898 seconds. Together with the preceding three-broker invocation, all three current process cases have passing records. These are separate invocations, not one combined full-suite build.
+|===
+
+The 21 streamed failures include `1.23456789012345` becoming `1.234568`, `1.23456789E-7` becoming zero, normal/subnormal minima becoming zero, and the DOUBLE neighbors of one becoming exactly one. The five JSON-decoding failures change the IEEE sign bit of `-0.0` to that of `+0.0`. The tests do not replace expected values with rounded LogMiner values, add numeric tolerances, or disable these assertions.
+
+Original and corrected XML reports are retained separately under `/tmp/dameng-gap-evidence/full` and `/tmp/dameng-gap-evidence/types-final`; the full run's JaCoCo report is saved under `/tmp/dameng-gap-evidence/full/jacoco`. The passing three-broker run and its container logs are under `/tmp/dameng-gap-evidence/connect-leader`, and the final original-worker cases under `/tmp/dameng-gap-evidence/connect-existing-final`. After these invocations, no test-owned containers remain. These local `/tmp` artifacts must be copied elsewhere if long-term retention is required.
+
+== Real database execution
+
+Run unit tests with the repository Maven wrapper and a supported JDK. Integration tests run a complete Debezium engine and require a native-mode DM instance with archive logging, `RLOG_APPEND_LOGIC=2`, `RLOG_IGNORE_TABLE_SET=1` and `RLOG_LLOG_COMPRESS=0` when that parameter exists. They create and drop uniquely named test tables in `dameng.schema`.
+
+The local integration fixture uses DM8 build `08134283904-20220804-166351-20005` with `DmJdbcDriver18` version `8.1.3.140`, native compatibility mode, and the GB18030 database character set. This build does not expose `RLOG_LLOG_COMPRESS`. Coverage on this fixture does not establish compatibility with all DM8 versions or server configurations.
+
+Set `dameng.hostname`, `dameng.port`, `dameng.user`, `dameng.password`, `dameng.schema` and `dameng.database` to use an existing test instance. Tests leave that instance running and do not change its global parameters. If `dameng.hostname` is absent, `DamengTestDatabase` starts a Testcontainers instance using `dameng.image`, defaulting to `hub.badxiao.top/xuxuclassmate/dameng:latest`, prepares archive logging and full non-LOB logical logging, disables logical-log compression when available, restarts the disposable container, waits for JDBC readiness and stops it after its last test class. Initialization uses the default image layout under `/opt/dmdbms/data/DAMENG`; custom images must provide that layout or an already prepared external test instance.
+
+First build and install the local dependencies from the repository root, then run the complete connector suite with a disposable database:
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng -am install -DskipITs
+./mvnw -pl debezium-connector-dameng verify -Pdameng-tests \
+  -Ddameng.image=hub.badxiao.top/xuxuclassmate/dameng:latest
+----
+
+If the default Ryuk image cannot be pulled, an available local Ryuk image can be selected explicitly without disabling resource cleanup:
+
+[source,shell]
+----
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -pl debezium-connector-dameng verify -Pdameng-tests \
+  -Ddameng.image=hub.badxiao.top/xuxuclassmate/dameng:latest
+----
+
+Surefire reports unit test results in `target/surefire-reports`; Failsafe reports database integration results in `target/failsafe-reports`.
+
+=== Code coverage and regression gate
+
+The `dameng-coverage` profile uses JaCoCo 0.8.15 to combine unit tests, architecture checks and embedded-engine DM integration tests. It measures all production classes in this module, without class exclusions. At `verify`, the module's aggregate `LINE` covered ratio must be at least 95%. Branch coverage is also reported, but has no threshold in this gate.
+
+After installing the repository dependencies, run the complete suite with a clean execution-data file:
+
+[source,shell]
+----
+JAVA_HOME=/opt/java/jdk-25.0.4+7 \
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -B -ntp -pl debezium-connector-dameng clean verify -Pdameng-coverage
+----
+
+The profile enables database integration tests. Keep `clean` so previous runs cannot contribute stale coverage. Execution data is written to `target/jacoco.exec`; the human-readable report is `target/site/jacoco/index.html`, with `jacoco.xml` and `jacoco.csv` in the same directory. The gate fails if the execution-data file is missing.
+
+For a baseline measurement or a targeted `-Dtest` or `-Dit.test` development run, add `-Djacoco.skipCheck=true` to collect a report without applying the full-suite gate. A targeted run does not establish the module's acceptance coverage; use the complete command above for acceptance.
+
+The independent Docker Kafka Connect worker JVM is not instrumented by this profile, so connector execution inside that worker does not contribute to the coverage report. Run the separate `dameng-connect-tests,assembly` process regression described below to check the packaged plugin, worker termination and recovery.
+
+The clean, full-suite acceptance run `/tmp/dameng-coverage-final2.log` finished with `BUILD SUCCESS` at 13:12:16 on 2026-09-28. JaCoCo reported `LINE` 2,397/2,467 (97.1625%), `BRANCH` 1,450/1,641 (88.3608%), and `CLASS` 56/56 (100%) for this module; the 95% aggregate line gate passed. These ratios use executable JaCoCo classes and lines, not the number of Java source files. The run passed 572 unit tests, 2 architecture checks and 78 database integration tests, with no failures, errors or skips. It included both real manual primary/standby tests and five 100,000-row transaction scenarios. Checkstyle passed and the assembly profile produced a plugin ZIP and TAR. The ZIP SHA-256 is `63b6ce01ed86077d08209e66414c5e2dc8a993887d6d91149e80081a5c279b0b`. The separately recorded Kafka Connect worker tests used an earlier plugin build and were not rerun for this coverage result.
+
+The preceding `/tmp/dameng-coverage-final.log` run was stopped after a primary/standby test read `FileOffsetBackingStore` during a concurrent file rewrite and received `StreamCorruptedException: unexpected EOF in middle of data block`. It is not a successful full-suite result. The test fixture now retries only `ConnectException` caused directly by `EOFException` or `StreamCorruptedException` for at most 30 seconds while still checking the durable LSN and identity. Persistently unreadable offsets still fail. The clean `/tmp/dameng-coverage-final2.log` run includes this test change and passed both primary/standby cases.
+
+Reproduce the extended acceptance workload and coverage gate with:
+
+[source,shell]
+----
+JAVA_HOME=/opt/java/jdk-25.0.4+7 \
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -B -ntp -pl debezium-connector-dameng clean verify -Pdameng-coverage,assembly \
+  -Ddameng.stress.rows=100000 \
+  -Ddameng.stress.payload.bytes=512 \
+  -Ddameng.stress.timeout.seconds=600 \
+  -Ddameng.stress.mining.batch.size=10000 \
+  -Dtest.argline=-Xmx2g
+----
+
+=== Large transaction regression
+
+`DamengLargeTransactionIT` is an independent real-database suite for finite large-transaction correctness checks. It covers bounded queue backpressure, an open transaction observed alongside other commits, full and savepoint rollback, and restart from a durable offset in the middle of a transaction. The class reads its limits from JVM system properties; defaults are 10,000 rows, a 512-byte payload, a 300-second timeout, and a 1,000-LSN mining batch. No throughput, memory ceiling, or maximum supported transaction size is implied.
+
+Run only this suite with a disposable Testcontainers database:
+
+[source,shell]
+----
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -pl debezium-connector-dameng verify -Pdameng-tests \
+  -Dit.test=DamengLargeTransactionIT \
+  -Ddameng.stress.rows=10000 \
+  -Ddameng.stress.payload.bytes=512 \
+  -Ddameng.stress.timeout.seconds=300 \
+  -Ddameng.stress.mining.batch.size=1000
+----
+
+Set `dameng.hostname`, `dameng.port`, `dameng.user`, and `dameng.password` to use an already prepared DM instance. Increase `dameng.stress.rows` or `dameng.stress.payload.bytes` only after the default correctness run succeeds; record elapsed times and resource usage from the test log separately.
+
+The following extended run executes the complete connector suite, installs the module, and produces its plugin archive, with the stress cases set to 100,000 rows, 512-byte payloads, a 10,000-LSN mining batch, a 600-second wait limit, and a 2 GiB test JVM heap. Build `debezium-assembly-descriptors` with its dependencies first when using a clean Maven repository.
+
+[source,shell]
+----
+JAVA_HOME=/opt/java/jdk-25.0.4+7 \
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -B -ntp -l /tmp/dameng-production-final-source.log \
+  -pl debezium-connector-dameng install -Pdameng-tests,assembly \
+  -Ddameng.stress.rows=100000 \
+  -Ddameng.stress.payload.bytes=512 \
+  -Ddameng.stress.timeout.seconds=600 \
+  -Ddameng.stress.mining.batch.size=10000 \
+  -Dtest.argline=-Xmx2g
+----
+
+The larger mining window is a stress-run setting, not a change to the connector's default. Performance comparisons must keep both the connector code and test properties fixed; changing the projected LogMiner columns and the mining window together cannot isolate either change's effect.
+
+The test log separates source workload from delivered events:
+
+[cols="2,5",options="header"]
+|===
+|Metric |Meaning
+|`workloadRowChanges` |Row-level changes attempted by the test, including rolled-back work and marker rows. Replaying an event after restart does not add to this value.
+|`deliveredDataEvents` |Data events consumed and checked by the test, including intentionally replayed events after restart. Transaction metadata records are not counted.
+|`elapsedMs` |Scenario wall time including database writes, CDC delivery, assertions, and the final two-second no-extra-records check. Container startup is outside this interval.
+|`testJvmSampledHeapPeakBytes` |Largest observed used Java heap value, sampled every 100 milliseconds in the test JVM. It includes JDBC driver state, test framework and assertion objects, and garbage not yet collected. It is not connector-only or retained heap, process RSS, or database memory, and sampling can miss short peaks.
+|`testJvmHeapMaxBytes` |Maximum heap reported by the test JVM, provided as context for the sampled value.
+|===
+
+The default 10,000-row scenarios have been executed successfully on the local DM8 fixture, as has `DamengSnapshotFilterIT`.
+
+=== Recorded 100,000-row run
+
+This record predates the finite window budgets, snapshot deadline, timeout mapping and required `capture_scope` signature added during operational hardening. It documents that earlier implementation; rerun the suites before using it as evidence for subsequent changes.
+
+On 2026-09-24, all five `DamengLargeTransactionIT` scenarios passed with no failures, errors, or skips. The recorded environment was JDK `25.0.4+7`, `DmJdbcDriver18` `8.1.3.140`, and Testcontainers image `hub.badxiao.top/xuxuclassmate/dameng:latest` reporting DM8 build `08134283904-20220804-166351-20005`. The database used `COMPATIBLE_MODE=0`, `LENGTH_IN_CHAR=0`, and the GB18030 character set. Each scenario used the extended command above: 100,000 base rows, 512-byte ASCII payloads, a 10,000-LSN mining batch, a 600-second wait limit, and `-Xmx2g`.
+
+Values below are the scenario metrics from `/tmp/dameng-stress-final.log`, using the definitions above. MiB means 1,048,576 bytes.
+
+[cols="3,1,1,1,1",options="header"]
+|===
+|Scenario |`workloadRowChanges` |`deliveredDataEvents` |Elapsed seconds |Sampled test JVM heap peak (MiB)
+|Full rollback |100,002 |2 |30.103 |610.0
+|Resume at a durable mid-transaction offset |100,001 |150,001 |26.938 |524.5
+|Mixed transaction with bounded queues |175,000 |175,000 |36.446 |745.0
+|Savepoint rollback |150,002 |50,002 |56.266 |654.5
+|Open transaction across other commits |100,002 |100,002 |14.666 |466.0
+|===
+
+These are finite-load correctness observations from one local fixture, not a throughput benchmark, memory ceiling, or supported maximum transaction size. The mid-transaction recovery case restarts after explicitly persisting an acknowledged middle offset; it does not kill the database or connector process.
+
+The same final invocation completed successfully with 362 unit tests, 2 architecture checks, and 66 database integration tests, with no failures, errors, or skips. Formatting and Checkstyle completed, the module was installed locally, and the plugin ZIP and TAR archives were generated. Testcontainers removed its database and Ryuk containers after the run.
+
+A later 100,000-row run against the hardened implementation was interrupted after two scenarios completed. That partial run is not a successful full-suite result; the complete current-version stress results are recorded below.
+
+=== Recorded 2026-09-28 100,000-row regression
+
+On 2026-09-28, `/tmp/dameng-coverage-final2.log` recorded all five `DamengLargeTransactionIT` scenarios passing with no failures, errors or skips. This run includes the finite 512 MiB estimated byte and 1,000,000 input-row window budgets, the snapshot deadline, timeout mapping, required `capture_scope` signature, primary/standby recovery and the initial-snapshot completion guard. It uses the DM8 build and JDBC driver listed above, 100,000 base rows, 512-byte payloads, a 10,000-LSN mining batch, a 600-second wait limit and a 2 GiB test JVM heap. MiB means 1,048,576 bytes; values are rounded to one decimal place.
+
+[cols="3,1,1,1,1",options="header"]
+|===
+|Scenario |`workloadRowChanges` |`deliveredDataEvents` |Elapsed seconds |Sampled test JVM heap peak (MiB)
+|Full rollback |100,002 |2 |30.360 |548.0
+|Resume at a durable mid-transaction offset |100,001 |150,001 |26.200 |553.0
+|Mixed transaction with bounded queues |175,000 |175,000 |34.057 |790.0
+|Savepoint rollback |150,002 |50,002 |55.823 |704.0
+|Open transaction across other commits |100,002 |100,002 |15.506 |473.7
+|===
+
+These measurements cover finite correctness workloads in the complete test JVM. They do not establish a throughput target, a maximum supported transaction size, or a connector-only heap peak.
+
+The preceding `/tmp/dameng-production-final-source.log` invocation finished with `BUILD SUCCESS` at 11:40:12 on 2026-09-28: 496 unit tests, 2 architecture checks and 78 database integration tests passed. The latest `/tmp/dameng-coverage-final2.log` reran the full database suite with additional unit tests and the coverage gate; use the latest run above for current acceptance. The still earlier `/tmp/dameng-production-regression.log` passed 494 unit tests, 2 architecture checks and 77 database integration tests before the initial-snapshot completion guard was added.
+
+An earlier diagnostic run with a 1,000-LSN mining batch completed only the full-rollback case: 292.617 seconds, two delivered marker events, and a sampled test JVM heap peak of 662.5 MiB. The remaining cases in that run were stopped manually. Its LogMiner query projected more columns, including unused redo metadata, than the final run. Because both the query projection and mining batch changed, these figures must not be treated as a controlled speedup comparison.
+
+The reference connector in `~/projects/dameng-connector` targets Debezium 1.9.8.Final. Its container test only verifies JDBC. Its transaction timeout auto-commit and permissive OR-predicate parsing must not be used as correctness specifications.
+
+== Operational safeguards and regression scope
+
+`LogMinerBatchTest` checks cumulative byte and input-row budgets across the complete mining window, including multiple transactions, transaction markers, discarded rows, and SQL continuation pieces. It verifies exact-limit acceptance, preallocation rejection of continuation growth, and rejection of all publication/replay-position APIs after capacity failure. The default limits are 512 MiB estimated bytes and 1,000,000 input rows; they are not a limit on whole-process heap. The limits follow Oracle's configuration conventions, but intentionally do not copy Oracle's optional transaction-discard threshold behavior.
+
+`DamengConnectorConfigTest` covers finite positive socket and initial-snapshot timeouts, the driver's `socketTimeout` mapping, rejection of the ambiguous raw `database.socketTimeout` input, nonnegative statement timeouts, and rejection of unsupported parallel snapshot connections. Real tests must establish that JDBC timeout and connection abort release locks on the deployed DM version, including a snapshot blocked by downstream backpressure. Unit mocks alone cannot establish server-side session termination.
+
+Offsets now require a `capture_scope` signature of database/schema/table include and exclude expressions, `table.ignore.builtin`, and `signal.data.collection`. Older offsets lacking the signature and changes to any signed expression are rejected. This applies to narrowing filters and equivalent-expression rewrites as well as expanding filters. Recovery tests must keep the exact signed values or use a new identity, fresh history and an initial snapshot. Column filters and `snapshot.include.collection.list` do not change the table coverage signature.
+
+Finite budgets do not remove the repeated work caused by a long transaction pinning the scan start. A capacity failure keeps the replay position unchanged and can recur after restart until an operator adjusts the workload or explicitly increases a budget with sufficient heap and retained archives. Archive deletion, prolonged network loss and driver/server failure combinations remain separate fault-injection requirements.
+
+=== Kafka Connect process regression
+
+The separate `dameng-connect-tests` profile runs `DamengKafkaConnectIT` from the standard test source directory. The embedded-engine `dameng-tests` profile excludes that class. The process test requires the assembly profile so the worker can load this build's connector ZIP through its plugin directory.
+
+[source,shell]
+----
+JAVA_HOME=/opt/java/jdk-25.0.4+7 \
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -pl debezium-connector-dameng verify -Pdameng-connect-tests,assembly
+----
+
+The fixture runs independent KRaft broker, distributed Connect worker and DM containers. It uses a Java 21 base image, defaulting to the locally available `hub.badxiao.top/library/flink:2.2.1-java21`, with the repository-managed Kafka runtime dependencies copied into the broker and worker. Set `dameng.connect.java.image` to select another compatible Java base. Image pulls are disabled by default; `dameng.connect.allow.image.pull=true` enables them when registry access is available.
+
+The tests verify isolated plugin discovery, committed CRUD records in Kafka, persisted schema history and offsets, task stop/resume through REST, and recovery after killing the worker and replacing its container, including DDL and DML while it is stopped. Known at-least-once duplicates are accepted; these are not exactly-once tests.
+
+`shouldRecoverEveryRowAfterWorkerKillDuringTransactionPublication` commits 3,000 rows in one database transaction. A test-only producer interceptor blocks the ninth data-topic send while Kafka's I/O thread can finish earlier sends. The test observes at least one committed row in Kafka, kills the worker and checks broker end offsets to prove that only one to eight additional records were published. A new worker with no local files and no interceptor must recover every remaining row, preserve values, avoid a new initial snapshot, and deliver a subsequent transaction. The test permits legitimate intermediate source-offset flushes and known replays; it does not assume that no message was acknowledged before the kill. The gate class is packaged only into that test worker's runtime and is absent from the connector plugin.
+
+On 2026-09-24, `/tmp/dameng-connect-crash.log` completed with `BUILD SUCCESS` at 18:12:19: 426 unit tests, 2 architecture checks and both `DamengKafkaConnectIT` cases, with no failures, errors or skips. The interrupted-transaction case took 114.901 seconds and the task/worker replacement case took 99.426 seconds, including fixture setup. Checkstyle passed and all test-owned process containers were removed. Logs for each fixture are retained separately under `target/dameng-connect-logs/run-*`. This is a single-broker, single-worker test; multiple-worker rebalancing, broker faults and the later primary/standby implementation are separate validation work.
+
+The earlier Kafka Connect process run `/tmp/dameng-connect-final-ha.log` finished with `BUILD SUCCESS` at 11:20:51 on 2026-09-28, using a plugin ZIP assembled after the primary/standby and snapshot-completion changes but before the current coverage run. It passed 496 unit tests, 2 architecture checks and both `DamengKafkaConnectIT` cases with no failures, errors or skips; Checkstyle also passed. The in-flight 3,000-row worker-kill case took 113.4 seconds, and task/worker restart took 99.21 seconds. This validates that earlier plugin in the one-broker, one-worker process fixture; the coverage-run ZIP has not been rerun through this suite. The process test does not exercise a role change inside the distributed worker; the separate real DM primary/standby tests cover manual role changes.
+
+=== Connection loss and primary/standby regression
+
+`DamengRecoverySafetyIT` uses a dedicated account without `DBA` or `SELECT ANY TABLE`. It verifies snapshot and streaming with explicit table access plus `SOI`, `VTI` and `EXECUTE ON DBMS_LOGMNR`, administrator termination of only that account's task sessions, and automatic recovery. Its TCP proxy rejects connections during startup and interrupts a streaming connection, then restores service; the test checks durable offsets and resumed data delivery without restarting the engine manually.
+
+The focused `/tmp/dameng-ha-unit-network.log` invocation passed 485 unit tests, 2 architecture checks and both recovery IT cases with zero failures, errors or skips. This result precedes the final HA identity/archive refinements and is evidence for that invocation, not proof of the entire current workspace.
+
+`DamengPrimaryStandbyEnvironment` creates two disposable DM members from a backup, configures physical replication and a manual data-guard monitor, and exposes both JDBC addresses without a virtual IP. `DamengPrimaryStandbyIT` covers offline DDL/DML recovery after a manual switchover, a switchback with the same running engine, recovery after terminating its own primary followed by a non-forced manual takeover, and an incomplete initial snapshot interrupted by switchover. The connector's endpoint list remains unchanged. Run the targeted suite with:
+
+[source,shell]
+----
+TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
+  ./mvnw -pl debezium-connector-dameng verify -Pdameng-tests \
+  -Dit.test=DamengPrimaryStandbyIT
+----
+
+The earlier targeted connector run `/tmp/dameng-primary-standby2.log` completed with `BUILD SUCCESS` on 2026-09-24: 492 unit tests, 2 architecture checks and the original `DamengPrimaryStandbyIT` case passed. The test recovered offline DDL and DML after an A-to-B manual switchover, followed a B-to-A switchback while the same engine was running, and resumed after its current primary was killed and the administrator performed an ordinary, non-forced takeover. The connector endpoint list remained unchanged throughout. The later `/tmp/dameng-production-final-source.log` reran this scenario and the interrupted-snapshot scenario in the same 78-IT suite, with both passing.
+
+The subsequent snapshot-completion guard checks that the primary identity still matches before marking an initial snapshot complete. `/tmp/dameng-snapshot-ha-targeted2.log` finished with `BUILD SUCCESS` at 11:16:28 on 2026-09-28: 496 unit tests, 2 architecture checks and the real `DamengPrimaryStandbyIT.shouldRestartAnIncompleteSnapshotAfterManualSwitchover` case all passed. With the initial snapshot interrupted during a manual role change, the test observed all 500 rows emitted from the new member's database magic before snapshot completion and a subsequent row 501 captured by streaming. The test does not assert exactly-once delivery of rows that were already read from the interrupted attempt.
+
+An earlier version of that new test used `nextRecord()`, whose Awaitility polling incurred at least 100 milliseconds per row; its 90-second deadline expired after counting 448 rows. The corrected test polls the consumed record queue directly, counts the 500 records from the new primary, and passed within its 120-second limit. The earlier `/tmp/dameng-snapshot-ha-regression.log` consequently ended in `BUILD FAILURE` for that test timing issue, even though its 496 unit tests, 2 architecture checks, 4 runtime-safety IT cases and the pre-existing primary/standby IT case passed. Do not treat that invocation as a fully successful build or as evidence of connector data loss.
+
+Direct fixture probes additionally established a normal B restart and inspected `SYSOPENHISTORY`, local archive writer/source magics and identical historical LogMiner output on the replicated member. These are database and driver observations distinct from the connector integration test.
+
+The acceptance scope is one DM8 build and driver, one single-instance primary/standby pair (`N_EP=1`), administrator-managed role changes and DM-managed archives. The connector does not promote or fence servers. Missing open anchors after the 128-record history rotates, timestamp/apply-order ambiguity, incomplete lineage, insufficient applied LSNs, ambiguous overlapping archives and foreign database identity fail closed. Enabling `database.failover.hosts` on a single-server offset without HA anchors requires a fresh connector identity, schema history and initial snapshot. Forced lossy takeover, split brain, manually mixed archive branches, DMDSC and other DM versions are outside this demonstrated scope.
+
+`DamengCaptureScopeTest` covers signature stability and rejected changes, while `DamengSnapshotFilterIT` checks changed filters after a previously excluded table has been dropped and unchanged filters with offline creation or drop/recreation. The current coverage regression passed 4 `DamengRuntimeSafetyIT`, 3 `DamengSnapshotFilterIT` and 2 `DamengConstraintIT` cases; the constraint cases cover snapshot-derived named history through DDL/restart and null event keys for a UNIQUE-only table. Its 78 database integration tests include both primary/standby cases and all five 100,000-row scenarios. The earlier packaged Kafka Connect process run passed both of its cases; the current ZIP was not rerun there. Full external LOB streaming is outside the requested production acceptance scope and remains unsupported.
