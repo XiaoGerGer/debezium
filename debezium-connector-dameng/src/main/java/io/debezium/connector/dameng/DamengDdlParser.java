@@ -14,6 +14,13 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 
+import io.debezium.connector.dameng.compatibility.DamengIdentifierRules;
+import io.debezium.connector.dameng.ddl.DamengDdlStatementAnalyzer;
+import io.debezium.connector.dameng.ddl.DamengDdlStatementAnalyzer.Analysis;
+import io.debezium.connector.dameng.ddl.DamengDdlStatementAnalyzer.Impact;
+import io.debezium.connector.dameng.ddl.DamengSqlLexer;
+import io.debezium.connector.dameng.ddl.DamengSqlLexer.Kind;
+import io.debezium.connector.dameng.ddl.DamengSqlLexer.Token;
 import io.debezium.relational.Attribute;
 import io.debezium.relational.Column;
 import io.debezium.relational.ColumnEditor;
@@ -29,21 +36,38 @@ import io.debezium.relational.Tables;
  */
 public final class DamengDdlParser {
     static final String CONSTRAINT_PREFIX = "dameng.constraint.";
-    private static final Set<String> COLUMN_CLAUSES = Set.of("DEFAULT", "NOT", "NULL", "PRIMARY", "UNIQUE", "CHECK", "REFERENCES", "CONSTRAINT", "IDENTITY");
+    private static final Set<String> COLUMN_CLAUSES = Set.of("DEFAULT", "NOT", "NULL", "PRIMARY", "UNIQUE", "CHECK", "REFERENCES", "CONSTRAINT", "IDENTITY",
+            "COMMENT", "GENERATED", "AS", "VIRTUAL", "VISIBLE", "STORAGE");
     private final Charset databaseCharset;
     private final boolean characterSemanticsEnabled;
     private final boolean defaultCharacterLength;
     private final boolean nationalCharacterLength;
+    private final DamengSqlLexer lexer;
+    private final DamengDdlStatementAnalyzer analyzer;
+    private final DamengIdentifierRules identifierRules;
 
     public DamengDdlParser() {
         this(StandardCharsets.UTF_8, true, false, false);
     }
 
     public DamengDdlParser(Charset databaseCharset, boolean characterSemanticsEnabled, boolean defaultCharacterLength, boolean nationalCharacterLength) {
+        this(databaseCharset, characterSemanticsEnabled, defaultCharacterLength, nationalCharacterLength, false);
+    }
+
+    public DamengDdlParser(Charset databaseCharset, boolean characterSemanticsEnabled, boolean defaultCharacterLength, boolean nationalCharacterLength,
+                           boolean nestedComments) {
+        this(databaseCharset, characterSemanticsEnabled, defaultCharacterLength, nationalCharacterLength, nestedComments, new DamengIdentifierRules(false));
+    }
+
+    public DamengDdlParser(Charset databaseCharset, boolean characterSemanticsEnabled, boolean defaultCharacterLength, boolean nationalCharacterLength,
+                           boolean nestedComments, DamengIdentifierRules identifierRules) {
         this.databaseCharset = databaseCharset;
         this.characterSemanticsEnabled = characterSemanticsEnabled;
         this.defaultCharacterLength = defaultCharacterLength;
         this.nationalCharacterLength = nationalCharacterLength;
+        this.lexer = new DamengSqlLexer(nestedComments);
+        this.identifierRules = identifierRules;
+        this.analyzer = new DamengDdlStatementAnalyzer(lexer, identifierRules);
     }
 
     public enum Type {
@@ -57,77 +81,49 @@ public final class DamengDdlParser {
     public record SchemaChange(Type type, Table table, TableId tableId, TableId previousTableId) {
     }
 
+    /** Analyze one original LogMiner record once, before filtering or parsing. */
+    public Analysis analyze(String ddl, String defaultSchema) {
+        return analyzer.analyze(ddl, defaultSchema).requireSupported();
+    }
+
     /** Resolves the DDL target before table filtering, even when LogMiner omits SEG_OWNER. */
     public TableId resolveTableId(String ddl, String defaultSchema) {
-        if (isNonTableDdl(ddl)) {
-            return null;
-        }
-        final var tokens = new Tokens(tokenize(ddl));
-        if (tokens.take("CREATE") || tokens.take("ALTER") || tokens.take("DROP") || tokens.take("TRUNCATE")) {
-            tokens.expect("TABLE");
-        }
-        else if (tokens.take("RENAME")) {
-            tokens.take("TABLE");
-        }
-        else {
-            throw tokens.error("Unsupported table DDL");
-        }
-        return tokens.tableId(defaultSchema);
+        return analyze(ddl, defaultSchema).tableId();
     }
 
     /** Returns the destination of a table rename without requiring its historical schema. */
     public TableId resolveRenamedTableId(String ddl, String defaultSchema) {
-        final var tokens = new Tokens(tokenize(ddl));
-        if (tokens.take("ALTER")) {
-            tokens.expect("TABLE");
-            final var previous = tokens.tableId(defaultSchema);
-            if (!tokens.take("RENAME") || !tokens.take("TO")) {
-                return null;
-            }
-            final var renamed = tokens.tableId(previous.schema());
-            tokens.end();
-            return renamed;
-        }
-        if (tokens.take("RENAME")) {
-            tokens.take("TABLE");
-            final var previous = tokens.tableId(defaultSchema);
-            tokens.expect("TO");
-            final var renamed = tokens.tableId(previous.schema());
-            tokens.end();
-            return renamed;
-        }
-        return null;
+        return analyze(ddl, defaultSchema).renamedTableId();
     }
 
-    /**
-     * Identifies object definitions which cannot change a captured table's columns or
-     * primary key. Unknown statements are deliberately not classified as harmless.
-     */
     public boolean isNonTableDdl(String ddl) {
-        final var tokens = new Tokens(tokenize(ddl));
-        if (tokens.take("CREATE")) {
-            if (tokens.take("OR")) {
-                tokens.expect("REPLACE");
-            }
-            tokens.take("UNIQUE");
-            return tokens.peek("INDEX") || tokens.peek("SEQUENCE") || tokens.peek("VIEW") || tokens.peek("SYNONYM")
-                    || tokens.peek("PROCEDURE") || tokens.peek("FUNCTION") || tokens.peek("TRIGGER");
+        return analyzer.analyze(ddl, null).impact() == Impact.NO_TABLE_CHANGE;
+    }
+
+    /** Computes a single historical change without modifying the live model. */
+    public List<SchemaChange> plan(Analysis analysis, Tables tables) {
+        analysis.requireSupported();
+        if (analysis.impact() == Impact.NO_TABLE_CHANGE) {
+            return List.of();
         }
-        if (tokens.take("DROP") || tokens.take("ALTER")) {
-            return tokens.peek("INDEX") || tokens.peek("SEQUENCE") || tokens.peek("VIEW") || tokens.peek("SYNONYM")
-                    || tokens.peek("PROCEDURE") || tokens.peek("FUNCTION") || tokens.peek("TRIGGER");
-        }
-        return false;
+        return List.of(parseStatement(new Tokens(analysis.tokens()), tables.clone(), analysis.tableId().schema()));
     }
 
     public List<SchemaChange> parse(String ddl, Tables tables, String defaultSchema) {
         Objects.requireNonNull(ddl, "ddl");
         Objects.requireNonNull(tables, "tables");
+        final var values = lexer.tokenize(ddl);
+        if (analyzer.analyzeTokens(ddl, values, defaultSchema).impact() == Impact.NO_TABLE_CHANGE) {
+            return List.of();
+        }
         final var working = tables.clone();
         List<SchemaChange> changes = new ArrayList<>();
-        for (List<Token> statement : split(tokenize(ddl), ";")) {
+        for (List<Token> statement : split(values, ";")) {
             if (!statement.isEmpty()) {
-                changes.add(parseStatement(new Tokens(statement), working, defaultSchema));
+                final var analysis = analyzer.analyzeTokens(ddl, statement, defaultSchema).requireSupported();
+                if (analysis.impact() == Impact.TABLE) {
+                    changes.add(parseStatement(new Tokens(statement), working, defaultSchema));
+                }
             }
         }
         // A malformed later statement must not leave a partially updated schema behind.
@@ -147,15 +143,29 @@ public final class DamengDdlParser {
 
     private SchemaChange parseStatement(Tokens tokens, Tables tables, String defaultSchema) {
         if (tokens.take("CREATE")) {
+            if (tokens.peek("GLOBAL") || tokens.peek("TEMPORARY") || tokens.peek("EXTERNAL") || tokens.peek("HUGE")) {
+                throw tokens.error("Captured temporary, external and HUGE tables do not have verified complete LogMiner row images");
+            }
             tokens.expect("TABLE");
             final var id = tokens.tableId(defaultSchema);
+            if (id.table().startsWith("#")) {
+                throw tokens.error("Captured temporary tables do not have complete LogMiner row images");
+            }
             if (tables.forTable(id) != null) {
                 throw tokens.error("CREATE TABLE refers to an existing table " + id);
             }
             final var editor = Table.editor().tableId(id);
-            final var definitions = tokens.group();
+            if (tokens.take("LIKE")) {
+                copyColumns(editor, requireTable(tables, tokens.tableId(defaultSchema)));
+            }
+            else if (tokens.take("AS")) {
+                selectColumns(editor, tokens, tables, defaultSchema);
+            }
+            else {
+                addDefinitions(editor, tokens.group());
+                tableOptions(tokens, editor);
+            }
             tokens.end();
-            addDefinitions(editor, definitions);
             final var table = editor.create();
             tables.overwriteTable(table);
             return new SchemaChange(Type.CREATE, table, id, null);
@@ -195,6 +205,234 @@ public final class DamengDdlParser {
             return new SchemaChange(Type.TRUNCATE, requireTable(tables, id), id, null);
         }
         throw tokens.error("Unsupported Dameng DDL");
+    }
+
+    private void copyColumns(TableEditor target, Table source) {
+        for (var column : source.columns()) {
+            if (target.columnWithName(column.name()) != null) {
+                throw new IllegalArgumentException("Duplicate CTAS output column " + column.name());
+            }
+            target.addColumn(copiedColumn(column).create());
+        }
+    }
+
+    private ColumnEditor copiedColumn(Column source) {
+        // Native CTAS/LIKE copies values and nullability, not keys, defaults,
+        // identity generators, constraints, comments or the source object id.
+        return source.edit().unsetDefaultValueExpression().autoIncremented(false).generated(false).comment(null);
+    }
+
+    private void selectColumns(TableEditor target, Tokens tokens, Tables tables, String defaultSchema) {
+        tokens.expect("SELECT");
+        final int start = tokens.index;
+        int depth = 0;
+        while (!tokens.finished()) {
+            if (depth == 0 && tokens.peek("FROM")) {
+                break;
+            }
+            if (tokens.take("(")) {
+                depth++;
+            }
+            else if (tokens.take(")")) {
+                depth--;
+            }
+            else {
+                tokens.index++;
+            }
+        }
+        final var projections = split(tokens.values.subList(start, tokens.index), ",");
+        tokens.expect("FROM");
+        final var source = requireTable(tables, tokens.tableId(defaultSchema));
+        String alias = source.id().table();
+        if (tokens.take("AS")) {
+            alias = tokens.identifier();
+        }
+        else if (!tokens.finished() && !tokens.peek("WHERE")) {
+            alias = tokens.identifier();
+        }
+        // Predicates choose rows but do not change projection types. Expressions
+        // with joins, set operators or aggregates require a separate type model.
+        if (tokens.take("WHERE")) {
+            final var predicate = tokens.remaining();
+            expression(predicate);
+            for (var token : predicate) {
+                if (Set.of("SELECT", "UNION", "INTERSECT", "MINUS", "EXCEPT", "GROUP", "HAVING", "INTO").stream().anyMatch(token::keyword)) {
+                    throw token.error("Unsupported CTAS query scope; only a single historical source table is supported");
+                }
+            }
+        }
+        tokens.end();
+        for (var projection : projections) {
+            final var item = new Tokens(projection);
+            if (item.take("*")) {
+                item.end();
+                copyColumns(target, source);
+                continue;
+            }
+            final ColumnEditor column;
+            if (item.take("CAST")) {
+                final var cast = new Tokens(item.group());
+                final var original = projectedColumn(cast, source, alias);
+                cast.expect("AS");
+                column = copiedColumn(original).optional(true);
+                dataType(column, cast);
+                cast.end();
+                item.expect("AS");
+                column.name(item.identifier());
+            }
+            else {
+                column = copiedColumn(projectedColumn(item, source, alias));
+                if (item.take("AS")) {
+                    column.name(item.identifier());
+                }
+                else if (!item.finished()) {
+                    column.name(item.identifier());
+                }
+            }
+            item.end();
+            if (target.columnWithName(column.name()) != null) {
+                throw item.error("Duplicate CTAS output column " + column.name());
+            }
+            target.addColumn(column.create());
+        }
+    }
+
+    private Column projectedColumn(Tokens tokens, Table source, String alias) {
+        String name = tokens.identifier();
+        if (tokens.take(".")) {
+            if (!name.equals(alias)) {
+                throw tokens.error("Unknown CTAS source qualifier " + name);
+            }
+            name = tokens.identifier();
+        }
+        final var column = source.columnWithName(name);
+        if (column == null) {
+            throw tokens.error("Unknown historical CTAS source column " + name);
+        }
+        return column;
+    }
+
+    private void tableOptions(Tokens tokens, TableEditor table) {
+        while (!tokens.finished()) {
+            if (tokens.take("TABLESPACE")) {
+                tokens.identifier();
+            }
+            else if (tokens.take("STORAGE")) {
+                storageOptions(new Tokens(tokens.group()));
+            }
+            else if (tokens.take("PARTITION")) {
+                partitionOptions(tokens, table);
+            }
+            else if (tokens.take("DISKSPACE")) {
+                if (!tokens.take("UNLIMITED")) {
+                    tokens.expect("LIMIT");
+                    tokens.integer();
+                }
+            }
+            else if (tokens.take("NOPARALLEL")) {
+                // Physical execution policy does not alter the captured columns.
+            }
+            else if (tokens.take("PARALLEL")) {
+                if (!tokens.finished() && tokens.values.get(tokens.index).kind() == Kind.NUMBER) {
+                    tokens.integer();
+                }
+            }
+            else if (tokens.take("SEGMENT")) {
+                tokens.expect("CREATION");
+                if (!tokens.take("IMMEDIATE")) {
+                    tokens.expect("DEFERRED");
+                }
+            }
+            else if (tokens.take("COMPRESS")) {
+                tokens.take("EXCEPT");
+                if (tokens.peek("(")) {
+                    identifiers(tokens.group()).forEach(name -> requireColumn(table, name));
+                }
+            }
+            else {
+                throw tokens.error("Unsupported table storage or partition option");
+            }
+        }
+    }
+
+    private void storageOptions(Tokens tokens) {
+        do {
+            if (tokens.take("ON")) {
+                tokens.identifier();
+            }
+            else if (tokens.take("INITIAL") || tokens.take("NEXT") || tokens.take("MINEXTENTS") || tokens.take("FILLFACTOR")) {
+                tokens.integer();
+            }
+            else if (tokens.take("BRANCH")) {
+                if (tokens.take("(")) {
+                    tokens.integer();
+                    tokens.expect(",");
+                    tokens.integer();
+                    tokens.expect(")");
+                }
+                else {
+                    tokens.integer();
+                }
+            }
+            else if (tokens.take("NOBRANCH") || tokens.take("CLUSTERBTR")) {
+                // Heap/index organization preserves the logical column model.
+            }
+            else if (tokens.take("WITH") || tokens.take("WITHOUT")) {
+                tokens.expect("COUNTER");
+            }
+            else {
+                tokens.take("DISABLE");
+                tokens.expect("USING");
+                tokens.expect("LONG");
+                tokens.expect("ROW");
+            }
+        } while (tokens.take(","));
+        tokens.end();
+    }
+
+    private void partitionOptions(Tokens tokens, TableEditor table) {
+        tokens.expect("BY");
+        final boolean hash = tokens.take("HASH");
+        final boolean range = !hash && tokens.take("RANGE");
+        if (!hash && !range) {
+            tokens.expect("LIST");
+        }
+        identifiers(tokens.group()).forEach(name -> requireColumn(table, name));
+        if (hash && tokens.take("PARTITIONS")) {
+            if (tokens.integer() <= 0) {
+                throw tokens.error("Partition count must be positive");
+            }
+            if (tokens.take("STORE")) {
+                tokens.expect("IN");
+                identifiers(tokens.group());
+            }
+            return;
+        }
+        for (var definition : split(tokens.group(), ",")) {
+            final var partition = new Tokens(definition);
+            partition.expect("PARTITION");
+            partition.identifier();
+            if (!hash) {
+                partition.expect("VALUES");
+                if (range) {
+                    if (partition.take("EQU")) {
+                        partition.expect("OR");
+                    }
+                    partition.expect("LESS");
+                    partition.expect("THAN");
+                }
+                expression(partition.group());
+            }
+            while (!partition.finished()) {
+                if (partition.take("TABLESPACE")) {
+                    partition.identifier();
+                }
+                else {
+                    partition.expect("STORAGE");
+                    storageOptions(new Tokens(partition.group()));
+                }
+            }
+        }
     }
 
     private SchemaChange alter(Tokens tokens, Tables tables, TableId id) {
@@ -263,7 +501,7 @@ public final class DamengDdlParser {
             final var column = requireColumn(editor, name).edit();
             if (tokens.take("SET")) {
                 if (tokens.take("DEFAULT")) {
-                    column.defaultValueExpression(expression(tokens.remaining()));
+                    column.defaultValueExpression(defaultExpression(tokens.remaining()));
                 }
                 else {
                     tokens.expect("NOT");
@@ -323,7 +561,7 @@ public final class DamengDdlParser {
         }
     }
 
-    private static void tableConstraint(TableEditor editor, Tokens tokens) {
+    private void tableConstraint(TableEditor editor, Tokens tokens) {
         final var name = tokens.take("CONSTRAINT") ? tokens.identifier() : null;
         final String kind;
         if (tokens.take("PRIMARY")) {
@@ -381,7 +619,17 @@ public final class DamengDdlParser {
                 column.optional(true);
             }
             else if (tokens.take("DEFAULT")) {
-                column.defaultValueExpression(expression(tokens.defaultExpression()));
+                if (tokens.take("ON")) {
+                    tokens.expect("NULL");
+                    column.optional(false);
+                }
+                column.defaultValueExpression(defaultExpression(tokens.defaultExpression()));
+            }
+            else if (tokens.take("COMMENT")) {
+                column.comment(tokens.string());
+            }
+            else if (tokens.peek("GENERATED") || tokens.peek("AS") || tokens.peek("VIRTUAL")) {
+                throw tokens.error("Virtual/generated columns contain NULL rather than computed values in LogMiner redo; capture is unsupported");
             }
             else if (tokens.take("PRIMARY")) {
                 tokens.expect("KEY");
@@ -420,7 +668,7 @@ public final class DamengDdlParser {
         }
     }
 
-    private static void references(Tokens tokens) {
+    private void references(Tokens tokens) {
         tokens.expect("REFERENCES");
         tokens.tableId(null);
         if (tokens.peek("(")) {
@@ -454,6 +702,22 @@ public final class DamengDdlParser {
     private void dataType(ColumnEditor column, Tokens tokens) {
         final int start = tokens.index;
         String name = tokens.identifier().toUpperCase(Locale.ROOT);
+        if (name.equals("INTERVAL")) {
+            tokens.identifier();
+            if (tokens.peek("(")) {
+                tokens.group();
+            }
+            if (tokens.take("TO")) {
+                tokens.identifier();
+                if (tokens.peek("(")) {
+                    tokens.group();
+                }
+            }
+            final var declaration = expression(tokens.values.subList(start, tokens.index));
+            final var interval = DamengInterval.type(declaration);
+            column.jdbcType(Types.OTHER).type(interval.typeName(), declaration).length(interval.leadingPrecision()).scale(interval.fractionalPrecision());
+            return;
+        }
         if (name.equals("DOUBLE")) {
             tokens.take("PRECISION");
         }
@@ -479,6 +743,9 @@ public final class DamengDdlParser {
         boolean timeZone = false;
         if (name.equals("TIMESTAMP") || name.equals("DATETIME") || name.equals("TIME") || name.equals("DATETIME2")) {
             if (tokens.take("WITH")) {
+                // TODO Add LOCAL TIME ZONE DDL metadata when the source time-zone contract in
+                // DamengValueConverters.schemaBuilder is implemented and verified. Preserve its
+                // distinct type semantics; snapshot and historical redo must agree on the instant.
                 // LOCAL TIME ZONE depends on the database session and is not treated as
                 // a standard offset timestamp without an explicit conversion contract.
                 tokens.expect("TIME");
@@ -488,7 +755,7 @@ public final class DamengDdlParser {
             if (scale != null) {
                 throw tokens.error("Temporal types accept one precision parameter");
             }
-            scale = length < 0 ? (name.equals("DATETIME2") ? 9 : 6) : length;
+            scale = length < 0 ? (name.equals("TIME") ? 0 : name.equals("DATETIME2") ? 9 : 6) : length;
             length = (name.equals("TIME") ? 15 : 29) + (scale == 0 ? 0 : scale + 1) + (timeZone ? 7 : 0);
         }
         final int jdbcType = switch (name) {
@@ -575,7 +842,7 @@ public final class DamengDdlParser {
         return column;
     }
 
-    private static List<String> identifiers(List<Token> values) {
+    private List<String> identifiers(List<Token> values) {
         List<String> result = new ArrayList<>();
         for (List<Token> item : split(values, ",")) {
             final var tokens = new Tokens(item);
@@ -589,16 +856,29 @@ public final class DamengDdlParser {
         if (values.isEmpty()) {
             throw new IllegalArgumentException("Empty SQL expression");
         }
-        return String.join(" ", values.stream().map(Token::text).toList());
+        final var first = values.get(0);
+        return first.source().substring(first.start(), values.get(values.size() - 1).end());
     }
 
-    private record Token(String text) {
-        boolean keyword(String keyword) {
-            return text.equalsIgnoreCase(keyword);
+    private static String defaultExpression(List<Token> values) {
+        // History is read without the original database session. Remove only the
+        // comments already identified by this configured lexer, so later default
+        // conversion cannot reinterpret a nested comment as SQL or hide an operator.
+        // Preserve token spelling and adjacency (e.g. .5), and all string contents.
+        if (values.isEmpty()) {
+            throw new IllegalArgumentException("Empty SQL expression");
         }
+        final var result = new StringBuilder();
+        int end = values.get(0).start();
+        for (var token : values) {
+            final var gap = token.source().substring(end, token.start());
+            result.append(gap.isBlank() ? gap : " ").append(token.text());
+            end = token.end();
+        }
+        return result.toString();
     }
 
-    private static final class Tokens {
+    private final class Tokens {
         private final List<Token> values;
         private int index;
 
@@ -615,7 +895,7 @@ public final class DamengDdlParser {
         }
 
         private String peekKeyword() {
-            return finished() ? "" : values.get(index).text().toUpperCase(Locale.ROOT);
+            return finished() || values.get(index).kind() != Kind.WORD ? "" : values.get(index).text().toUpperCase(Locale.ROOT);
         }
 
         private boolean take(String keyword) {
@@ -639,26 +919,23 @@ public final class DamengDdlParser {
         }
 
         private IllegalArgumentException error(String message) {
-            return new IllegalArgumentException(message + " near " + values.subList(index, values.size()));
+            if (!finished()) {
+                return values.get(index).error(message);
+            }
+            final var last = values.isEmpty() ? null : values.get(values.size() - 1);
+            return DamengSqlLexer.error(last == null ? "" : last.source(), last == null ? 0 : last.end(), message);
         }
 
         private String identifier() {
             if (finished()) {
                 throw error("Expected identifier");
             }
-            final var text = values.get(index++).text();
-            if (text.startsWith("\"")) {
-                return text.substring(1, text.length() - 1).replace("\"\"", "\"");
-            }
-            if (!Character.isLetter(text.charAt(0)) && text.charAt(0) != '_' && text.charAt(0) != '#') {
-                throw error("Invalid unquoted identifier " + text);
-            }
-            return text.toUpperCase(Locale.ROOT);
+            return identifierRules.identifier(values.get(index++));
         }
 
         private TableId tableId(String defaultSchema) {
             final var first = identifier();
-            return take(".") ? new TableId(null, first, identifier()) : new TableId(null, defaultSchema, first);
+            return take(".") ? new TableId(null, first, identifier()) : new TableId(null, identifierRules.canonicalName(defaultSchema), first);
         }
 
         private int integer() {
@@ -673,6 +950,13 @@ public final class DamengDdlParser {
             catch (NumberFormatException e) {
                 throw error("Expected integer");
             }
+        }
+
+        private String string() {
+            if (finished()) {
+                throw error("Expected SQL string literal");
+            }
+            return values.get(index++).stringValue();
         }
 
         private List<Token> remaining() {
@@ -718,103 +1002,7 @@ public final class DamengDdlParser {
     }
 
     private static List<List<Token>> split(List<Token> tokens, String delimiter) {
-        List<List<Token>> result = new ArrayList<>();
-        int depth = 0;
-        int start = 0;
-        for (int index = 0; index < tokens.size(); index++) {
-            final var token = tokens.get(index);
-            if (token.keyword("(")) {
-                depth++;
-            }
-            else if (token.keyword(")")) {
-                depth--;
-            }
-            else if (depth == 0 && token.keyword(delimiter)) {
-                result.add(tokens.subList(start, index));
-                start = index + 1;
-            }
-            if (depth < 0) {
-                throw new IllegalArgumentException("Unexpected closing parenthesis in DDL");
-            }
-        }
-        if (depth != 0) {
-            throw new IllegalArgumentException("Unbalanced parentheses in DDL");
-        }
-        result.add(tokens.subList(start, tokens.size()));
-        return result;
+        return DamengSqlLexer.split(tokens, delimiter);
     }
 
-    private static List<Token> tokenize(String input) {
-        List<Token> result = new ArrayList<>();
-        int offset = 0;
-        while (offset < input.length()) {
-            final char c = input.charAt(offset);
-            if (Character.isWhitespace(c)) {
-                offset++;
-                continue;
-            }
-            if (input.startsWith("--", offset)) {
-                final int newline = input.indexOf('\n', offset + 2);
-                offset = newline < 0 ? input.length() : newline + 1;
-                continue;
-            }
-            if (input.startsWith("/*", offset)) {
-                final int close = input.indexOf("*/", offset + 2);
-                if (close < 0) {
-                    throw new IllegalArgumentException("Unclosed SQL comment");
-                }
-                offset = close + 2;
-                continue;
-            }
-            final int start = offset++;
-            if (c == '\'' || c == '"') {
-                boolean closed = false;
-                while (offset < input.length()) {
-                    if (input.charAt(offset++) == c) {
-                        if (offset < input.length() && input.charAt(offset) == c) {
-                            offset++;
-                        }
-                        else {
-                            closed = true;
-                            break;
-                        }
-                    }
-                }
-                if (!closed) {
-                    throw new IllegalArgumentException("Unclosed SQL quoted value");
-                }
-            }
-            else if (Character.isDigit(c)) {
-                while (offset < input.length() && Character.isDigit(input.charAt(offset))) {
-                    offset++;
-                }
-                if (offset < input.length() && input.charAt(offset) == '.') {
-                    offset++;
-                    while (offset < input.length() && Character.isDigit(input.charAt(offset))) {
-                        offset++;
-                    }
-                }
-                if (offset < input.length() && (input.charAt(offset) == 'e' || input.charAt(offset) == 'E')) {
-                    offset++;
-                    if (offset < input.length() && (input.charAt(offset) == '+' || input.charAt(offset) == '-')) {
-                        offset++;
-                    }
-                    while (offset < input.length() && Character.isDigit(input.charAt(offset))) {
-                        offset++;
-                    }
-                }
-            }
-            else if (Character.isLetter(c) || c == '_' || c == '#' || c == '$') {
-                while (offset < input.length()) {
-                    final char next = input.charAt(offset);
-                    if (!Character.isLetterOrDigit(next) && next != '_' && next != '#' && next != '$') {
-                        break;
-                    }
-                    offset++;
-                }
-            }
-            result.add(new Token(input.substring(start, offset)));
-        }
-        return result;
-    }
 }

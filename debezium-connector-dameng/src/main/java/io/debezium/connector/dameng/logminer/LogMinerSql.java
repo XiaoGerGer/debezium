@@ -47,10 +47,12 @@ public final class LogMinerSql {
         // Large transactions can be replayed across many windows. Fetch only the
         // consumed fields, avoiding repeated JDBC transfer of unused undo SQL and values.
         StringBuilder sql = new StringBuilder(
-                "SELECT SCN, START_SCN, COMMIT_SCN, TIMESTAMP, XID, OPERATION_CODE, ROLL_BACK, SEG_OWNER, TABLE_NAME, USERNAME, SQL_REDO, RS_ID, SSN, CSF, DATA_OBJ# FROM V$LOGMNR_CONTENTS WHERE SCN >= ? AND SCN <= ?");
+                "SELECT SCN, START_SCN, COMMIT_SCN, TIMESTAMP, XID, OPERATION_CODE, ROLL_BACK, SEG_OWNER, TABLE_NAME, USERNAME, SQL_REDO, RS_ID, SSN, CSF, DATA_OBJ#, DATA_OBJV#, RBASQN, RBABLK, RBABYTE FROM V$LOGMNR_CONTENTS WHERE SCN >= ? AND SCN <= ?");
         // Keep every operation and every table in the window. A transaction can start in an
         // earlier window and commit in this one; filtering DML here would make pinning unsafe.
-        sql.append(" ORDER BY COMMIT_SCN, SCN, RBASQN, RBABLK, RBABYTE, SSN");
+        // Rollback rows can have COMMIT_SCN=0 even when the rest of their transaction
+        // has committed. Preserve redo order while buffering; sort completed transactions later.
+        sql.append(" ORDER BY SCN, RBASQN, RBABLK, RBABYTE, SSN");
         return sql.toString();
     }
 

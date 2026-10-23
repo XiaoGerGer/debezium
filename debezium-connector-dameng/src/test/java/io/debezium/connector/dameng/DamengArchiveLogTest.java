@@ -70,6 +70,18 @@ class DamengArchiveLogTest {
     }
 
     @Test
+    void shouldAdvanceAcrossAFileBoundaryWithANumericGapButRequireTheInclusiveRestartRow() throws Exception {
+        final var next = file("next", 250, 300, 200);
+        when(connection.readArchiveLogFiles()).thenReturn(List.of(next));
+        assertThat(connection.archiveLogsForRange(201, 300)).containsExactly(next);
+        assertThatThrownBy(() -> connection.archiveLogsForRange(200, 300)).hasMessageContaining("restart LSN");
+        assertThatThrownBy(() -> connection.archiveLogsForRange(202, 300)).hasMessageContaining("restart LSN");
+        assertThatThrownBy(() -> connection.archiveLogsForRange(0, 300)).hasMessageContaining("restart LSN");
+        when(connection.readArchiveLogFiles()).thenReturn(List.of(file("unknown-predecessor", 250, 300, 0)));
+        assertThatThrownBy(() -> connection.archiveLogsForRange(1, 300)).hasMessageContaining("restart LSN");
+    }
+
+    @Test
     void shouldNotMoveCoverageBackwardForOverlappingArchiveCopies() throws Exception {
         final var first = file("first", 100, 250, 99);
         final var overlap = file("overlap", 150, 200, 149);

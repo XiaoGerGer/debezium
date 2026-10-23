@@ -24,7 +24,7 @@ class LogMinerSqlTest {
         String sql = LogMinerSql.contentsQuery(null, false);
         assertThat(sql).contains("SCN >= ? AND SCN <= ?");
         assertThat(sql).doesNotContain("OPERATION_CODE IN");
-        assertThat(sql).contains("ORDER BY COMMIT_SCN, SCN, RBASQN, RBABLK, RBABYTE, SSN");
+        assertThat(sql).contains("ORDER BY SCN, RBASQN, RBABLK, RBABYTE, SSN");
         assertThat(sql).contains("DATA_OBJ#");
     }
 

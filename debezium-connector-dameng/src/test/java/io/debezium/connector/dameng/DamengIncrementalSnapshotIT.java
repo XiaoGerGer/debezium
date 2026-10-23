@@ -7,6 +7,7 @@ package io.debezium.connector.dameng;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -21,8 +22,11 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import javax.management.ObjectName;
+
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -104,6 +108,39 @@ class DamengIncrementalSnapshotIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
+    void shouldAutomaticallyCreateTheSignalTableBeforeSnapshotDiscovery() throws Exception {
+        execute("DROP TABLE " + qualified(signalTable));
+        connection.commit();
+        startEngine();
+        requestSnapshot();
+        final Set<Integer> ids = new HashSet<>();
+        for (int index = 0; index < 6; index++) {
+            final var envelope = (Struct) nextDataRecord().value();
+            assertThat(envelope.getString("op")).isEqualTo("r");
+            assertThat(envelope.getStruct("source").getString("snapshot")).isEqualTo("incremental");
+            ids.add(envelope.getStruct("after").getInt32("ID"));
+        }
+        assertThat(ids).containsExactlyInAnyOrder(1, 2, 3, 4, 5, 6);
+        stopConnector();
+        consumedLines.clear();
+        startEngine();
+        // Restart must reuse the same signal table and retain completed watermark rows.
+        try (var statement = connection.createStatement();
+                var rows = statement.executeQuery("SELECT COUNT(*) FROM " + qualified(signalTable) + " WHERE TYPE='snapshot-window-close'")) {
+            assertThat(rows.next()).isTrue();
+            assertThat(rows.getInt(1)).isGreaterThanOrEqualTo(3);
+        }
+        requestSnapshot();
+        final Set<Integer> restartedIds = new HashSet<>();
+        for (int index = 0; index < 6; index++) {
+            final var envelope = (Struct) nextDataRecord().value();
+            assertThat(envelope.getString("op")).isEqualTo("r");
+            restartedIds.add(envelope.getStruct("after").getInt32("ID"));
+        }
+        assertThat(restartedIds).containsExactlyInAnyOrder(1, 2, 3, 4, 5, 6);
+    }
+
+    @Test
     void shouldSnapshotRequestedTableInMultipleChunks() throws Exception {
         startEngine();
         requestSnapshot();
@@ -116,6 +153,7 @@ class DamengIncrementalSnapshotIT extends AbstractAsyncEngineConnectorTest {
             ids.add(envelope.getStruct("after").getInt32("ID"));
         }
         assertThat(ids).containsExactlyInAnyOrder(1, 2, 3, 4, 5, 6);
+        assertCompletedIncrementalMetrics(6, 6, 3);
         try (var statement = connection.createStatement();
                 var rows = statement.executeQuery("SELECT COUNT(*) FROM " + qualified(signalTable) + " WHERE TYPE='snapshot-window-open'")) {
             assertThat(rows.next()).isTrue();
@@ -149,6 +187,9 @@ class DamengIncrementalSnapshotIT extends AbstractAsyncEngineConnectorTest {
         }
         assertThat(updatedIds).containsExactly(1);
         assertThat(snapshotIds).containsExactlyInAnyOrder(2, 3, 4, 5, 6);
+        // The changed row was read into a window and then removed by CDC deduplication.
+        // Only the five accepted snapshot rows contribute to the enqueue counter.
+        assertCompletedIncrementalMetrics(6, 5, 3);
     }
 
     @Test
@@ -290,6 +331,23 @@ class DamengIncrementalSnapshotIT extends AbstractAsyncEngineConnectorTest {
                 assertThat(record.topic()).isNotEqualTo("dameng." + DamengTestDatabase.schema() + "." + table);
             }
         }
+    }
+
+    private void assertCompletedIncrementalMetrics(long scanned, long enqueued, long windows) {
+        final var mbeans = ManagementFactory.getPlatformMBeanServer();
+        Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            assertThat(failure.get()).isNull();
+            final var name = new ObjectName("debezium.dameng:type=connector-metrics,context=snapshot,server=dameng");
+            assertThat(mbeans.isRegistered(name)).isTrue();
+            assertThat(mbeans.getAttribute(name, "IncrementalSnapshotRowsScanned")).isEqualTo(scanned);
+            assertThat(mbeans.getAttribute(name, "IncrementalSnapshotRowsEnqueued")).isEqualTo(enqueued);
+            assertThat(mbeans.getAttribute(name, "IncrementalSnapshotWindowsCompleted")).isEqualTo(windows);
+            assertThat(mbeans.getAttribute(name, "IncrementalSnapshotRunning")).isEqualTo(false);
+            assertThat(mbeans.getAttribute(name, "IncrementalSnapshotPaused")).isEqualTo(false);
+            assertThat(mbeans.getAttribute(name, "IncrementalSnapshotCurrentTable")).isEqualTo("");
+            assertThat(mbeans.getAttribute(name, "IncrementalSnapshotPhase")).isEqualTo("idle");
+            assertThat(mbeans.getAttribute(name, "IncrementalSnapshotCurrentCloseWaitDurationMillis")).isEqualTo(0L);
+        });
     }
 
     private void startEngine() throws Exception {

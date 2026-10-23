@@ -105,8 +105,8 @@ Oracle 也不是所有模式都只读一次。其读取位置受 LOB、CTE、窗
 | F3 | 快照模式 | 支持 `always`、`initial`、`initial_only`、`no_data`、`recovery`、`when_needed`、`configuration_based`、`custom` | [配置类][d-config] 仅支持 `initial`、`initial_only`、`no_data` 和兼容别名 `never`；锁模式只有 `shared` |
 | F4 | 增量快照时 schema 变化 | Oracle 接入公共 schema 变化检测路径并提供表 DDL 获取实现 | 已有源信号表增量快照，但显式拒绝 `incremental.snapshot.allow.schema.changes=true`，只允许一个信号表。不能描述为“没有增量快照” |
 | F5 | 未采集表的 schema 历史 | 可配置记录采集范围外的表结构和 DDL | 初始历史主要覆盖采集过滤器选中的表；`schema.history.internal.store.only.captured.tables.ddl=false` 不会自动扩大历史范围。现已用 `capture_scope` 签名拒绝过滤表达式改变或无签名旧 offset；要求新 identity、fresh history 和 initial snapshot，防止没有历史定义的表静默漏采 |
-| F6 | DDL 覆盖 | 使用 [ANTLR Oracle DDL parser][o-ddl] 和专用 listener | [DamengDdlParser][d-ddl] 是手写 tokenizer/parser，支持常见建表、改列、重命名、删除、清空等。`CREATE TABLE` 在列定义后要求语句结束，额外子句不在该路径支持范围。扩展应以真实 DM redo 为依据 |
-| F7 | 类型映射 | 有 Oracle INTERVAL、时区类型、XML 等专门处理，具体能力依适配器和配置而定 | 普通常见类型已有映射；[Dameng 文档][d-doc] 明确指出原生 interval 和复杂对象等未支持。[DDL 类型分支][d-ddl] 也有显式拒绝路径。不能因名称与 Oracle 相似就复用其语义 |
+| F6 | DDL 覆盖 | 使用 [ANTLR Oracle DDL parser][o-ddl] 和专用 listener | `ddl` 子包拆分词法和完整语句影响范围分析，[DamengDdlParser][d-ddl] 复用单表结构语法并在副本上计算变更，正式模型由 schema history 链路应用。支持常见建表、改列、重命名、删除、清空及已验证的 LONG ROW 存储子句；未知子句与复合 schema/user 操作明确失败。扩展以真实 DM redo 为依据 |
+| F7 | 类型映射 | 有 Oracle INTERVAL、时区类型、XML 等专门处理，具体能力依适配器和配置而定 | 普通常见类型已有映射；2026-10-12 补充全部 13 种原生 INTERVAL 的精确字符串映射，复用 Debezium Interval 公共格式，支持 JDBC、历史 DDL、redo 及匹配的常量默认值。复杂对象及 LOCAL TIME ZONE 仍有明确拒绝路径。INTERVAL 不使用平均月天数或整数微秒近似，相关边界与 CRUD 证据见[达梦主手册的数据类型章节](documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-data-types) |
 | F8 | 专用监控指标 | [LogMiner 指标接口][o-metrics] 包含活跃事务数、最老 SCN、查询/解析/提交耗时和吞吐等 | [Task][d-task] 已接入 Dameng metrics factory，并保留公共指标。新增窗口累计预算/输入行及峰值、开放事务数、replay/scan/latest archived LSN、容量失败数和总扫描耗时；重读放大率、细分阶段耗时及归档等待仍缺失 |
 | F9 | 事件 source 元数据 | 可提供用户名、redo SQL、row ID、事务开始/提交时间等扩展字段 | [DamengSourceInfoStructMaker][d-source] 主要提供 schema/table、LSN、change LSN、commit LSN、事务 ID 和事件序号。需要根据审计和排障需求决定是否扩展 |
 
@@ -118,6 +118,22 @@ Oracle 也不是所有模式都只读一次。其读取位置受 LOB、CTE、窗
 
 当前文档还将 blocking snapshot、初始快照并行分块和自定义 snapshotter 列为未实现并验证的能力。公共基类提供部分基础设施，因此接手时需区分“缺少 connector 适配”“继承路径可用但未验证”和“显式不支持”，不要仅以缺少同名类推断完全没有实现。
 
+**DDL 健壮性：词法、影响范围与历史变更分离（2026-10-14）**
+
+现场 `//` 注释后接 `GRANT SELECT` 的失败已纳入回归。借鉴 Oracle 的职责分离，在 `ddl` 子包新增 `DamengSqlLexer` 和 `DamengDdlStatementAnalyzer`，保留现有 `DamengDdlParser` 单表语法。每条流式 DDL 只做一次词法分析，先判定完整输入的影响范围，再执行捕获过滤与历史模型解析。
+
+词法保留原始位置、SQL 和字值内容，区分关键字、引用标识符及字符串；支持 `--`、`//`、普通块注释和提示、双写引号、national string 和 Q 引用。模式策略接受 `BACKSLASH_ESCAPE`、`NESTED_C_STYLE_COMMENT` 的 `0/1` 组合，未知值不假设为默认值。原生 DM 8.1.2.128 中两种反斜杠参数值均保留普通、N、Q 字符串的反斜杠，不套用 MySQL 转义。非嵌套块注释在第一个 `*/` 结束；嵌套模式按层数匹配闭合。闭合后的剩余输入仍按 SQL 分析。可执行注释明确拒绝；不开放 PostgreSQL dollar quoting 或 MySQL hash 注释。保存列默认表达式前仅移除已识别的注释，避免 history 恢复后以错误的注释规则吞掉表达式运算符。词法参数需在保留归档区间内不变，不能凭当前参数重解释旧 DDL。现行支持边界见[达梦主手册的 DDL 章节](documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-ddl)。
+
+权限、索引、序列、视图、同义词及可确定完整边界的过程/函数/触发器定义不修改采集行结构；完整校验的 `COMMENT ON TABLE/COLUMN` 也接受并跳过，流式字段注释暂不刷新。过程中的分号不按普通 SQL 分割；正文需有可识别的完整 `BEGIN ... END`，复杂声明等未支持形式仍会报错。非表语句后夹带表 DDL 或未知语句不能被首句隐藏。
+
+CREATE/ALTER/DROP/TRUNCATE/RENAME 表语句复用已有语法；未知 ALTER 子句对已跟踪表仍报错。解析先在模型副本上计算变更，成功后由 `DamengDatabaseSchema` 的事件/历史链路应用正式模型，不再先修改共享 `Tables`。识别或解析失败包含 LSN、对象标识及词法/语法位置，保留该条语句前的结构和 offset；不使用当前 JDBC 结构解释历史日志。
+
+保留限制：原始 LogMiner 单条记录最多承载一个结构变更；复合 `CREATE SCHEMA`、`DROP SCHEMA`、`DROP USER`（含级联）明确不支持，不能仅因主表名未知就跳过。非零兼容模式仍需独立策略和验收。多表结构计划、可执行注释、复杂过程声明及流式注释元数据刷新是后续工作。2026-10-15 已补上 offset 参数签名及启动/运行时核对；旧无签名 offset 需新身份和初始快照，检查本身不能重建未记录的历史参数。
+
+三项 P1 另加入统一标识符策略、同表大小写冲突检查，以及有限 CTAS/LIKE、常见存储选项、单层 HASH/RANGE/LIST 分区、内联列 COMMENT 与 DEFAULT ON NULL。CTAS 基于历史源结构；临时/HUGE/外部表及虚拟列因日志不完整或未验收而明确拒绝。CASE_SENSITIVE=0 不开放；IDENTIFIER_MODE=1 和旧库不支持的语法仅有 parser 单测。具体范围、数据库证据与升级影响见词法核对报告。
+
+回归包含词法位置/引用边界、夹带语句、失败不改变历史模型、改表后 DML、停机重放及再次重启恢复。执行结果见 `debezium-connector-dameng/src/test/testing.adoc`；直接语法探针不能替代 Connector 的数据正确性验收。
+
 **需要单独看待的数据库机制差异**
 
 | 项目 | 结论 |
@@ -125,7 +141,7 @@ Oracle 也不是所有模式都只读一次。其读取位置受 LOB、CTE、窗
 | 在线 redo 与归档 | Oracle 路径可使用在线 redo 和归档；当前 Dameng LogMiner 路径从归档读取，事件延迟包含等待归档的时间。不能将数据库归档等待全部计为 Java 处理耗时 |
 | 字典策略 | Oracle 有 online catalog、redo catalog、hybrid、dictionary file 等策略。Dameng 刻意不使用在线字典，以历史 schema 解析 `OBJ#`、`COL n`，避免当前结构误解历史日志 |
 | 采集适配器 | Oracle 配置有 Buffered/Unbuffered LogMiner、XStream、OLR；Dameng 只有当前 LogMiner 路径。Dameng 虽然定义了 `COMMITTED_DATA_ONLY` 常量，实际流式调用传入 `false`，不代表已具备 Oracle Unbuffered 等价实现 |
-| RAC、PDB、XStream | 属于 Oracle 专属机制，不是直接移植目标。DM 单实例主备的连接和身份校验已按官方机制实现并单独验收；备库采集和 DMDSC 不在此支持范围 |
+| RAC、PDB、XStream | 属于 Oracle 专属机制，不是直接移植目标。DM 单实例主备的连接和身份校验已按官方机制实现；8.1.3.162 指定构建新增主库写信号、备库 LogMiner/快照读取，配置与测试边界以统一手册和测试说明为准。旧版本探针不代表新构建能力；DMDSC 仍不支持 |
 | 数据库版本与模式 | 当前 Dameng 文档记录了特定 DM8 构建及 JDBC 版本，启动校验要求 native compatibility 等配置。类型、时间精度和日志格式结论不能未经验证推广到全部 DM 版本 |
 
 **已经实现、优化时必须保留的能力**

@@ -163,6 +163,11 @@ public abstract class AbstractSchemaHistory implements SchemaHistory {
     protected abstract void recoverRecords(Consumer<HistoryRecord> records) throws InterruptedException;
 
     @Override
+    public void readRecords(Consumer<HistoryRecord> records) throws InterruptedException {
+        recoverRecords(records);
+    }
+
+    @Override
     public void stop() {
         listener.stopped();
     }

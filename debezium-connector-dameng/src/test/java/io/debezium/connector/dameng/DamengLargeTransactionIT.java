@@ -94,7 +94,10 @@ class DamengLargeTransactionIT extends AbstractAsyncEngineConnectorTest {
         execute(connection, "CREATE TABLE " + tableName() + " (ID INT PRIMARY KEY, REVISION INT, PAYLOAD VARCHAR(2000))");
         connection.commit();
         config = Configuration.create()
+                .with("log.mining.window.strategy", System.getProperty("dameng.test.window.strategy", "archive_bytes"))
                 .with("topic.prefix", "dameng")
+                .with("log.mining.buffer.memory.bytes", 64 * 1024)
+                .with("log.mining.buffer.spill.path", temporaryDirectory.resolve("spill").toString())
                 .with("database.hostname", DamengTestDatabase.hostname())
                 .with("database.port", DamengTestDatabase.port())
                 .with("database.user", DamengTestDatabase.user())
@@ -262,6 +265,9 @@ class DamengLargeTransactionIT extends AbstractAsyncEngineConnectorTest {
         insertRows(connection, retained + 1, ROWS);
         execute(connection, "UPDATE " + tableName() + " SET REVISION=99 WHERE ID<=" + retained);
         commitMarker(ROWS + 1);
+        try (var files = java.nio.file.Files.walk(temporaryDirectory.resolve("spill"))) {
+            assertThat(files.filter(java.nio.file.Files::isRegularFile).count()).isPositive();
+        }
         connection.rollback(savepoint);
         execute(connection, "UPDATE " + tableName() + " SET REVISION=1 WHERE ID=1");
         connection.commit();

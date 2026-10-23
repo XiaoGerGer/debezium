@@ -14,4 +14,13 @@ public interface ChangeEventQueueMetrics {
     long maxQueueSizeInBytes();
 
     long currentQueueSizeInBytes();
+
+    /**
+     * Cumulative nanoseconds spent awaiting queue space, including condition-lock
+     * reacquisition. Does not include poll waits or uncontended enqueue work.
+     * Providers without this measurement retain the default value.
+     */
+    default long enqueueWaitNanos() {
+        return 0;
+    }
 }

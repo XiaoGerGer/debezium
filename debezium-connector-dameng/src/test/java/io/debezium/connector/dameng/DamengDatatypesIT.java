@@ -6,12 +6,14 @@
 package io.debezium.connector.dameng;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertAll;
 
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.sql.Types;
 import java.time.Duration;
 import java.time.LocalDate;
@@ -21,7 +23,9 @@ import java.time.OffsetDateTime;
 import java.time.OffsetTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -31,12 +35,12 @@ import java.util.stream.Stream;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.json.JsonConverter;
 import org.apache.kafka.connect.source.SourceRecord;
-import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -44,6 +48,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.dameng.DamengDatatypeCases.TypeCase;
 import io.debezium.data.VariableScaleDecimal;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.storage.file.history.FileSchemaHistory;
@@ -144,13 +149,151 @@ class DamengDatatypesIT extends AbstractAsyncEngineConnectorTest {
         startEngine();
         final var snapshot = nextRecord();
         assertThat(((Struct) snapshot.value()).getString("op")).isEqualTo("r");
-        assertStoredValues(((Struct) snapshot.value()).getStruct("after"), expected);
         insertFloatingValue(2, type, literal);
         final var streamed = nextRecord();
         assertThat(((Struct) streamed.value()).getString("op")).isEqualTo("c");
         // The independent JDBC baseline is the value actually stored by DM,
         // not the input literal or another invocation of the connector converter.
-        assertStoredValues(((Struct) streamed.value()).getStruct("after"), storedValues(2));
+        final var expectedStreaming = storedValues(2);
+        assertAll("snapshot and streaming are checked independently",
+                () -> DamengDatatypeAssertions.assertRow(((Struct) snapshot.value()).getStruct("after"), expected, "snapshot"),
+                () -> DamengDatatypeAssertions.assertRow(((Struct) streamed.value()).getStruct("after"), expectedStreaming, "streaming"));
+    }
+
+    static Stream<TypeCase> boundaryTypes() {
+        final var selection = java.util.regex.Pattern.compile(System.getProperty("dameng.datatype.case", ".*"));
+        return DamengDatatypeCases.boundaries().filter(type -> selection.matcher(type.name()).find());
+    }
+
+    @ParameterizedTest(name = "Connect output {0}: {1}")
+    @MethodSource("specialFloatingPointValues")
+    void shouldPreserveNegativeZeroAndNaNInRawConnectorCrud(String type, String literal) throws Exception {
+        config = config.edit().with("tombstones.on.delete", false).build();
+        createTable("VALUE " + type);
+        insertFloatingValue(1, type, literal);
+        final var expected = storedValues(1);
+        startEngine();
+        final var snapshot = nextRecord();
+        assertThat(((Struct) snapshot.value()).getString("op")).isEqualTo("r");
+        DamengDatatypeAssertions.assertConnectRow(((Struct) snapshot.value()).getStruct("after"), expected, "special value snapshot");
+
+        insertFloatingValue(2, type, literal);
+        final var inserted = storedValues(2);
+        final var create = nextRecord();
+        execute("UPDATE " + tableName() + " SET VALUE=NULL WHERE ID=2");
+        final var nulled = storedValues(2);
+        final var update = nextRecord();
+        execute("DELETE FROM " + tableName() + " WHERE ID=1");
+        final var delete = nextRecord();
+        assertAll("raw Connect CRUD; JSON consistency remains separately checked by the strict matrix",
+                () -> assertRawBoundaryImages(create, "c", null, inserted),
+                () -> assertRawBoundaryImages(update, "u", inserted, nulled),
+                () -> assertRawBoundaryImages(delete, "d", expected, null));
+    }
+
+    static Stream<Arguments> specialFloatingPointValues() {
+        return Stream.of("REAL", "FLOAT(24)", "FLOAT(53)", "DOUBLE")
+                .flatMap(type -> Stream.of("-0.0", "NaN").map(value -> Arguments.of(type, value)));
+    }
+
+    private static void assertRawBoundaryImages(SourceRecord record, String operation, Map<String, Object> before, Map<String, Object> after) {
+        final var envelope = (Struct) record.value();
+        assertAll("special value " + operation,
+                () -> assertThat(envelope.getString("op")).isEqualTo(operation),
+                () -> DamengDatatypeAssertions.assertConnectRow(envelope.getStruct("before"), before, "special value before"),
+                () -> DamengDatatypeAssertions.assertConnectRow(envelope.getStruct("after"), after, "special value after"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("boundaryTypes")
+    void shouldPreserveTypeBoundariesAndNullCrudImages(TypeCase type) throws Exception {
+        final var builder = config.edit().with("tombstones.on.delete", false);
+        type.settings().forEach(builder::with);
+        config = builder.build();
+        execute("CREATE TABLE " + tableName() + " (ID INT PRIMARY KEY, VALUE " + type.declaration() + ")" + type.storage());
+        tableCreated = true;
+        final List<Executable> checks = new ArrayList<>();
+        int rejectedId = 9999;
+        for (var rejected : type.rejected()) {
+            final int invalidId = rejectedId++;
+            checks.add(() -> {
+                try {
+                    rejected.insert(connection, tableName(), invalidId);
+                }
+                catch (SQLException databaseRejection) {
+                    assertThat(databaseRejection.getErrorCode()).as("explicit database rejection of an outside-range input").isNotZero();
+                    DamengTestDatabase.recordCapability(type.declaration() + "/outside-range/" + rejected.description(),
+                            "rejected; code=" + databaseRejection.getErrorCode());
+                    return;
+                }
+                final var stored = DamengDatatypeAssertions.storedRow(connection, tableName(), invalidId, config);
+                final var insert = nextRecord();
+                execute("DELETE FROM " + tableName() + " WHERE ID=" + invalidId);
+                final var delete = nextRecord();
+                DamengTestDatabase.recordCapability(type.declaration() + "/outside-range/" + rejected.description(),
+                        "accepted; consistency outcome is recorded in test XML");
+                assertAll("accepted outside-range input",
+                        () -> assertBoundaryImages(insert, "c", null, stored, "accepted outside-range INSERT"),
+                        () -> assertBoundaryImages(delete, "d", stored, null, "accepted outside-range DELETE"));
+            });
+        }
+        final Map<Integer, Map<String, Object>> initial = new LinkedHashMap<>();
+        int id = 1;
+        for (var value : type.values()) {
+            value.insert(connection, tableName(), id);
+            initial.put(id, DamengDatatypeAssertions.storedRow(connection, tableName(), id, config));
+            id++;
+        }
+        DamengDatatypeCases.Value.sql("NULL").insert(connection, tableName(), id);
+        initial.put(id, DamengDatatypeAssertions.storedRow(connection, tableName(), id, config));
+        startEngine();
+        final int snapshotCount = initial.size();
+        for (int count = 0; count < snapshotCount; count++) {
+            final var record = nextRecord();
+            final var row = ((Struct) record.value()).getStruct("after");
+            final int snapshotId = row.getInt32("ID");
+            final var expected = initial.remove(snapshotId);
+            checks.add(() -> {
+                assertThat(expected).as("snapshot ID appears exactly once").isNotNull();
+                assertBoundaryImages(record, "r", null, expected, "snapshot/id=" + snapshotId);
+            });
+        }
+        checks.add(() -> assertThat(initial).as("all snapshot rows were checked").isEmpty());
+        final List<BoundaryImage> images = new ArrayList<>();
+        int streamedId = id + 1;
+        for (var value : type.values()) {
+            final int currentId = streamedId++;
+            value.insert(connection, tableName(), currentId);
+            final var inserted = DamengDatatypeAssertions.storedRow(connection, tableName(), currentId, config);
+            images.add(new BoundaryImage("c", null, inserted, "stream/insert/id=" + currentId));
+            execute("UPDATE " + tableName() + " SET VALUE=NULL WHERE ID=" + currentId);
+            final var nulled = DamengDatatypeAssertions.storedRow(connection, tableName(), currentId, config);
+            images.add(new BoundaryImage("u", inserted, nulled, "stream/value-to-null/id=" + currentId));
+            value.update(connection, tableName(), currentId);
+            final var restored = DamengDatatypeAssertions.storedRow(connection, tableName(), currentId, config);
+            images.add(new BoundaryImage("u", nulled, restored, "stream/null-to-value/id=" + currentId));
+            execute("DELETE FROM " + tableName() + " WHERE ID=" + currentId);
+            images.add(new BoundaryImage("d", restored, null, "stream/delete/id=" + currentId));
+        }
+        // Execute the finite workload first: every retained before/after image comes from
+        // JDBC at that operation's position, even if a later operation deletes the row.
+        for (var image : images) {
+            final var record = nextRecord();
+            checks.add(() -> assertBoundaryImages(record, image.operation(), image.before(), image.after(), image.stage()));
+        }
+        assertAll("mode=" + DamengTestDatabase.requestedCompatibilityMode() + "/" + type, checks);
+    }
+
+    private record BoundaryImage(String operation, Map<String, Object> before, Map<String, Object> after, String stage) {
+    }
+
+    private static void assertBoundaryImages(SourceRecord record, String operation, Map<String, Object> before, Map<String, Object> after, String stage) {
+        final var envelope = (Struct) record.value();
+        assertAll(stage,
+                () -> assertThat(envelope.getString("op")).isEqualTo(operation),
+                () -> DamengDatatypeAssertions.assertRow(envelope.getStruct("before"), before, stage + "/before"),
+                () -> DamengDatatypeAssertions.assertRow(envelope.getStruct("after"), after, stage + "/after"),
+                () -> assertThat(((Struct) record.key()).getInt32("ID")).isEqualTo((after == null ? before : after).get("ID")));
     }
 
     static Stream<Arguments> floatingPointValues() {
@@ -457,21 +600,93 @@ class DamengDatatypesIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
-    void shouldReportUnsupportedNativeIntervalColumns() throws Exception {
-        createTable("YEAR_MONTH INTERVAL YEAR(3) TO MONTH");
-        execute("INSERT INTO " + tableName() + " VALUES(1,INTERVAL '012-03' YEAR(3) TO MONTH)");
-        startEngine();
-        Awaitility.await("unsupported interval type is reported").atMost(Duration.ofSeconds(30))
-                .until(() -> failure.get() != null);
-        Throwable cause = failure.get();
-        while (cause.getCause() != null) {
-            cause = cause.getCause();
+    void shouldPreserveNativeIntervalsAndTheirLogicalSchema() throws Exception {
+        createTable("YEAR_MONTH INTERVAL YEAR(9) TO MONTH, DAY_SECOND INTERVAL DAY(9) TO SECOND(6)");
+        final var snapshot = snapshotAndStream("INTERVAL '-999999999-11' YEAR(9) TO MONTH,"
+                + "INTERVAL '-999999999 23:59:59.999999' DAY(9) TO SECOND(6)");
+        assertThat(snapshot.getString("YEAR_MONTH")).isEqualTo("P-999999999Y-11M0DT0H0M0S");
+        assertThat(snapshot.getString("DAY_SECOND")).isEqualTo("P0Y0M-999999999DT-23H-59M-59.999999S");
+        for (var name : List.of("YEAR_MONTH", "DAY_SECOND")) {
+            final var schema = snapshot.schema().field(name).schema();
+            assertThat(schema.type()).isEqualTo(org.apache.kafka.connect.data.Schema.Type.STRING);
+            assertThat(schema.name()).isEqualTo("io.debezium.time.Interval");
+            assertThat(schema.version()).isEqualTo(1);
+            assertThat(schema.isOptional()).isTrue();
         }
-        assertThat(cause.getMessage()).contains("Unsupported Dameng column type", "YEAR_MONTH", "column.exclude.list");
     }
 
     @Test
-    void shouldAllowExcludingUnsupportedIntervalColumns() throws Exception {
+    void shouldReplayIntervalDdlAndValuesWrittenWhileStopped() throws Exception {
+        config = config.edit().with("tombstones.on.delete", false).build();
+        createTable("VALUE INTERVAL YEAR(3) TO MONTH DEFAULT INTERVAL '1-2' YEAR TO MONTH");
+        execute("INSERT INTO " + tableName() + " (ID) VALUES(1)");
+        startEngine();
+        final var snapshot = nextRecord();
+        assertBoundaryImages(snapshot, "r", null, DamengDatatypeAssertions.storedRow(connection, tableName(), 1, config), "interval default snapshot");
+        assertThat(((Struct) snapshot.value()).getStruct("after").schema().field("VALUE").schema().defaultValue())
+                .isEqualTo("P1Y2M0DT0H0M0S");
+        execute("INSERT INTO " + tableName() + " (ID) VALUES(2)");
+        final var checkpoint = nextRecord();
+        final var before = DamengDatatypeAssertions.storedRow(connection, tableName(), 2, config);
+        assertBoundaryImages(checkpoint, "c", null, before, "interval default streaming");
+        stopConnector();
+        storeOffsets(config, Map.of(checkpoint.sourcePartition(), checkpoint.sourceOffset()));
+        consumedLines.clear();
+        execute("ALTER TABLE " + tableName() + " ADD SPAN INTERVAL DAY(9) TO SECOND(6)");
+        execute("UPDATE " + tableName() + " SET SPAN=INTERVAL '-999999999 23:59:59.123456' DAY(9) TO SECOND(6) WHERE ID=2");
+        final var after = DamengDatatypeAssertions.storedRow(connection, tableName(), 2, config);
+        final Map<String, Object> historicalBefore = new LinkedHashMap<>(before);
+        historicalBefore.put("SPAN", null);
+        execute("DELETE FROM " + tableName() + " WHERE ID=2");
+        startEngine();
+        assertBoundaryImages(nextRecord(), "u", historicalBefore, after, "interval offline ALTER replay");
+        assertBoundaryImages(nextRecord(), "d", after, null, "interval offline DELETE replay");
+    }
+
+    @Test
+    void shouldCaptureAllIntervalQualifiersInStreamingCreatedTable() throws Exception {
+        config = config.edit().with("table.include.list", DamengTestDatabase.schema() + "\\." + table + "(_NEW)?")
+                .with("tombstones.on.delete", false).build();
+        createTable("LABEL VARCHAR(10)");
+        execute("INSERT INTO " + tableName() + " VALUES(1,'initial')");
+        startEngine();
+        assertThat(((Struct) nextRecord().value()).getString("op")).isEqualTo("r");
+        final var added = tableName().substring(0, tableName().length() - 1) + "_NEW\"";
+        final var types = DamengDatatypeCases.intervals().filter(type -> !type.declaration().contains("(")).toList();
+        final List<String> names = new ArrayList<>();
+        final List<String> definitions = new ArrayList<>();
+        final List<String> literals = new ArrayList<>();
+        for (int index = 0; index < types.size(); index++) {
+            final var name = "SPAN" + index;
+            names.add(name);
+            definitions.add(name + " " + types.get(index).declaration());
+            literals.add(types.get(index).values().get(1).sql());
+        }
+        execute("CREATE TABLE " + added + " (ID INT PRIMARY KEY," + String.join(",", definitions)
+                + ",CALENDAR INTERVAL YEAR(9) TO MONTH DEFAULT INTERVAL '999999999-11' YEAR TO MONTH)");
+        try {
+            execute("INSERT INTO " + added + " (ID," + String.join(",", names) + ") VALUES(2," + String.join(",", literals) + ")");
+            final var inserted = DamengDatatypeAssertions.storedRow(connection, added, 2, config);
+            final var record = nextRecord();
+            assertThat(record.topic()).endsWith("." + table + "_NEW");
+            assertBoundaryImages(record, "c", null, inserted, "stream-created interval table");
+            assertThat(((Struct) record.value()).getStruct("after").schema().field("CALENDAR").schema().defaultValue())
+                    .isEqualTo("P999999999Y11M0DT0H0M0S");
+            execute("ALTER TABLE " + added + " MODIFY SPAN0 INTERVAL YEAR(9)");
+            execute("UPDATE " + added + " SET SPAN0=INTERVAL '999999999' YEAR WHERE ID=2");
+            final var updated = DamengDatatypeAssertions.storedRow(connection, added, 2, config);
+            assertBoundaryImages(nextRecord(), "u", inserted, updated, "interval precision widening");
+            execute("DELETE FROM " + added + " WHERE ID=2");
+            assertBoundaryImages(nextRecord(), "d", updated, null, "stream-created interval DELETE");
+        }
+        finally {
+            stopConnector();
+            execute("DROP TABLE " + added);
+        }
+    }
+
+    @Test
+    void shouldAllowExcludingIntervalColumns() throws Exception {
         createTable("YEAR_MONTH INTERVAL YEAR(3) TO MONTH, DAY_SECOND INTERVAL DAY(3) TO SECOND(6), TEXT_VALUE VARCHAR(30)");
         config = config.edit().with("column.exclude.list", DamengTestDatabase.schema() + "\\." + table + "\\.(YEAR_MONTH|DAY_SECOND)").build();
         final var snapshot = snapshotAndStream("INTERVAL '012-03' YEAR(3) TO MONTH,INTERVAL '002 03:04:05.123456' DAY(3) TO SECOND(6),'kept column'");
@@ -519,7 +734,7 @@ class DamengDatatypesIT extends AbstractAsyncEngineConnectorTest {
             if (failure.get() != null) {
                 throw new AssertionError("Dameng connector failed", failure.get());
             }
-            if (waitForAvailableRecords(1, TimeUnit.SECONDS)) {
+            if (waitForAvailableRecords(100, TimeUnit.MILLISECONDS)) {
                 final var record = consumeRecord();
                 if (record != null && record.value() instanceof Struct value && value.schema().field("op") != null) {
                     value.validate();

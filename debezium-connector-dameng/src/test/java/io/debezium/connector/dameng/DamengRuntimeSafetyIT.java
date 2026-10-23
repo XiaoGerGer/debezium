@@ -8,6 +8,7 @@ package io.debezium.connector.dameng;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -18,6 +19,8 @@ import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+
+import javax.management.ObjectName;
 
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -68,6 +71,7 @@ class DamengRuntimeSafetyIT extends AbstractAsyncEngineConnectorTest {
         execute("CREATE TABLE " + tableName() + " (ID INT PRIMARY KEY, REVISION INT)");
         writer.commit();
         config = Configuration.create()
+                .with("log.mining.window.strategy", System.getProperty("dameng.test.window.strategy", "archive_bytes"))
                 .with("topic.prefix", "dameng")
                 .with("database.hostname", DamengTestDatabase.hostname())
                 .with("database.port", DamengTestDatabase.port())
@@ -109,6 +113,36 @@ class DamengRuntimeSafetyIT extends AbstractAsyncEngineConnectorTest {
                 }
             }
         }
+    }
+
+    @Test
+    void shouldExposeSnapshotLockWaitingAndConfirmedReleaseThroughJmx() throws Exception {
+        execute("INSERT INTO " + tableName() + " VALUES(1,0)");
+        config = config.edit().with("snapshot.mode", "initial").with("snapshot.max.duration.ms", 30_000).build();
+        final var mbeans = ManagementFactory.getPlatformMBeanServer();
+        final var name = new ObjectName("debezium.dameng:type=connector-metrics,context=snapshot,server=dameng");
+        startEngine();
+        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            assertThat(mbeans.isRegistered(name)).isTrue();
+            assertThat(mbeans.getAttribute(name, "SnapshotLockWaiting")).isEqualTo(true);
+            assertThat(mbeans.getAttribute(name, "SnapshotLocksHeld")).isEqualTo(false);
+            assertThat(mbeans.getAttribute(name, "LockedTableCount")).isEqualTo(0);
+            assertThat((Long) mbeans.getAttribute(name, "SnapshotLockWaitDurationMillis")).isGreaterThanOrEqualTo(200L);
+        });
+        // End the business transaction so the snapshot can acquire its shared lock.
+        writer.commit();
+        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            assertThat(mbeans.getAttribute(name, "SnapshotCompleted")).isEqualTo(true);
+            assertThat(mbeans.getAttribute(name, "SnapshotLockWaiting")).isEqualTo(false);
+            assertThat(mbeans.getAttribute(name, "SnapshotLocksHeld")).isEqualTo(false);
+            assertThat(mbeans.getAttribute(name, "LockedTableCount")).isEqualTo(0);
+            assertThat(mbeans.getAttribute(name, "SnapshotLockHoldDurationMillis")).isEqualTo(0L);
+            assertThat(mbeans.getAttribute(name, "LastSnapshotLockStatisticsAvailable")).isEqualTo(true);
+            assertThat(mbeans.getAttribute(name, "LastSnapshotLockedTableCount")).isEqualTo(1);
+            assertThat((Long) mbeans.getAttribute(name, "LastSnapshotLockWaitDurationMillis")).isGreaterThanOrEqualTo(200L);
+            assertThat((Long) mbeans.getAttribute(name, "LastSnapshotLockHoldDurationMillis")).isGreaterThanOrEqualTo(0L);
+        });
+        assertThat(failure.get()).isNull();
     }
 
     @Test
@@ -195,14 +229,36 @@ class DamengRuntimeSafetyIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
-    void shouldFailBeforePublishingAnOversizedMiningWindow() throws Exception {
-        config = config.edit().with("log.mining.buffer.max.records", 50).build();
+    void shouldDeliverAnEntireTransactionBeyondLegacyBudgetsWithForcedSpilling() throws Exception {
+        config = config.edit().with("log.mining.buffer.max.records", 1).with("log.mining.buffer.max.bytes", 1)
+                .with("log.mining.buffer.memory.bytes", 1024).with("log.mining.buffer.spill.path", directory.resolve("spill").toString()).build();
         startEngine();
         waitForStreamingRunning("dameng", "dameng");
         insertRows(200);
         writer.commit();
-        awaitFailure("log.mining.buffer.max.records");
-        assertThat(consumedLines).as("an over-budget window must not publish a partial transaction").isEmpty();
+        final var ids = new java.util.HashSet<Integer>();
+        for (int i = 0; i < 200; i++) {
+            final var event = (Struct) nextDataRecord().value();
+            assertThat(event.getString("op")).isEqualTo("c");
+            assertThat(ids.add(event.getStruct("after").getInt32("ID"))).isTrue();
+        }
+        assertThat(ids).hasSize(200).contains(1, 200);
+        assertThat(failure.get()).isNull();
+        final var mbeans = ManagementFactory.getPlatformMBeanServer();
+        final var name = new ObjectName("debezium.dameng:type=connector-metrics,context=streaming,server=dameng");
+        assertThat((Long) mbeans.getAttribute(name, "SpilledTransactions")).isPositive();
+        assertThat(mbeans.getAttribute(name, "BufferLimitFailures")).isEqualTo(0L);
+    }
+
+    @Test
+    void shouldFailBeforePublishingWhenOneSqlPayloadExceedsItsLimit() throws Exception {
+        config = config.edit().with("log.mining.buffer.max.sql.bytes", 8).build();
+        startEngine();
+        waitForStreamingRunning("dameng", "dameng");
+        insertRows(1);
+        writer.commit();
+        awaitFailure("log.mining.buffer.max.sql.bytes");
+        assertThat(consumedLines).as("an oversized SQL must not publish a partial transaction").isEmpty();
     }
 
     @ParameterizedTest

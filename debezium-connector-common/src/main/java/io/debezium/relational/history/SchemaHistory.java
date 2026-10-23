@@ -10,6 +10,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.function.Consumer;
 
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
@@ -160,6 +161,14 @@ public interface SchemaHistory {
      * Start the history.
      */
     void start();
+
+    /**
+     * Visit stored records in storage order without applying them to a schema.
+     * Implementations that cannot inspect history must reject the operation.
+     */
+    default void readRecords(Consumer<HistoryRecord> records) throws InterruptedException {
+        throw new UnsupportedOperationException("This schema history implementation does not support record inspection");
+    }
 
     /**
      * Record a change to the schema of the named database, and store it in the schema storage.

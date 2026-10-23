@@ -6,6 +6,7 @@
 package io.debezium.connector.dameng;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.EOFException;
 import java.io.StreamCorruptedException;
@@ -34,10 +35,18 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
+import io.debezium.document.DocumentReader;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
+import io.debezium.junit.logging.LogInterceptor;
+import io.debezium.relational.TableId;
+import io.debezium.relational.history.HistoryRecord;
+import io.debezium.relational.history.JsonTableChangeSerializer;
 import io.debezium.storage.file.history.FileSchemaHistory;
+
+import ch.qos.logback.classic.Logger;
 
 /** Disconnects only task sessions belonging to a unique test account in a test-owned database. */
 class DamengRecoverySafetyIT extends AbstractAsyncEngineConnectorTest {
@@ -87,7 +96,9 @@ class DamengRecoverySafetyIT extends AbstractAsyncEngineConnectorTest {
         execute("GRANT SOI TO " + username);
         execute("GRANT VTI TO " + username);
         execute("GRANT EXECUTE ON DBMS_LOGMNR TO " + username);
-        config = Configuration.create().with("topic.prefix", "dameng")
+        config = Configuration.create()
+                .with("log.mining.window.strategy", System.getProperty("dameng.test.window.strategy", "archive_bytes"))
+                .with("topic.prefix", "dameng")
                 .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
                 .with("database.user", username).with("database.password", PASSWORD)
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
@@ -114,6 +125,61 @@ class DamengRecoverySafetyIT extends AbstractAsyncEngineConnectorTest {
             finally {
                 admin.close();
             }
+        }
+    }
+
+    @Test
+    void shouldWarnAboutAnIncludedTableWithoutSelectPrivilegesAndContinueCapturingVisibleTables() throws Exception {
+        final String hiddenTable = table + "_NO_SELECT";
+        final String qualifiedHidden = '"' + DamengTestDatabase.schema() + "\".\"" + hiddenTable + '"';
+        execute("CREATE TABLE " + qualifiedHidden + " (ID INT, LABEL VARCHAR(50))");
+        final var logs = LogInterceptor.forClass(DamengSnapshotChangeEventSource.class);
+        try {
+            execute("INSERT INTO " + qualifiedHidden + " VALUES(1,'not visible')");
+            config = config.edit().with("table.include.list", DamengTestDatabase.schema() + "\\." + table + ","
+                    + DamengTestDatabase.schema() + "\\." + hiddenTable).build();
+            try (var restricted = new DamengConnection(new DamengConnectorConfig(config).getJdbcConfig())) {
+                assertThat(restricted.getAllTableIds(null))
+                        .contains(new TableId(null, DamengTestDatabase.schema(), table))
+                        .doesNotContain(new TableId(null, DamengTestDatabase.schema(), hiddenTable));
+                assertThatThrownBy(() -> restricted.query("SELECT 1 FROM " + qualifiedHidden + " WHERE 1=0", rows -> {
+                })).isInstanceOf(SQLException.class).satisfies(error -> assertThat(((SQLException) error).getErrorCode()).isEqualTo(-5504));
+            }
+
+            start(DamengConnector.class, config, (success, message, error) -> {
+                if (!success) {
+                    failure.set(error == null ? new IllegalStateException(message) : error);
+                }
+            }, null);
+            waitForStreamingRunning("dameng", "dameng");
+            final var snapshot = nextDataRecord();
+            assertThat(envelope(snapshot).getString("op")).isEqualTo("r");
+            assertThat(snapshot.topic()).endsWith("." + table);
+            assertThat(logs.containsWarnMessage("table.include.list rule '" + DamengTestDatabase.schema() + "\\." + hiddenTable
+                    + "' did not select any table visible to database user '" + username + "'")).isTrue();
+            assertThat(logs.containsWarnMessage("table.include.list rule '" + DamengTestDatabase.schema() + "\\." + table + "'")).isFalse();
+            assertThat(logs.containsMessage("Dameng tables selected for schema capture: [" + DamengTestDatabase.schema() + "." + table + "]")).isTrue();
+            final List<TableId> storedTables = new ArrayList<>();
+            for (String line : java.nio.file.Files.readAllLines(directory.resolve("schema-history.dat"))) {
+                final var record = DocumentReader.defaultReader().read(line);
+                for (var change : new JsonTableChangeSerializer().deserialize(record.getArray(HistoryRecord.Fields.TABLE_CHANGES), false)) {
+                    storedTables.add(change.getId());
+                }
+            }
+            assertThat(storedTables).contains(new TableId(null, DamengTestDatabase.schema(), table))
+                    .doesNotContain(new TableId(null, DamengTestDatabase.schema(), hiddenTable));
+
+            execute("INSERT INTO " + qualifiedTable() + " VALUES(2,2,'streaming after warning')");
+            final var streamed = nextDataRecord();
+            assertThat(envelope(streamed).getString("op")).isEqualTo("c");
+            assertThat(envelope(streamed).getStruct("after").getString("LABEL")).isEqualTo("streaming after warning");
+            assertThat(failure.get()).isNull();
+        }
+        finally {
+            stopConnector();
+            logs.stop();
+            ((Logger) LoggerFactory.getLogger(DamengSnapshotChangeEventSource.class)).detachAppender(logs);
+            execute("DROP TABLE " + qualifiedHidden);
         }
     }
 

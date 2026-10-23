@@ -29,11 +29,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser.SqlExpression;
 import io.debezium.relational.Column;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
+import io.debezium.relational.ValueConverter;
 
 class DamengValueConvertersTest {
     private final DamengValueConverters converters = new DamengValueConverters(
@@ -80,6 +82,53 @@ class DamengValueConvertersTest {
     void shouldDecodeDate() {
         assertThat(convert(column(Types.DATE), new SqlExpression("TO_DATE('2026-09-24','YYYY-MM-DD')")))
                 .isEqualTo((int) LocalDate.of(2026, 9, 24).toEpochDay());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { Types.BINARY, Types.VARBINARY, Types.LONGVARBINARY })
+    void shouldDecodeQuotedEmptyBinaryOnlyForBinaryColumns(int jdbcType) {
+        assertThat((ByteBuffer) convert(column(jdbcType), "0x")).isEqualTo(ByteBuffer.wrap(new byte[0]));
+        assertThat(convert(column(Types.VARCHAR), "0x")).isEqualTo("0x");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { Types.REAL, Types.FLOAT, Types.DOUBLE })
+    void shouldPreserveFloatingPointNaNAndNegativeZeroInConnectValues(int jdbcType) {
+        final var negativeZero = (Number) convert(column(jdbcType), "-0.000000");
+        assertThat(Double.doubleToRawLongBits(negativeZero.doubleValue())).isEqualTo(Double.doubleToRawLongBits(-0.0));
+        final var nan = (Number) convert(column(jdbcType), new SqlExpression("nan"));
+        assertThat(Double.isNaN(nan.doubleValue())).isTrue();
+        assertThatThrownBy(() -> convert(column(Types.DECIMAL), new SqlExpression("nan")))
+                .isInstanceOf(DataException.class).hasMessageContaining("floating-point column");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "1-01-01", "99-12-31", "999-02-28", "-1-01-01", "-4712-01-01", "1582-10-10", "9999-12-31" })
+    void shouldParseSignedAndUnpaddedYearsFromRedo(String value) {
+        final var parts = value.substring(value.startsWith("-") ? 1 : 0).split("-");
+        final int year = Integer.parseInt(parts[0]) * (value.startsWith("-") ? -1 : 1);
+        final var date = LocalDate.of(year, Integer.parseInt(parts[1]), Integer.parseInt(parts[2]));
+        assertThat(convert(column(Types.DATE), new SqlExpression("DATE'" + value + "'"))).isEqualTo((int) date.toEpochDay());
+        final var timestamp = date.atTime(12, 34, 56, 123456000);
+        assertThat(convert(column(Types.TIMESTAMP), new SqlExpression("TIMESTAMP'" + value + " 12:34:56.123456'")))
+                .isEqualTo(timestamp.toEpochSecond(ZoneOffset.UTC) * 1_000_000 + 123456);
+        assertThat(converters.convertLogMinerValue(new SqlExpression("TIMESTAMP'" + value + " 12:34:56.123456 +08:00'"),
+                column(Types.TIMESTAMP_WITH_TIMEZONE), input -> input))
+                .isEqualTo(timestamp.atOffset(ZoneOffset.ofHours(8)));
+    }
+
+    @Test
+    void shouldRejectInvalidCalendarDatesInsteadOfNormalizingThem() {
+        assertThatThrownBy(() -> convert(column(Types.DATE), new SqlExpression("DATE'1-02-29'")))
+                .isInstanceOf(DataException.class).hasMessageContaining("Invalid LogMiner value");
+    }
+
+    @Test
+    void shouldRejectLocalTimezoneSchemaInsteadOfSilentlyPublishingAReaderDependentTimestamp() {
+        final var column = Column.editor().name("LOCAL_TS").jdbcType(Types.TIMESTAMP).type("TIMESTAMP WITH LOCAL TIME ZONE")
+                .length(36).scale(6).optional(true).create();
+        assertThatThrownBy(() -> converters.schemaBuilder(column)).isInstanceOf(DataException.class)
+                .hasMessageContaining("LOCAL_TS", "source session time zone", "column.exclude.list");
     }
 
     @Test
@@ -157,8 +206,11 @@ class DamengValueConvertersTest {
     void shouldPadFixedCharactersUsingTheHistoricalLengthSemantics(String charset, String expression, String value, String expected) {
         final var column = Column.editor().name("VALUE").jdbcType(Types.CHAR).type("CHAR", expression)
                 .length(8).charsetName(charset).optional(true).create();
-        assertThat(convert(column, value)).isEqualTo(expected);
-        assertThat(convert(column, expected)).isEqualTo(expected);
+        final var converter = converter(column);
+        assertThat(converter.convert(value)).isEqualTo(expected);
+        assertThat(converter.convert(expected)).isEqualTo(expected);
+        assertThat(converter.convert(null)).isNull();
+        assertThat(converter.convert(value)).isEqualTo(expected);
     }
 
     static Stream<Arguments> fixedCharacters() {
@@ -196,9 +248,33 @@ class DamengValueConvertersTest {
         assertThat(convert(current.columnWithName("C"), "达梦")).isEqualTo("达梦  ");
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = { Types.CHAR, Types.NCHAR })
+    void shouldKeepReusablePaddingBoundToEachHistoricalColumn(int jdbcType) {
+        final var original = Column.editor().name("VALUE").jdbcType(jdbcType).type("CHAR", "CHAR(8 BYTE)")
+                .length(8).charsetName("GB18030").optional(true).create();
+        final var originalConverter = converter(original);
+        final var characterConverter = converter(original.edit().type("CHAR", "CHAR(8 CHAR)").charsetName("UTF-8").create());
+        final var extendedConverter = converter(original.edit().length(12).type("CHAR", "CHAR(12 BYTE)").create());
+        final var otherTableConverter = converter(original.edit().charsetName("UTF-8").create());
+        for (int i = 0; i < 3; i++) {
+            assertThat(originalConverter.convert("达梦")).isEqualTo("达梦    ");
+            assertThat(characterConverter.convert("达梦")).isEqualTo("达梦      ");
+            assertThat(extendedConverter.convert(new SqlExpression("UNISTR('\\8FBE\\68A6')"))).isEqualTo("达梦        ");
+            assertThat(otherTableConverter.convert("达梦")).isEqualTo("达梦  ");
+            assertThat(characterConverter.convert("😀")).isEqualTo("😀       ");
+            assertThat(originalConverter.convert(null)).isNull();
+            assertThat(originalConverter.convert("longer than eight")).isEqualTo("longer than eight");
+        }
+    }
+
     private Object convert(Column column, Object value) {
+        return converter(column).convert(value);
+    }
+
+    private ValueConverter converter(Column column) {
         final var field = new Field(column.name(), 0, converters.schemaBuilder(column).optional().build());
-        return converters.converter(column, field).convert(value);
+        return converters.converter(column, field);
     }
 
     private Column column(int jdbcType) {

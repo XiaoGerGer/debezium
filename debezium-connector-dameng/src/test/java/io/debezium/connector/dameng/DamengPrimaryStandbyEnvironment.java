@@ -58,13 +58,18 @@ final class DamengPrimaryStandbyEnvironment implements AutoCloseable {
         try {
             for (int i = 0; i < 2; i++) {
                 final var container = new GenericContainer<>(DockerImageName.parse(
-                        System.getProperty("dameng.image", "hub.badxiao.top/xuxuclassmate/dameng:latest")))
-                        .withNetwork(network).withExposedPorts(5236).withCommand("sleep", "infinity")
+                        System.getProperty("dameng.image",
+                                "dameng:8.1.3.162-20240621-rev232765")))
+                        .withNetwork(network).withExposedPorts(5236)
+                        // Own initialization and dmserver lifecycle; bypass the vendor single-node entrypoint.
+                        .withCreateContainerCmdModifier(command -> command.withEntrypoint("sleep"))
+                        .withCommand("infinity")
+                        .withEnv("LD_LIBRARY_PATH", BIN + ":/opt/dmdbms/lib")
                         .waitingFor(Wait.forSuccessfulCommand("test -x " + BIN + "/dminit"));
                 nodes.add(container);
                 container.start();
                 command(i, "cd " + BIN + " && ./dminit PATH=/opt/dmdbms/data DB_NAME=DAMENG INSTANCE_NAME=" + instanceNames[i]
-                        + " SYSDBA_PWD=" + PASSWORD + " PAGE_SIZE=8 CASE_SENSITIVE=1 UNICODE_FLAG=1 LENGTH_IN_CHAR=0 LOG_SIZE=256");
+                        + " SYSDBA_PWD=" + PASSWORD + " PAGE_SIZE=8 CASE_SENSITIVE=1 UNICODE_FLAG=1 LOG_SIZE=256");
                 startServer(i, false);
                 awaitConnection(i);
                 sql(i, "SHUTDOWN NORMAL");
@@ -178,14 +183,19 @@ final class DamengPrimaryStandbyEnvironment implements AutoCloseable {
     private void awaitRoles() {
         Awaitility.await("DM HA primary and standby are OPEN").atMost(Duration.ofMinutes(2)).pollInterval(Duration.ofSeconds(1))
                 .until(() -> hasRole(primary, "PRIMARY") && hasRole(1 - primary, "STANDBY")
-                        && hasValidArchive(0) && hasValidArchive(1));
+                // Only the current primary sends REALTIME archives. Newer DM builds report
+                // NULL for the standby's inactive outgoing route; both must archive locally.
+                        && hasValidArchive(primary, "REALTIME")
+                        && hasValidArchive(0, "LOCAL") && hasValidArchive(1, "LOCAL"));
     }
 
-    private boolean hasValidArchive(int node) {
+    private boolean hasValidArchive(int node, String type) {
         try (var connection = connection(node);
-                var statement = connection.createStatement();
-                var result = statement.executeQuery("SELECT ARCH_STATUS FROM V$ARCH_STATUS WHERE ARCH_TYPE='REALTIME'")) {
-            return result.next() && "VALID".equals(result.getString(1));
+                var statement = connection.prepareStatement("SELECT ARCH_STATUS FROM V$ARCH_STATUS WHERE ARCH_TYPE=?")) {
+            statement.setString(1, type);
+            try (var result = statement.executeQuery()) {
+                return result.next() && "VALID".equals(result.getString(1));
+            }
         }
         catch (SQLException e) {
             return false;
@@ -233,10 +243,17 @@ final class DamengPrimaryStandbyEnvironment implements AutoCloseable {
     }
 
     private String monitor(int node, String operation) throws Exception {
-        final String input = "login\n" + USER + "\n" + PASSWORD + "\n" + operation + "\nexit\n";
-        final String command = "cd " + BIN + " && printf '%s' '" + input.replace("'", "'\\''") + "' | ./dmmonitor " + DATA + "/dmmonitor.ini";
-        final String output = command(node, command);
+        // Newer monitors require confirmation for role changes. Only this fixture's owned pair is addressed.
+        final String confirmation = operation.startsWith("switchover ") || operation.startsWith("takeover ") ? "YES\n" : "";
+        final String input = "login\n" + USER + "\n" + PASSWORD + "\n" + operation + "\n" + confirmation + "exit\n";
+        final String command = "cd " + BIN + " && printf '%s' '" + input.replace("'", "'\\''")
+                + "' | timeout 90s ./dmmonitor " + DATA + "/dmmonitor.ini";
+        final var result = nodes.get(node).execInContainer("bash", "-c", command);
+        final String output = result.getStdout() + result.getStderr();
         Files.writeString(logDirectory.resolve("monitor-" + System.nanoTime() + ".log"), output);
+        if (result.getExitCode() != 0) {
+            throw new IllegalStateException("DM monitor failed or timed out: " + output);
+        }
         return output;
     }
 
@@ -250,6 +267,18 @@ final class DamengPrimaryStandbyEnvironment implements AutoCloseable {
 
     String standbyJdbcUrl() {
         return jdbcUrl(1 - primary);
+    }
+
+    Path logDirectory() {
+        return logDirectory;
+    }
+
+    void restartStandby() throws Exception {
+        final int standby = 1 - primary;
+        sql(standby, "SHUTDOWN NORMAL");
+        awaitServerStopped(standby);
+        startServer(standby, true);
+        awaitRoles();
     }
 
     String jdbcUrl(int node) {
@@ -290,6 +319,33 @@ final class DamengPrimaryStandbyEnvironment implements AutoCloseable {
         for (int i = 0; i < nodes.size(); i++) {
             final GenericContainer<?> container = nodes.get(i);
             if (container.isRunning()) {
+                // Retain database state before cleanup, including failures during role establishment.
+                final var diagnostics = new StringBuilder();
+                try (var connection = connection(i); var statement = connection.createStatement()) {
+                    statement.setQueryTimeout(5);
+                    for (var query : List.of("SELECT MODE$,STATUS$ FROM V$INSTANCE", "SELECT * FROM V$ARCH_STATUS")) {
+                        diagnostics.append(query).append('\n');
+                        try (var rows = statement.executeQuery(query)) {
+                            while (rows.next()) {
+                                for (int column = 1; column <= rows.getMetaData().getColumnCount(); column++) {
+                                    diagnostics.append(rows.getMetaData().getColumnName(column)).append('=')
+                                            .append(rows.getString(column)).append(' ');
+                                }
+                                diagnostics.append('\n');
+                            }
+                        }
+                    }
+                }
+                catch (SQLException e) {
+                    diagnostics.append(e).append('\n');
+                }
+                try {
+                    diagnostics.append(command(i, "tail -n 80 /opt/dmdbms/log/*.log"));
+                    Files.writeString(logDirectory.resolve(i + "-diagnostics.txt"), diagnostics);
+                }
+                catch (Exception e) {
+                    // Diagnostic collection must not prevent cleanup of the owned containers.
+                }
                 for (String logfile : List.of("server.log", "watcher.log")) {
                     try {
                         container.copyFileFromContainer("/tmp/" + logfile, logDirectory.resolve(i + "-" + logfile).toString());

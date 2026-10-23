@@ -6,6 +6,7 @@
 package io.debezium.connector.dameng;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
@@ -43,6 +44,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import io.debezium.config.Configuration;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.embedded.util.MetricsHelper;
+import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.storage.file.history.FileSchemaHistory;
 
 /**
@@ -117,6 +119,22 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
             finally {
                 connection.close();
             }
+        }
+    }
+
+    @Test
+    void shouldLogJdbcDatabaseVersionOnStartup() throws Exception {
+        final var version = DamengDatabaseVersion.read(connection.getMetaData());
+        final var logs = LogInterceptor.forClass(DamengConnectorTask.class);
+        try {
+            startAndVerifySnapshot();
+            assertThat(logs.containsMessage("Connected to " + version.productName() + " database version " + version.productVersion())).isTrue();
+            assertThat(logs.containsMessage("matches tested JDBC version: " + version.isTested())).isTrue();
+            assertThat(logs.containsWarnMessage("has not been tested")).isEqualTo(!version.isTested());
+            assertThat(logs.containsMessage("Dameng COMPATIBLE_MODE=0 selected compatibility profile native-v1")).isTrue();
+        }
+        finally {
+            logs.stop();
         }
     }
 
@@ -355,9 +373,9 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "no_data", "never" })
+    @ValueSource(strings = { "", "no_data", "never" })
     void shouldStreamWithoutPublishingExistingRows(String snapshotMode) throws Exception {
-        config = config.edit().with("snapshot.mode", snapshotMode).build();
+        config = snapshotMode.isEmpty() ? config.edit().without("snapshot.mode").build() : config.edit().with("snapshot.mode", snapshotMode).build();
         startEngine();
         waitForStreamingRunning("dameng", "dameng");
         assertNoDataRecords(Duration.ofSeconds(1));
@@ -385,20 +403,54 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
         assertNoDataRecords(Duration.ofSeconds(2));
     }
 
-    @Test
-    void shouldDiscardChangesRolledBackToSavepoint() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = { "unused", "partial", "statement-failure" })
+    void shouldPreserveOnlyEffectiveChangesWithSavepointsAndStatementFailure(String scenario) throws Exception {
         startAndVerifySnapshot();
         execute("INSERT INTO " + tableName() + " VALUES(2,'keep',2)");
-        final var savepoint = connection.setSavepoint("DBZ_SAVEPOINT");
-        execute("INSERT INTO " + tableName() + " VALUES(3,'discard',3)");
-        execute("UPDATE " + tableName() + " SET NAME='discard' WHERE ID=2");
-        connection.rollback(savepoint);
+        if (scenario.equals("statement-failure")) {
+            assertThatThrownBy(() -> execute("INSERT INTO " + tableName()
+                    + " SELECT 3,'failed',3 FROM DUAL UNION ALL SELECT 1,'duplicate',1 FROM DUAL"))
+                    .isInstanceOf(java.sql.SQLException.class);
+        }
+        else {
+            final var savepoint = connection.setSavepoint("DBZ_SAVEPOINT");
+            execute("INSERT INTO " + tableName() + " VALUES(3,'discard',3)");
+            if (scenario.equals("partial")) {
+                connection.rollback(savepoint);
+            }
+        }
         connection.commit();
+        assertThat(after(nextDataRecord()).getInt32("ID")).isEqualTo(2);
+        if (scenario.equals("unused")) {
+            assertThat(after(nextDataRecord()).getInt32("ID")).isEqualTo(3);
+        }
+        assertNoDataRecords(Duration.ofSeconds(1));
+    }
 
-        final var committed = nextDataRecord();
-        assertThat(after(committed).get("ID")).isEqualTo(2);
-        assertThat(after(committed).getString("NAME")).isEqualTo("keep");
-        assertNoDataRecords(Duration.ofSeconds(2));
+    @Test
+    void shouldRollBackToAnEarlierSavepointAndContinueAnEmptyTransactionAcrossWindows() throws Exception {
+        config = config.edit().with("log.mining.batch.size", 20).with("log.mining.buffer.memory.bytes", 1024)
+                .with("log.mining.window.strategy", "fixed")
+                .with("log.mining.buffer.spill.path", temporaryDirectory.resolve("spill").toString()).build();
+        startAndVerifySnapshot();
+        final var first = connection.setSavepoint("FIRST_POINT");
+        execute("INSERT INTO " + tableName() + " VALUES(2,'discard before second point',2)");
+        connection.setSavepoint("SECOND_POINT");
+        execute("INSERT INTO " + tableName() + " VALUES(3,'discard after second point',3)");
+        try (var other = DriverManager.getConnection(jdbcUrl, USER, PASSWORD); var statement = other.createStatement()) {
+            statement.execute("INSERT INTO " + tableName() + " VALUES(10,'checkpoint before rollback',0)");
+            assertThat(after(nextDataRecord()).getInt32("ID")).isEqualTo(10);
+            connection.rollback(first);
+            // A committed checkpoint forces scanning beyond the rollback while
+            // the original, now empty, transaction is still open.
+            statement.execute("INSERT INTO " + tableName() + " VALUES(11,'checkpoint after rollback',0)");
+            assertThat(after(nextDataRecord()).getInt32("ID")).isEqualTo(11);
+        }
+        execute("INSERT INTO " + tableName() + " VALUES(4,'after rollback',4)");
+        connection.commit();
+        assertThat(after(nextDataRecord()).getInt32("ID")).isEqualTo(4);
+        assertNoDataRecords(Duration.ofSeconds(1));
     }
 
     @Test
@@ -416,6 +468,45 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
         assertThat(after(nextDataRecord()).get("ID")).isEqualTo(3);
         connection.commit();
         assertThat(after(nextDataRecord()).get("ID")).isEqualTo(2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = { false, true })
+    void shouldDiscardSavepointChangesAlreadyReadInEarlierWindows(boolean restart) throws Exception {
+        config = config.edit().with("log.mining.batch.size", 20).with("log.mining.buffer.memory.bytes", 1024)
+                .with("log.mining.window.strategy", "fixed")
+                .with("log.mining.buffer.spill.path", temporaryDirectory.resolve("spill").toString()).build();
+        startAndVerifySnapshot();
+        execute("INSERT INTO " + tableName() + " VALUES(2,'keep',2)");
+        final var savepoint = connection.setSavepoint("CROSS_WINDOW");
+        execute("INSERT INTO " + tableName() + " VALUES(3,'discard',3)");
+        execute("UPDATE " + tableName() + " SET NAME='discard' WHERE ID=2");
+        // Independent committed rows prove that scanning has passed the provisional
+        // images before rollback; sleeps alone would not establish that boundary.
+        try (var other = DriverManager.getConnection(jdbcUrl, USER, PASSWORD); var statement = other.createStatement()) {
+            for (int id = 10; id <= 11; id++) {
+                statement.execute("INSERT INTO " + tableName() + " VALUES(" + id + ",'checkpoint',0)");
+                final var checkpoint = nextDataRecord();
+                assertThat(after(checkpoint).getInt32("ID")).isEqualTo(id);
+                if (restart && id == 11) {
+                    stopConnector();
+                    storeOffsets(config, Map.of(checkpoint.sourcePartition(), checkpoint.sourceOffset()));
+                    consumedLines.clear();
+                    startEngine();
+                }
+            }
+        }
+        connection.rollback(savepoint);
+        execute("INSERT INTO " + tableName() + " VALUES(4,'after rollback',4)");
+        connection.commit();
+
+        final var kept = nextDataRecord();
+        assertThat(after(kept).getInt32("ID")).isEqualTo(2);
+        assertThat(after(kept).getString("NAME")).isEqualTo("keep");
+        final var added = nextDataRecord();
+        assertThat(after(added).getInt32("ID")).isEqualTo(4);
+        assertThat(after(added).getString("NAME")).isEqualTo("after rollback");
+        assertNoDataRecords(Duration.ofSeconds(1));
     }
 
     @Test
@@ -560,6 +651,91 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
         execute("INSERT INTO " + tableName() + " (ID,NAME,AMOUNT,EXTRA) VALUES(3,'restored schema',3,'restored')");
         connection.commit();
         assertThat(after(nextDataRecord()).getString("EXTRA")).isEqualTo("restored");
+    }
+
+    @Test
+    void shouldReplayCommentedDdlAndNonTableStatementsThenRecoverTheirHistoricalSchema() throws Exception {
+        final var procedure = "P_" + table;
+        final var index = "I_" + table;
+        startAndVerifySnapshot();
+        stopConnector();
+        try {
+            execute("// 授予权限\r\nGRANT SELECT ON " + tableName() + " TO PUBLIC;");
+            execute("/* 权限不改变表结构 */ REVOKE SELECT ON " + tableName() + " FROM PUBLIC");
+            execute("COMMENT ON TABLE " + tableName() + " IS q'[it's; -- /* a comment]'");
+            execute("COMMENT ON COLUMN " + tableName() + ".NAME IS 'name; // comment'");
+            execute("CREATE INDEX " + index + " ON " + tableName() + "(NAME)");
+            execute("DROP INDEX " + index);
+            execute("CREATE PROCEDURE " + procedure + " AS BEGIN NULL; BEGIN NULL; END; END;");
+            execute("DROP PROCEDURE " + procedure);
+            execute("ALTER/*词法边界，正文中的 /* 只是文本*/TABLE " + tableName() + " ADD EXTRA VARCHAR(100) DEFAULT q'[it's;--/*//]'");
+            execute("INSERT INTO " + tableName() + " (ID,NAME,AMOUNT) VALUES(2,'historical',2)");
+            connection.commit();
+            startEngine();
+            final var record = after(nextDataRecord());
+            assertThat(record.get("ID")).isEqualTo(2);
+            assertThat(record.getString("EXTRA")).isEqualTo("it's;--/*//");
+            assertThat(record.schema().field("EXTRA").schema().defaultValue()).isEqualTo("it's;--/*//");
+            assertNoDataRecords(Duration.ofSeconds(1));
+            stopConnector();
+            startEngine();
+            execute("INSERT INTO " + tableName() + " (ID,NAME,AMOUNT) VALUES(3,'recovered',3)");
+            connection.commit();
+            final var recovered = after(nextDataRecord());
+            assertThat(recovered.get("ID")).isEqualTo(3);
+            assertThat(recovered.getString("EXTRA")).isEqualTo("it's;--/*//");
+            assertThat(recovered.schema()).isEqualTo(record.schema());
+        }
+        finally {
+            stopConnector();
+            connection.rollback();
+            execute("DROP PROCEDURE IF EXISTS " + procedure);
+            execute("DROP INDEX IF EXISTS " + index);
+            connection.commit();
+        }
+    }
+
+    @Test
+    void shouldRefreshPhysicalMappingAcrossLiveDdl() throws Exception {
+        config = config.edit().with("table.include.list", SCHEMA + "\\." + table + "(_RENAMED)?").build();
+        startAndVerifySnapshot();
+        // Populate the physical mapping before each DDL; keep the same streaming source alive.
+        execute("INSERT INTO " + tableName() + " VALUES(2,'before DDL',2)");
+        connection.commit();
+        assertThat(after(nextDataRecord()).getString("NAME")).isEqualTo("before DDL");
+
+        execute("ALTER TABLE " + tableName() + " ADD EXTRA VARCHAR(100)");
+        execute("INSERT INTO " + tableName() + " VALUES(3,'added',3,'new column')");
+        connection.commit();
+        assertThat(after(nextDataRecord()).getString("EXTRA")).isEqualTo("new column");
+
+        execute("ALTER TABLE " + tableName() + " RENAME COLUMN EXTRA TO LABEL");
+        execute("UPDATE " + tableName() + " SET LABEL='renamed column' WHERE ID=3");
+        connection.commit();
+        final var renamedColumn = nextDataRecord();
+        assertThat(before(renamedColumn).getString("LABEL")).isEqualTo("new column");
+        assertThat(after(renamedColumn).getString("LABEL")).isEqualTo("renamed column");
+        assertThat(after(renamedColumn).schema().field("EXTRA")).isNull();
+
+        execute("ALTER TABLE " + tableName() + " RENAME TO \"" + table + "_RENAMED\"");
+        table = table + "_RENAMED";
+        execute("UPDATE " + tableName() + " SET LABEL='renamed table' WHERE ID=3");
+        connection.commit();
+        final var renamedTable = nextDataRecord();
+        assertThat(renamedTable.topic()).endsWith("." + table);
+        assertThat(after(renamedTable).getString("LABEL")).isEqualTo("renamed table");
+
+        execute("DROP TABLE " + tableName());
+        execute("CREATE TABLE " + tableName() + " (ID INT PRIMARY KEY, COUNTER BIGINT, LABEL VARCHAR(100))");
+        execute("INSERT INTO " + tableName() + " VALUES(4,9223372036854775807,'recreated')");
+        connection.commit();
+        final var recreated = after(nextDataRecord());
+        assertThat(recreated.getInt32("ID")).isEqualTo(4);
+        assertThat(recreated.getInt64("COUNTER")).isEqualTo(Long.MAX_VALUE);
+        assertThat(recreated.getString("LABEL")).isEqualTo("recreated");
+        assertThat(recreated.schema().field("NAME")).isNull();
+        assertThat(recreated.schema().field("AMOUNT")).isNull();
+        assertNoDataRecords(Duration.ofSeconds(1));
     }
 
     @Test
@@ -988,6 +1164,37 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
         assertThat(deleted.key()).isNull();
         assertThat(envelope(deleted).getString("op")).isEqualTo("d");
         assertThat(before(deleted).get("ID")).isEqualTo(1);
+    }
+
+    @Test
+    void shouldRefreshCharacterPaddingAfterLiveAndHistoricalDdl() throws Exception {
+        execute("ALTER TABLE " + tableName() + " ADD FIXED CHAR(8)");
+        execute("UPDATE " + tableName() + " SET FIXED='ab' WHERE ID=1");
+        connection.commit();
+        startEngine();
+        assertThat(after(nextDataRecord()).getString("FIXED")).isEqualTo("ab      ");
+
+        execute("INSERT INTO " + tableName() + " VALUES(2,'before DDL',2,'cd')");
+        connection.commit();
+        assertThat(after(nextDataRecord()).getString("FIXED")).isEqualTo("cd      ");
+        execute("ALTER TABLE " + tableName() + " MODIFY FIXED CHAR(12)");
+        execute("INSERT INTO " + tableName() + " VALUES(3,'after DDL',3,'ef')");
+        connection.commit();
+        final var checkpoint = nextDataRecord();
+        assertThat(after(checkpoint).getString("FIXED")).isEqualTo("ef          ");
+        stopConnector();
+        storeOffsets(config, Map.of(checkpoint.sourcePartition(), checkpoint.sourceOffset()));
+        consumedLines.clear();
+
+        execute("INSERT INTO " + tableName() + " VALUES(4,'old history',4,'gh')");
+        connection.commit();
+        execute("ALTER TABLE " + tableName() + " MODIFY FIXED CHAR(16)");
+        execute("INSERT INTO " + tableName() + " VALUES(5,'new history',5,'ij')");
+        connection.commit();
+        startEngine();
+        assertThat(after(nextDataRecord()).getString("FIXED")).isEqualTo("gh          ");
+        assertThat(after(nextDataRecord()).getString("FIXED")).isEqualTo("ij              ");
+        assertNoDataRecords(Duration.ofSeconds(1));
     }
 
     @Test

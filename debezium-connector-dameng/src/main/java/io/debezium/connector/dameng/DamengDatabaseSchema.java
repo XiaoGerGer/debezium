@@ -5,6 +5,9 @@
  */
 package io.debezium.connector.dameng;
 
+import java.sql.SQLException;
+import java.util.Collection;
+
 import org.apache.kafka.connect.errors.ConnectException;
 
 import io.debezium.config.CommonConnectorConfig;
@@ -12,6 +15,7 @@ import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.pipeline.spi.Offsets;
 import io.debezium.relational.CustomConverterRegistry;
 import io.debezium.relational.HistorizedRelationalDatabaseSchema;
+import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchemaBuilder;
 import io.debezium.relational.Tables;
@@ -24,6 +28,16 @@ import io.debezium.spi.topic.TopicNamingStrategy;
 
 public final class DamengDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     private final DamengValueConverters valueConverters;
+    private long tableVersion;
+    private DamengCaptureScopeChange captureScopeChange;
+    private DamengCaptureScopePreparation captureScopePreparation;
+    private DamengConnection captureScopeConnection;
+    private final DamengConnectorConfig config;
+
+    /** Invalidates streaming's object index after snapshot, recovery or DDL. */
+    long tableVersion() {
+        return tableVersion;
+    }
 
     public DamengDatabaseSchema(DamengConnectorConfig config, DamengValueConverters valueConverters,
                                 SchemaNameAdjuster schemaNameAdjuster, TopicNamingStrategy<TableId> topicNamingStrategy,
@@ -35,6 +49,13 @@ public final class DamengDatabaseSchema extends HistorizedRelationalDatabaseSche
                         false, config.getEventConvertingFailureHandlingMode()),
                 false, config.getKeyMapper(), taskContext);
         this.valueConverters = valueConverters;
+        this.config = config;
+    }
+
+    void setCaptureScopeChange(DamengCaptureScopeChange change, DamengConnection connection, DamengStandbySupport standby) {
+        captureScopeChange = change;
+        captureScopeConnection = connection;
+        captureScopePreparation = new DamengCaptureScopePreparation(config, connection, standby);
     }
 
     public Tables getTables() {
@@ -46,9 +67,37 @@ public final class DamengDatabaseSchema extends HistorizedRelationalDatabaseSche
     }
 
     @Override
+    public void refresh(Table table) {
+        tableVersion++;
+        super.refresh(table);
+    }
+
+    void registerRecoveryTables(Collection<Table> baselineTables) {
+        tableVersion++;
+        for (Table table : baselineTables) {
+            tables().overwriteTable(table);
+            buildAndRegisterSchema(table);
+        }
+        validateObjectIdentities();
+    }
+
+    @Override
     public void recover(Offsets<?, ?> offsets) throws InterruptedException {
+        tableVersion++;
         super.recover(offsets);
         validateObjectIdentities();
+        if (captureScopeChange != null) {
+            final var offset = (DamengOffsetContext) offsets.getTheOnlyOffset();
+            try {
+                if (offset != null && !java.util.Objects.equals(offset.getCaptureScopeManifest(), DamengCaptureScope.manifest(config))) {
+                    captureScopeChange.prepare(offset, captureScopeConnection.getAllTableIds(null), captureScopePreparation, this);
+                }
+                captureScopeChange.recovered(this, offset);
+            }
+            catch (SQLException e) {
+                throw new ConnectException("Could not prepare the Dameng capture scope change", e);
+            }
+        }
     }
 
     /** Ensures recovered tables can be bound to dictionary-free LogMiner records. */
@@ -69,6 +118,7 @@ public final class DamengDatabaseSchema extends HistorizedRelationalDatabaseSche
 
     @Override
     public void applySchemaChange(SchemaChangeEvent event) {
+        tableVersion++;
         if (event.getType() == SchemaChangeEventType.TRUNCATE) {
             final TableChanges changes = new TableChanges();
             for (var table : event.getTables()) {

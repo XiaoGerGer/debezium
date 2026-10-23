@@ -12,7 +12,11 @@ import java.util.List;
 import org.apache.kafka.connect.errors.ConnectException;
 
 /** Database family and retained primary-open history used to reject divergent recovery. */
-public record DamengDatabaseIdentity(long permanentMagic, long databaseMagic, long currentLsn, List<OpenRecord> history) {
+public record DamengDatabaseIdentity(long permanentMagic, long databaseMagic, long currentLsn, List<OpenRecord> history, long readingDatabaseMagic) {
+    public DamengDatabaseIdentity(long permanentMagic, long databaseMagic, long currentLsn, List<OpenRecord> history) {
+        this(permanentMagic, databaseMagic, currentLsn, history, databaseMagic);
+    }
+
     public record OpenRecord(String guid, Instant openedAt, long databaseMagic, long appliedLsn, long previousPrimaryMagic) {
         public OpenRecord(String guid, Instant openedAt, long databaseMagic, long appliedLsn) {
             this(guid, openedAt, databaseMagic, appliedLsn, databaseMagic);
@@ -21,7 +25,7 @@ public record DamengDatabaseIdentity(long permanentMagic, long databaseMagic, lo
 
     public DamengDatabaseIdentity {
         history = history.stream().sorted(Comparator.comparing(OpenRecord::openedAt)).toList();
-        if (permanentMagic == 0 || databaseMagic == 0 || history.isEmpty()) {
+        if (permanentMagic == 0 || databaseMagic == 0 || readingDatabaseMagic == 0 || history.isEmpty()) {
             throw new ConnectException("Dameng primary/standby recovery requires a database permanent magic and retained SYSOPENHISTORY records");
         }
         for (int index = 0; index < history.size(); index++) {

@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.BitSet;
+import java.util.Random;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
@@ -159,6 +160,16 @@ class LogMinerDmlParserTest {
     }
 
     @Test
+    void shouldParseNonFiniteRedoWithoutConfusingQuotedText() {
+        assertThat(parser.parse("INSERT INTO APP.EVENTS(AMOUNT,NAME) VALUES(nan,'nan')", table).newValues())
+                .containsExactly(null, "nan", new SqlExpression("nan"), null, null, null);
+        assertThat(parser.parse("UPDATE APP.EVENTS SET AMOUNT=NULL WHERE AMOUNT=NaN AND ID=1", table).oldValues()[2])
+                .isEqualTo(new SqlExpression("NaN"));
+        assertThat(parser.parse("DELETE FROM APP.EVENTS WHERE AMOUNT=nan", table).oldValues()[2]).isEqualTo(new SqlExpression("nan"));
+        assertThat(parser.parse("INSERT INTO APP.EVENTS(BIN,NAME) VALUES('0x','0x')", table).newValues()[4]).isEqualTo("0x");
+    }
+
+    @Test
     void shouldDecodeBinaryBeforeAndAfterImages() {
         final var entry = parser.parse("UPDATE APP.EVENTS SET BIN=0xABCD WHERE ID=2 AND BIN=0x0123;", table);
 
@@ -207,6 +218,40 @@ class LogMinerDmlParserTest {
     }
 
     @Test
+    void shouldFoldUnquotedColumnNamesButPreserveQuotedCase() {
+        final var metadata = table("ID", "mixedName", "AMOUNT");
+        final var entry = parser.parse("UPDATE app.events SET \"mixedName\"='after', aMoUnT=2 WHERE id=1 AND \"mixedName\"='before' AND amount=1",
+                metadata);
+
+        assertThat(entry.oldValues()).containsExactly("1", "before", "1");
+        assertThat(entry.newValues()).containsExactly("1", "after", "2");
+        assertThatThrownBy(() -> parser.parse("INSERT INTO APP.EVENTS(mixedName) VALUES('wrong case')", metadata))
+                .isInstanceOf(DmlParserException.class).hasMessageContaining("Unknown redo column");
+        assertThatThrownBy(() -> parser.parse("INSERT INTO APP.EVENTS(\"MIXEDNAME\") VALUES('wrong case')", metadata))
+                .isInstanceOf(DmlParserException.class).hasMessageContaining("Unknown redo column");
+    }
+
+    @Test
+    void shouldResolveColumnsAgainstEachHistoricalOrder() {
+        final var original = table("ID", "NAME", "AMOUNT");
+        final var reordered = original.edit().reorderColumn("AMOUNT", null).create();
+        final String sql = "UPDATE APP.EVENTS SET AMOUNT=20 WHERE ID=1 AND NAME='unchanged' AND AMOUNT=10";
+
+        assertThat(parser.parse(sql, original).newValues()).containsExactly("1", "unchanged", "20");
+        assertThat(parser.parse(sql, reordered).newValues()).containsExactly("20", "1", "unchanged");
+        assertThat(parser.parse(sql, original).oldValues()).containsExactly("1", "unchanged", "10");
+    }
+
+    @Test
+    void shouldPreferAnActualRowidColumnOverTheRowLocator() {
+        final var entry = parser.parse("UPDATE APP.EVENTS SET ROWID='after' WHERE ID=1 AND ROWID='before'", table("ID", "ROWID"));
+
+        assertThat(entry.oldValues()).containsExactly("1", "before");
+        assertThat(entry.newValues()).containsExactly("1", "after");
+        assertThat(entry.oldPresent()).isEqualTo(bits(0, 1));
+    }
+
+    @Test
     void shouldParseWhitespaceAndCommentsOutsideLiterals() {
         final var entry = parser.parse(
                 "/* redo */\nInSeRt\tInTo APP.EVENTS\n(ID,/* comment */NAME)\nVaLuEs (1,'/* literal */'); -- trailing",
@@ -232,6 +277,44 @@ class LogMinerDmlParserTest {
                 "UPDATE APP.EVENTS SET NAME='" + value.replace("'", "''") + "' WHERE ID=1 AND NAME='before'", table);
 
         assertThat(entry.newValues()[1]).isEqualTo(value);
+    }
+
+    @Test
+    void shouldPreserveSeededQuotedIdentifiersAndValues() {
+        final var random = new Random(43107);
+        final String[] fragments = { "a", "达梦", "😀", "'", "\"", "''", "\"\"", "\\", "\n", "/*", "--", ",()=;" };
+        for (int i = 0; i < 300; i++) {
+            final var value = new StringBuilder();
+            final int length = random.nextInt(40);
+            for (int j = 0; j < length; j++) {
+                value.append(fragments[random.nextInt(fragments.length)]);
+            }
+            final String text = value.toString();
+            final String name = "column" + text;
+            final String quotedName = "\"" + name.replace("\"", "\"\"") + "\"";
+            final String literal = "'" + text.replace("'", "''") + "'";
+            final var entry = parser.parse("UPDATE APP.EVENTS SET " + quotedName + "=" + literal
+                    + " WHERE " + quotedName + "='before'", table(name));
+            assertThat(entry.oldValues()).containsExactly("before");
+            assertThat(entry.newValues()).containsExactly(text);
+        }
+    }
+
+    @Test
+    void shouldPreserveAdjacentNumericTokensAndExpressionBoundaries() {
+        final String expression = "TO_NUMBER( /* retained */ '0001.2000')";
+        final var entry = parser.parse("INSERT INTO APP.EVENTS(ID,AMOUNT,FLAG,NAME,TS,BIN) VALUES("
+                + "-0.000,/* gap */+.5E+2,1.,'1e+'," + expression + ",0x00ff)", table);
+        assertThat(entry.newValues()).startsWith("-0.000", "1e+", "+.5E+2", new SqlExpression(expression));
+        assertThat(entry.newValues()[5]).isEqualTo("1.");
+        assertThat((byte[]) entry.newValues()[4]).containsExactly((byte) 0, (byte) 0xff);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "'unclosed''", "'''", "\"unclosed\"\"", "1e+", "+.e2", "١", ".", "1..2" })
+    void shouldRejectIncompleteTokensAfterAValidNumericToken(String token) {
+        assertThatThrownBy(() -> parser.parse("INSERT INTO APP.EVENTS(ID,NAME) VALUES(1," + token + ")", table))
+                .isInstanceOf(DmlParserException.class);
     }
 
     @ParameterizedTest

@@ -33,6 +33,9 @@ public final class DamengChangeEventSourceFactory implements ChangeEventSourceFa
     private final SnapshotterService snapshotterService;
     private final NotificationService<DamengPartition, DamengOffsetContext> notificationService;
     private final DamengStreamingChangeEventSourceMetrics streamingMetrics;
+    private DamengRecovery recovery;
+    private DamengStandbySupport standby;
+    private DamengCaptureScopeChange captureScopeChange;
 
     public DamengChangeEventSourceFactory(DamengConnectorConfig config, MainConnectionProvidingConnectionFactory<DamengConnection> connectionFactory,
                                           DamengConnection incrementalSnapshotConnection,
@@ -56,12 +59,29 @@ public final class DamengChangeEventSourceFactory implements ChangeEventSourceFa
     public SnapshotChangeEventSource<DamengPartition, DamengOffsetContext> getSnapshotChangeEventSource(
                                                                                                         SnapshotProgressListener<DamengPartition> listener,
                                                                                                         NotificationService<DamengPartition, DamengOffsetContext> notifications) {
-        return new DamengSnapshotChangeEventSource(config, connectionFactory, schema, dispatcher, clock, listener, notifications, snapshotterService);
+        final var source = new DamengSnapshotChangeEventSource(config, connectionFactory, schema, dispatcher, clock, listener, notifications, snapshotterService,
+                recovery);
+        source.setStandbySupport(standby);
+        return source;
+    }
+
+    void setRecovery(DamengRecovery recovery) {
+        this.recovery = recovery;
+    }
+
+    void setStandbySupport(DamengStandbySupport standby) {
+        this.standby = standby;
+    }
+
+    void setCaptureScopeChange(DamengCaptureScopeChange change) {
+        captureScopeChange = change;
     }
 
     @Override
     public StreamingChangeEventSource<DamengPartition, DamengOffsetContext> getStreamingChangeEventSource() {
-        return new DamengStreamingChangeEventSource(config, connectionFactory, dispatcher, errorHandler, clock, schema, streamingMetrics);
+        final var source = new DamengStreamingChangeEventSource(config, connectionFactory, dispatcher, errorHandler, clock, schema, streamingMetrics);
+        source.setCaptureScopeChange(captureScopeChange);
+        return source;
     }
 
     @Override
@@ -73,7 +93,10 @@ public final class DamengChangeEventSourceFactory implements ChangeEventSourceFa
         if (config.getSignalingDataCollectionIds().isEmpty()) {
             return Optional.empty();
         }
-        return Optional.of(new DamengIncrementalSnapshotChangeEventSource(config, incrementalSnapshotConnection, dispatcher, schema,
-                clock, listener, eventListener, notifications));
+        final var source = new DamengIncrementalSnapshotChangeEventSource(config, incrementalSnapshotConnection, dispatcher, schema,
+                clock, listener, eventListener, notifications);
+        source.setStandbySupport(standby);
+        source.setCaptureScopeChange(captureScopeChange);
+        return Optional.of(source);
     }
 }

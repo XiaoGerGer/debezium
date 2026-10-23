@@ -6,24 +6,51 @@
 package io.debezium.connector.dameng;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.mockito.Mockito.mock;
 
 import java.io.IOException;
 import java.nio.file.AccessDeniedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.SQLException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLTimeoutException;
 import java.sql.SQLTransientConnectionException;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.base.ChangeEventQueue;
+import io.debezium.connector.dameng.logminer.LogMinerRow;
+import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer;
 import io.debezium.relational.history.SchemaHistoryException;
 
 class DamengErrorHandlerTest {
+    @TempDir
+    Path directory;
     private final DamengErrorHandler handler = new DamengErrorHandler(
             new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").build()), mock(ChangeEventQueue.class), null);
+
+    @ParameterizedTest
+    @ValueSource(strings = { "database.failover.hosts", "database.standby.hosts" })
+    void shouldRetryObservedMountInterruptionOnlyForRoleControlledConnections(String hosts) {
+        final var mount = new SQLException("TRX interrupted by mount", "25000", -6508);
+        final var config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").with(hosts, "a:5236,b:5236").build());
+        final var roleHandler = new DamengErrorHandler(config, mock(ChangeEventQueue.class), null);
+        assertThat(roleHandler.isRetriable(mount)).isTrue();
+        final var mounted = new SQLException("System in mount status", "22000", -510);
+        assertThat(roleHandler.isRetriable(mounted)).isTrue();
+        assertThat(handler.isRetriable(mounted)).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("different data error", "22000", -511))).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("Server Mode invalid.", "", 6091))).isTrue();
+        assertThat(handler.isRetriable(mount)).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("unrelated transaction error", "25000", -6509))).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("different SQLState", "42000", -6508))).isFalse();
+    }
 
     @Test
     void shouldRetryNoEligiblePrimaryOnlyForConfiguredFailoverEndpoints() {
@@ -77,6 +104,21 @@ class DamengErrorHandlerTest {
         final var connection = new SQLException("connection closed", "08003");
         connection.initCause(new SchemaHistoryException("Cannot persist DDL", new AccessDeniedException("history.dat")));
         assertThat(handler.isRetriable(connection)).isFalse();
+    }
+
+    @Test
+    void shouldNotRetryLocalTransactionStorageFailuresEvenDuringConnectionCleanup() throws Exception {
+        final var blocked = Files.writeString(directory.resolve("not-a-directory"), "test");
+        try (var buffer = new LogMinerTransactionBuffer(512, 1048576, 1000, blocked, 1048576)) {
+            final var failure = catchThrowable(() -> buffer.add(new LogMinerRow(11, 10, 0, "tx", 1, 0, null, null, null,
+                    "INSERT", "r", 0, 0, java.time.Instant.EPOCH, 7)));
+            assertThat(failure).isNotNull();
+            assertThat(handler.isRetriable(failure)).isFalse();
+            assertThat(handler.isRetriable(new RuntimeException(failure))).isFalse();
+            final var networkFailure = new SQLException("connection closed", "08003");
+            networkFailure.addSuppressed(failure);
+            assertThat(handler.isRetriable(networkFailure)).isFalse();
+        }
     }
 
     @Test

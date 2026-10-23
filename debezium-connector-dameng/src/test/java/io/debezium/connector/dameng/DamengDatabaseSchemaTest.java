@@ -66,6 +66,7 @@ class DamengDatabaseSchemaTest {
                 config.getTopicNamingStrategy(CommonConnectorConfig.TOPIC_NAMING_STRATEGY), new CustomConverterRegistry(List.of()),
                 new DamengTaskContext(configuration, config))) {
             schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, offset, "DAMENG", original));
+            assertThat(schema.tableVersion()).isEqualTo(1);
             schema.validateObjectIdentities();
             assertThat(schema.schemaFor(original.id())).isNotNull();
             offset.setCommitLsn(20);
@@ -74,6 +75,7 @@ class DamengDatabaseSchemaTest {
             schema.applySchemaChange(SchemaChangeEvent.ofRename(partition, offset, "DAMENG", "APP",
                     "ALTER TABLE APP.ORIGINAL RENAME TO RENAMED", renamed, original.id()));
 
+            assertThat(schema.tableVersion()).isEqualTo(2);
             assertThat(schema.getTables().forTable(original.id())).isNull();
             assertThat(schema.schemaFor(original.id())).isNull();
             assertThat(schema.getTables().forTable(renamed.id())).isEqualTo(renamed);
@@ -93,6 +95,7 @@ class DamengDatabaseSchemaTest {
             schema.applySchemaChange(SchemaChangeEvent.of(SchemaChangeEventType.TRUNCATE, partition, offset, "DAMENG", "APP",
                     "TRUNCATE TABLE APP.RENAMED", truncated, false));
             assertThat(schema.getTables().forTable(renamed.id()).attributeWithName("dameng.object.id").asLong()).isEqualTo(67890L);
+            assertThat(schema.tableVersion()).isEqualTo(3);
             final var afterTruncate = new Tables();
             schema.getSchemaHistory().recover(Offsets.of(partition, offset), afterTruncate, null);
             assertThat(afterTruncate.forTable(renamed.id()).attributeWithName("dameng.object.id").asLong()).isEqualTo(67890L);
@@ -103,6 +106,13 @@ class DamengDatabaseSchemaTest {
             assertThat(schema.getTables().forTable(renamed.id())).isNull();
             assertThat(schema.schemaFor(renamed.id())).isNull();
 
+            assertThat(schema.tableVersion()).isEqualTo(4);
+            schema.registerRecoveryTables(List.of(original));
+            assertThat(schema.tableVersion()).isEqualTo(5);
+            schema.recover(Offsets.of(partition, offset));
+            assertThat(schema.tableVersion()).isEqualTo(6);
+            schema.refresh(original);
+            assertThat(schema.tableVersion()).isEqualTo(7);
             final var afterDrop = new Tables();
             schema.getSchemaHistory().recover(Offsets.of(partition, offset), afterDrop, null);
             assertThat(afterDrop.tableIds()).isEmpty();

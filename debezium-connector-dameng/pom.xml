@@ -3,7 +3,7 @@
     <parent>
         <groupId>io.debezium</groupId>
         <artifactId>debezium-parent</artifactId>
-        <version>3.6.4-SNAPSHOT</version>
+        <version>3.6.4-xingchuang-kafka2.0</version>
         <relativePath>../debezium-parent/pom.xml</relativePath>
     </parent>
     <modelVersion>4.0.0</modelVersion>
@@ -13,6 +13,9 @@
     <properties>
         <version.dameng.driver>8.1.3.140</version.dameng.driver>
         <skipITs>true</skipITs>
+        <dameng.surefire.reports.directory>${project.build.directory}/surefire-reports</dameng.surefire.reports.directory>
+        <dameng.coverage.data.file>${project.build.directory}/jacoco.exec</dameng.coverage.data.file>
+        <dameng.failsafe.reports.directory>${project.build.directory}/failsafe-reports</dameng.failsafe.reports.directory>
     </properties>
     <dependencies>
         <dependency>
@@ -86,6 +89,12 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <version>2.3.232</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.awaitility</groupId>
             <artifactId>awaitility</artifactId>
             <scope>test</scope>
@@ -116,10 +125,21 @@
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <reportsDirectory>${dameng.surefire.reports.directory}</reportsDirectory>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-failsafe-plugin</artifactId>
                 <configuration>
+                    <reportsDirectory>${dameng.failsafe.reports.directory}</reportsDirectory>
                     <excludes>
                         <exclude>**/DamengKafkaConnectIT.java</exclude>
+                        <exclude>**/*ProbeIT.java</exclude>
+                        <exclude>**/*BenchmarkIT.java</exclude>
+                        <exclude>**/*PerformanceIT.java</exclude>
                     </excludes>
                 </configuration>
                 <executions>
@@ -166,7 +186,7 @@
                         <artifactId>jacoco-maven-plugin</artifactId>
                         <version>0.8.15</version>
                         <configuration>
-                            <dataFile>${project.build.directory}/jacoco.exec</dataFile>
+                            <dataFile>${dameng.coverage.data.file}</dataFile>
                         </configuration>
                         <executions>
                             <execution>
@@ -176,7 +196,7 @@
                                 </goals>
                                 <configuration>
                                     <propertyName>dameng.coverage.argLine</propertyName>
-                                    <destFile>${project.build.directory}/jacoco.exec</destFile>
+                                    <destFile>${dameng.coverage.data.file}</destFile>
                                     <!-- Preserve coverage across unit, architecture and embedded-engine integration test JVMs. -->
                                     <append>true</append>
                                 </configuration>
@@ -228,7 +248,7 @@
                                     <rules>
                                         <requireFilesExist>
                                             <files>
-                                                <file>${project.build.directory}/jacoco.exec</file>
+                                                <file>${dameng.coverage.data.file}</file>
                                             </files>
                                         </requireFilesExist>
                                     </rules>
@@ -280,6 +300,49 @@
             <properties>
                 <skipITs>false</skipITs>
             </properties>
+        </profile>
+        <profile>
+            <id>dameng-probes</id>
+            <properties>
+                <skipITs>false</skipITs>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration>
+                            <includes>
+                                <include>**/*ProbeIT.java</include>
+                                <include>**/*BenchmarkIT.java</include>
+                                <include>**/*PerformanceIT.java</include>
+                            </includes>
+                            <excludes combine.self="override">
+                                <exclude>**/DamengKafkaConnectIT.java</exclude>
+                            </excludes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>dameng-all-tests</id>
+            <properties>
+                <skipITs>false</skipITs>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration>
+                            <excludes combine.self="override">
+                                <exclude>**/DamengKafkaConnectIT.java</exclude>
+                            </excludes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
         </profile>
         <profile>
             <id>dameng-connect-tests</id>

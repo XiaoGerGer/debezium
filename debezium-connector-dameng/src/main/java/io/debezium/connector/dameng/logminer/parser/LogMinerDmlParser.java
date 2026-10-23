@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import io.debezium.data.Envelope.Operation;
@@ -204,6 +205,9 @@ public class LogMinerDmlParser {
             if (takeWord("NULL")) {
                 return null;
             }
+            if (takeWord("NAN")) {
+                return new SqlExpression(token.value());
+            }
             if (takeWord("OUT_CLOB") || takeWord("OUT_BLOB")) {
                 return new SqlExpression(token.value());
             }
@@ -232,6 +236,10 @@ public class LogMinerDmlParser {
                 return new SqlExpression(sql.substring(token.start(), tokens.get(position - 1).end()));
             }
             if (takeWord("INTERVAL")) {
+                // DM puts the sign before the quote: INTERVAL -'12-3' YEAR(3) TO MONTH.
+                if (!takeSymbol("-")) {
+                    takeSymbol("+");
+                }
                 if (peek().kind() != Kind.STRING) {
                     throw error("Expected an interval literal");
                 }
@@ -240,8 +248,7 @@ public class LogMinerDmlParser {
                 if (takeWord("TO")) {
                     readIntervalField();
                 }
-                // Keep the expression intact so excluded interval columns can be
-                // parsed without claiming a supported interval value mapping.
+                // Preserve qualifier, sign and fractional precision for exact value conversion.
                 return new SqlExpression(sql.substring(token.start(), tokens.get(position - 1).end()));
             }
             throw error("Unsupported redo value");
@@ -282,10 +289,11 @@ public class LogMinerDmlParser {
         }
 
         private int columnIndex(Token name) {
-            for (int i = 0; i < table.columns().size(); i++) {
-                if (matches(name, table.columns().get(i).name())) {
-                    return i;
-                }
+            final String identifier = name.kind() == Kind.IDENTIFIER ? name.value() : name.value().toUpperCase(Locale.ROOT);
+            final var column = table.columnWithName(identifier);
+            // Table's index is case-insensitive; quoted redo identifiers must still match exactly.
+            if (column != null && identifier.equals(column.name())) {
+                return column.position() - 1;
             }
             if (name.value().equalsIgnoreCase("ROWID")) {
                 return -1;
@@ -345,6 +353,7 @@ public class LogMinerDmlParser {
 
         private void tokenize() {
             int index = 0;
+            Matcher number = null;
             while (index < sql.length()) {
                 final char character = sql.charAt(index);
                 if (Character.isWhitespace(character)) {
@@ -366,29 +375,25 @@ public class LogMinerDmlParser {
                 }
                 final int start = index;
                 if (character == '\'' || character == '"') {
-                    final StringBuilder value = new StringBuilder();
-                    index++;
-                    boolean closed = false;
-                    while (index < sql.length()) {
-                        final char next = sql.charAt(index++);
-                        if (next == character) {
-                            if (index < sql.length() && sql.charAt(index) == character) {
-                                value.append(character);
-                                index++;
-                            }
-                            else {
-                                closed = true;
-                                break;
-                            }
+                    int contentStart = index + 1;
+                    int end = sql.indexOf(character, contentStart);
+                    StringBuilder decoded = null;
+                    // Most redo identifiers and strings have no escaped quotes. Copy
+                    // those once; allocate a builder only to decode doubled quotes.
+                    while (end >= 0 && end + 1 < sql.length() && sql.charAt(end + 1) == character) {
+                        if (decoded == null) {
+                            decoded = new StringBuilder();
                         }
-                        else {
-                            value.append(next);
-                        }
+                        decoded.append(sql, contentStart, end + 1);
+                        contentStart = end + 2;
+                        end = sql.indexOf(character, contentStart);
                     }
-                    if (!closed) {
+                    if (end < 0) {
                         throw error("Unterminated SQL quotation");
                     }
-                    tokens.add(new Token(character == '\'' ? Kind.STRING : Kind.IDENTIFIER, value.toString(), start, index));
+                    final String value = decoded == null ? sql.substring(contentStart, end) : decoded.append(sql, contentStart, end).toString();
+                    index = end + 1;
+                    tokens.add(new Token(character == '\'' ? Kind.STRING : Kind.IDENTIFIER, value, start, index));
                 }
                 else if (character == '0' && index + 1 < sql.length() && (sql.charAt(index + 1) == 'x' || sql.charAt(index + 1) == 'X')) {
                     index += 2;
@@ -398,13 +403,16 @@ public class LogMinerDmlParser {
                     }
                     tokens.add(new Token(Kind.BINARY, sql.substring(digits, index), start, index));
                 }
-                else if (Character.isDigit(character) || character == '+' || character == '-'
+                else if (Character.isDigit(character) || (character == '+' || character == '-') && index + 1 < sql.length()
+                        && (Character.isDigit(sql.charAt(index + 1)) || sql.charAt(index + 1) == '.')
                         || character == '.' && index + 1 < sql.length() && Character.isDigit(sql.charAt(index + 1))) {
-                    final var matcher = NUMBER.matcher(sql).region(index, sql.length());
-                    if (!matcher.lookingAt()) {
+                    if (number == null) {
+                        number = NUMBER.matcher(sql);
+                    }
+                    if (!number.region(index, sql.length()).lookingAt()) {
                         throw error("Invalid numeric literal");
                     }
-                    index = matcher.end();
+                    index = number.end();
                     tokens.add(new Token(Kind.NUMBER, sql.substring(start, index), start, index));
                 }
                 else if (Character.isLetter(character) || character == '_' || character == '$' || character == '#') {

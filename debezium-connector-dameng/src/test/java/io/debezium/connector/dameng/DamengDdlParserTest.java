@@ -124,10 +124,8 @@ class DamengDdlParserTest {
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Unsupported ALTER COLUMN");
         assertThatThrownBy(() -> parser.parse("ALTER TABLE APP.T MOVE", tables, "APP"))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Unsupported ALTER TABLE");
-        assertThatThrownBy(() -> parser.parse("COMMENT ON TABLE APP.T IS 'metadata'", tables, "APP"))
-                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Unsupported Dameng DDL");
-        assertThatThrownBy(() -> parser.resolveTableId("COMMENT ON TABLE APP.T IS 'metadata'", "APP"))
-                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Unsupported table DDL");
+        assertThat(parser.parse("COMMENT ON TABLE APP.T IS 'metadata'", tables, "APP")).isEmpty();
+        assertThat(parser.resolveTableId("COMMENT ON TABLE APP.T IS 'metadata'", "APP")).isNull();
         assertThat(tables.forTable(id)).isEqualTo(original);
     }
 
@@ -326,7 +324,7 @@ class DamengDdlParserTest {
                 + " /* trailing redo comment */", tables, "APP");
         final var column = tables.forTable(new TableId(null, "APP", "T")).columnWithName("AMOUNT");
 
-        assertThat(column.defaultValueExpression()).contains("( 1.2e+3 )");
+        assertThat(column.defaultValueExpression()).contains("(1.2e+3)");
         assertThat(column.isOptional()).isFalse();
     }
 
@@ -359,6 +357,8 @@ class DamengDdlParserTest {
                 Arguments.of("TIMESTAMP(6)", Types.TIMESTAMP, 36, 6),
                 Arguments.of("TIMESTAMP(6) WITH TIME ZONE", Types.TIMESTAMP_WITH_TIMEZONE, 43, 6),
                 Arguments.of("TIME(3)", Types.TIME, 19, 3),
+                Arguments.of("TIME", Types.TIME, 15, 0),
+                Arguments.of("TIME WITH TIME ZONE", Types.TIME_WITH_TIMEZONE, 22, 0),
                 Arguments.of("FLOAT(24)", Types.REAL, 24, null),
                 Arguments.of("FLOAT(53)", Types.FLOAT, 53, null),
                 Arguments.of("DOUBLE PRECISION", Types.DOUBLE, 53, null),
@@ -366,6 +366,18 @@ class DamengDdlParserTest {
                 Arguments.of("BIT", Types.BIT, 1, 0),
                 Arguments.of("BOOLEAN", Types.BOOLEAN, 1, 0),
                 Arguments.of("BINARY", Types.BINARY, 1, null));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "STORAGE(USING LONG ROW)", "STORAGE(DISABLE USING LONG ROW)" })
+    void shouldParseLongRowStorageWithoutChangingTheLogicalColumnDefinition(String storage) {
+        final var parser = new DamengDdlParser();
+        final var tables = new Tables();
+        parser.parse("CREATE TABLE APP.T (VALUE VARCHAR(32767)) " + storage, tables, "APP");
+        assertThat(tables.forTable(new TableId(null, "APP", "T")).columnWithName("VALUE").length()).isEqualTo(32767);
+        assertThatThrownBy(() -> parser.parse("CREATE TABLE APP.U (VALUE INT) STORAGE(USING UNKNOWN ROW)", tables, "APP"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(tables.forTable(new TableId(null, "APP", "U"))).isNull();
     }
 
     @ParameterizedTest
@@ -506,6 +518,55 @@ class DamengDdlParserTest {
         final var parser = new DamengDdlParser();
         assertThat(parser.isNonTableDdl(ddl)).isTrue();
         assertThat(parser.resolveTableId(ddl, "APP")).isNull();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "GRANT SELECT ON APP.T TO CDC_USER",
+            "REVOKE SELECT ON APP.T FROM CDC_USER",
+            "GRANT CREATE TABLE, CREATE VIEW TO CDC_USER",
+            "GRANT SOI TO CDC_USER WITH ADMIN OPTION",
+            "GRANT SELECT ON APP.T TO \"User;ALTER TABLE\" WITH GRANT OPTION",
+            "// 授予要采集表的 select 权限\nGRANT SELECT ON BIZ.CDC_PROBE TO DBZ_USER1",
+            "// 授予权限\r\n/* 对象权限 */ grant select on APP.T to CDC_USER;",
+            "-- 回收权限\rREVOKE SELECT ON APP.T FROM CDC_USER",
+            "GRANT SELECT ON APP.T TO CDC_USER; // 回收权限\nREVOKE SELECT ON APP.T FROM CDC_USER;",
+            "GRANT SELECT ON APP.T TO CDC_USER // trailing comment without newline"
+    })
+    void shouldIdentifyCommentedPrivilegeStatementsWithoutChangingTableDefinitions(String ddl) {
+        final var parser = new DamengDdlParser();
+        assertThat(parser.isNonTableDdl(ddl)).isTrue();
+        assertThat(parser.resolveTableId(ddl, "APP")).isNull();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "\n", "\r\n", "\r" })
+    void shouldParseTableDdlWithSlashCommentsAndPreserveQuotedCommentMarkers(String newline) {
+        final var parser = new DamengDdlParser();
+        final var tables = new Tables();
+        final var ddl = "// 注释中的 DROP TABLE APP.T;" + newline
+                + "CREATE TABLE APP.\"a//b\" (ID INT PRIMARY KEY, "
+                + "VALUE VARCHAR(100) DEFAULT 'https://example.test/--/*;') // trailing comment";
+
+        assertThat(parser.resolveTableId(ddl, "APP")).isEqualTo(new TableId(null, "APP", "a//b"));
+        parser.parse(ddl, tables, "APP");
+
+        assertThat(tables.forTable(new TableId(null, "APP", "a//b")).columnWithName("VALUE").defaultValueExpression())
+                .contains("'https://example.test/--/*;'");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "GRANT SELECT ON APP.T TO CDC_USER; ALTER TABLE APP.T ADD EXTRA INT",
+            "REVOKE SELECT ON APP.T FROM CDC_USER; CREATE TABLE APP.U (ID INT)",
+            "GRANT SELECT ON APP.T TO CDC_USER; // 表结构变更\nDROP TABLE APP.T",
+            "GRANT SELECT ON APP.T TO CDC_USER; UNKNOWN STATEMENT"
+    })
+    void shouldRejectMixedPrivilegeAndTableOrUnknownStatements(String ddl) {
+        final var parser = new DamengDdlParser();
+        assertThat(parser.isNonTableDdl(ddl)).isFalse();
+        assertThatThrownBy(() -> parser.resolveTableId(ddl, "APP"))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Unsupported table DDL");
     }
 
     @ParameterizedTest

@@ -1248,7 +1248,8 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
         return jdbcConnection.readTableStatement(connectorConfig, tableSize);
     }
 
-    private void rollbackTransaction(Connection connection) {
+    /** Ends the snapshot transaction; connectors can observe successful lock release. */
+    protected void rollbackTransaction(Connection connection) {
         if (connection != null) {
             try {
                 connection.rollback();

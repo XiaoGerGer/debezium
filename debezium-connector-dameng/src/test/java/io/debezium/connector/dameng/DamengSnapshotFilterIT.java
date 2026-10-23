@@ -19,7 +19,6 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
-import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -138,7 +137,7 @@ class DamengSnapshotFilterIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
-    void shouldRejectExpandedCaptureEvenWhenThePreviouslyExcludedTableWasDropped() throws Exception {
+    void shouldExpandCaptureWhenTheNewlyIncludedTableWasDropped() throws Exception {
         final Configuration expanded = config;
         config = config.edit().with("table.include.list", DamengTestDatabase.schema() + "\\." + snapshotTable).build();
         startEngine();
@@ -155,16 +154,25 @@ class DamengSnapshotFilterIT extends AbstractAsyncEngineConnectorTest {
         execute("DROP TABLE " + qualified(streamingTable));
         connection.commit();
         config = expanded;
-        failure.set(null);
-        start(DamengConnector.class, config, (success, message, error) -> {
-            if (!success) {
-                failure.set(error == null ? new IllegalStateException(message) : error);
-            }
-        }, null);
+        startEngine();
+        assertNoDataRecords();
+        execute("INSERT INTO " + qualified(snapshotTable) + " VALUES(3,'after expansion')");
+        connection.commit();
+        final var expandedRecord = nextDataRecord();
+        assertThat(expandedRecord.topic()).isEqualTo(topic(snapshotTable));
+        assertThat(envelope(expandedRecord).getStruct("after").getString("LABEL")).isEqualTo("after expansion");
+        assertNoDataRecords();
 
-        Awaitility.await().atMost(Duration.ofSeconds(30)).until(() -> failure.get() != null);
-        assertThat(failure.get()).hasStackTraceContaining("capture scope").hasStackTraceContaining("initial snapshot");
-        assertThat(consumedLines).isEmpty();
+        stopConnector();
+        storeOffsets(config, Map.of(expandedRecord.sourcePartition(), expandedRecord.sourceOffset()));
+        consumedLines.clear();
+        startEngine();
+        execute("INSERT INTO " + qualified(snapshotTable) + " VALUES(4,'after restart')");
+        connection.commit();
+        final var restarted = nextDataRecord();
+        assertThat(restarted.topic()).isEqualTo(topic(snapshotTable));
+        assertThat(envelope(restarted).getStruct("after").getString("LABEL")).isEqualTo("after restart");
+        assertNoDataRecords();
     }
 
     @Test

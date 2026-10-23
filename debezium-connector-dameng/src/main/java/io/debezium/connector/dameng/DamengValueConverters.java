@@ -14,7 +14,6 @@ import java.sql.Clob;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.time.DateTimeException;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
@@ -34,6 +33,7 @@ import io.debezium.data.VariableScaleDecimal;
 import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.relational.Column;
 import io.debezium.relational.ValueConverter;
+import io.debezium.time.Interval;
 
 public final class DamengValueConverters extends JdbcValueConverters {
     private static final Pattern STRING_FUNCTION = Pattern.compile("^([A-Za-z_]+)\\s*\\(\\s*'((?:''|[^'])*)'\\s*\\)$");
@@ -42,6 +42,11 @@ public final class DamengValueConverters extends JdbcValueConverters {
             Pattern.CASE_INSENSITIVE);
     private static final Pattern TIMESTAMP_FORMAT = Pattern.compile("YYYY-MM-DD HH24:MI:SS(?:\\.FF[1-9]?)?");
     private static final Pattern CHARACTER_LENGTH = Pattern.compile("(?is).*\\bCHAR\\s*\\).*", Pattern.CASE_INSENSITIVE);
+    private static final Pattern NUMERIC_LITERAL = Pattern.compile("[-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?");
+    private static final Pattern DATE_LITERAL = Pattern.compile("^DATE\\s*'([^']+)'$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern TIMESTAMP_LITERAL = Pattern.compile("^TIMESTAMP\\s*'([^']+)'$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern TIME_LITERAL = Pattern.compile("^TIME\\s*'([^']+)'$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern UNICODE_ESCAPE = Pattern.compile("\\\\([0-9a-fA-F]{4})");
     private final String unavailableValuePlaceholder;
     private final Charset databaseCharset;
 
@@ -57,6 +62,24 @@ public final class DamengValueConverters extends JdbcValueConverters {
 
     @Override
     public SchemaBuilder schemaBuilder(Column column) {
+        if (DamengInterval.isInterval(column)) {
+            DamengInterval.type(column.typeName());
+            return Interval.builder();
+        }
+        if (column.typeName() != null && column.typeName().toUpperCase(Locale.ROOT).replaceAll("\\s+", " ").contains("WITH LOCAL TIME ZONE")) {
+            // TODO Support LOCAL TIME ZONE after verifying a recoverable source time-zone contract.
+            // Snapshot uses the reader's time zone, but dictionary-free redo omits the writer's
+            // time zone and, on the tested build, does not adjust to the mining session's zone.
+            // Assuming both texts are UTC and converting to one output zone preserves their mismatch.
+            // A task-level source-zone setting could work only if every relevant redo value has a
+            // verified common time basis; defaulting that setting to UTC does not establish it.
+            // Read snapshots in UTC and interpret redo in its verified source zone before UTC
+            // normalization. Validate different writer zones, explicit offsets, DST, restart,
+            // historical replay and primary/standby switch before enabling this mapping.
+            // Keep rejecting it until the source-time-zone behavior is verified end to end.
+            throw new DataException("Unsupported Dameng TIMESTAMP WITH LOCAL TIME ZONE column " + column.name()
+                    + ": archived redo omits the source session time zone; exclude this column with column.exclude.list");
+        }
         if (hasVariableScale(column) && decimalMode == DecimalMode.PRECISE) {
             return VariableScaleDecimal.builder();
         }
@@ -70,10 +93,19 @@ public final class DamengValueConverters extends JdbcValueConverters {
 
     @Override
     public ValueConverter converter(Column column, Field field) {
+        if (DamengInterval.isInterval(column)) {
+            return value -> DamengInterval.convert(value, column);
+        }
         final ValueConverter delegate = hasVariableScale(column) && decimalMode == DecimalMode.PRECISE
                 ? value -> convertVariableScale(column, field, value)
                 : super.converter(column, field);
-        return delegate == null ? null : value -> convertLogMinerValue(value, column, delegate);
+        if (delegate == null) {
+            return null;
+        }
+        // A converter belongs to one historical column definition. Schema changes
+        // rebuild it; no global cache can confuse equal names from different tables/versions.
+        final ValueConverter normalizer = normalizer(column);
+        return value -> convertLogMinerValue(value, column, delegate, normalizer);
     }
 
     @Override
@@ -114,6 +146,10 @@ public final class DamengValueConverters extends JdbcValueConverters {
 
     /** Converts LogMiner literals using the same mapping as snapshot JDBC values. */
     public Object convertLogMinerValue(Object value, Column column, ValueConverter converter) {
+        return convertLogMinerValue(value, column, converter, normalizer(column));
+    }
+
+    private Object convertLogMinerValue(Object value, Column column, ValueConverter converter, ValueConverter normalizer) {
         if (value == null) {
             return null;
         }
@@ -129,15 +165,37 @@ public final class DamengValueConverters extends JdbcValueConverters {
             throw new DataException("Could not read Dameng LOB column " + column.name(), e);
         }
         if (value instanceof io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser.SqlExpression expression) {
-            return normalize(column, convertExpression(expression.sql(), column, converter));
+            return normalizer.convert(convertExpression(expression.sql(), column, converter));
         }
-        if (value instanceof String text && isNumeric(column.jdbcType()) && text.matches("[-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?")) {
-            return normalize(column, converter.convert(new BigDecimal(text)));
+        if (value instanceof String text && isNumeric(column.jdbcType()) && NUMERIC_LITERAL.matcher(text).matches()) {
+            // TODO Restore lossless REAL/FLOAT/DOUBLE streaming with a verified DM log API.
+            // Tested build 08134283904-20220804-166351-20005 renders SQL_REDO with six
+            // fractional digits (1.23456789012345 -> 1.234568; tiny nonzero values -> zero).
+            // Online-dictionary MINE_VALUE returns the same rounded values. Parsing cannot
+            // recover the original bits; reading the current row cannot reconstruct historical
+            // updates/deletes. The remaining lossless-recovery limitation is documented in the connector manual.
+            // BigDecimal erases the sign of zero. Parse floating types directly from the literal.
+            if (column.jdbcType() == Types.REAL) {
+                return converter.convert(Float.valueOf(text));
+            }
+            if (column.jdbcType() == Types.FLOAT || column.jdbcType() == Types.DOUBLE) {
+                return converter.convert(Double.valueOf(text));
+            }
+            return normalizer.convert(converter.convert(new BigDecimal(text)));
         }
         if (value instanceof String text) {
             switch (column.jdbcType()) {
+                case Types.BINARY:
+                case Types.VARBINARY:
+                case Types.LONGVARBINARY:
+                    // DM represents an empty binary image as the quoted string '0x'.
+                    // Interpret it only for a physical binary column, never for character data.
+                    if (text.equalsIgnoreCase("0x")) {
+                        return converter.convert(new byte[0]);
+                    }
+                    break;
                 case Types.DATE:
-                    return converter.convert(LocalDate.parse(text));
+                    return converter.convert(DamengTemporalValues.date(text));
                 case Types.TIMESTAMP:
                     return converter.convert(parseTimestamp(text));
                 case Types.TIME:
@@ -158,28 +216,30 @@ public final class DamengValueConverters extends JdbcValueConverters {
                 default:
             }
         }
-        return normalize(column, converter.convert(value));
+        return normalizer.convert(converter.convert(value));
     }
 
-    private Object normalize(Column column, Object value) {
-        if (value == null) {
-            return null;
-        }
+    private ValueConverter normalizer(Column column) {
         return switch (column.jdbcType()) {
-            case Types.TINYINT -> value instanceof Number ? ((Number) value).byteValue() : value;
-            case Types.SMALLINT -> value instanceof Number ? ((Number) value).shortValue() : value;
-            case Types.INTEGER -> value instanceof Number ? ((Number) value).intValue() : value;
-            case Types.BIGINT -> value instanceof Number ? ((Number) value).longValue() : value;
-            case Types.CHAR, Types.NCHAR -> value instanceof String text ? padCharacter(column, text) : value;
-            default -> value;
+            case Types.TINYINT -> value -> value instanceof Number ? ((Number) value).byteValue() : value;
+            case Types.SMALLINT -> value -> value instanceof Number ? ((Number) value).shortValue() : value;
+            case Types.INTEGER -> value -> value instanceof Number ? ((Number) value).intValue() : value;
+            case Types.BIGINT -> value -> value instanceof Number ? ((Number) value).longValue() : value;
+            case Types.CHAR, Types.NCHAR -> characterPadding(column);
+            default -> ValueConverter.passthrough();
         };
     }
 
-    private String padCharacter(Column column, String text) {
+    private ValueConverter characterPadding(Column column) {
         final boolean characterLength = column.typeExpression() != null && CHARACTER_LENGTH.matcher(column.typeExpression()).matches();
         final Charset charset = column.charsetName() == null ? databaseCharset : Charset.forName(column.charsetName());
+        final int width = column.length();
+        return value -> value instanceof String text ? padCharacter(text, width, characterLength, charset) : value;
+    }
+
+    private static String padCharacter(String text, int width, boolean characterLength, Charset charset) {
         final int length = characterLength ? text.codePointCount(0, text.length()) : text.getBytes(charset).length;
-        return length < column.length() ? text + " ".repeat(column.length() - length) : text;
+        return length < width ? text + " ".repeat(width - length) : text;
     }
 
     @Override
@@ -194,6 +254,15 @@ public final class DamengValueConverters extends JdbcValueConverters {
 
     private Object convertExpression(String expression, Column column, ValueConverter converter) {
         final String text = expression.trim();
+        if (text.equalsIgnoreCase("NAN")) {
+            if (column.jdbcType() == Types.REAL) {
+                return converter.convert(Float.NaN);
+            }
+            if (column.jdbcType() == Types.FLOAT || column.jdbcType() == Types.DOUBLE) {
+                return converter.convert(Double.NaN);
+            }
+            throw new DataException("LogMiner NaN requires a floating-point column: " + column.name());
+        }
         if (text.equalsIgnoreCase("OUT_CLOB") && (column.jdbcType() == Types.CLOB || column.jdbcType() == Types.NCLOB)) {
             return converter.convert(unavailableValuePlaceholder);
         }
@@ -218,17 +287,17 @@ public final class DamengValueConverters extends JdbcValueConverters {
             if (temporal.matches()) {
                 return converter.convert(parseTemporalFunction(temporal.group(1), temporal.group(2).replace("''", "'"), temporal.group(3)));
             }
-            final Matcher dateLiteral = Pattern.compile("^DATE\\s*'([^']+)'$", Pattern.CASE_INSENSITIVE).matcher(text);
+            final Matcher dateLiteral = DATE_LITERAL.matcher(text);
             if (dateLiteral.matches()) {
-                return converter.convert(LocalDate.parse(dateLiteral.group(1), DateTimeFormatter.ISO_LOCAL_DATE));
+                return converter.convert(DamengTemporalValues.date(dateLiteral.group(1)));
             }
-            final Matcher timestampLiteral = Pattern.compile("^TIMESTAMP\\s*'([^']+)'$", Pattern.CASE_INSENSITIVE).matcher(text);
+            final Matcher timestampLiteral = TIMESTAMP_LITERAL.matcher(text);
             if (timestampLiteral.matches()) {
                 return converter.convert(column.jdbcType() == Types.TIMESTAMP_WITH_TIMEZONE
                         ? parseOffsetTimestamp(timestampLiteral.group(1))
                         : parseTimestamp(timestampLiteral.group(1)));
             }
-            final Matcher timeLiteral = Pattern.compile("^TIME\\s*'([^']+)'$", Pattern.CASE_INSENSITIVE).matcher(text);
+            final Matcher timeLiteral = TIME_LITERAL.matcher(text);
             if (timeLiteral.matches()) {
                 return converter.convert(column.jdbcType() == Types.TIME_WITH_TIMEZONE
                         ? parseOffsetTime(timeLiteral.group(1))
@@ -250,7 +319,7 @@ public final class DamengValueConverters extends JdbcValueConverters {
     private static Object parseTemporalFunction(String function, String literal, String format) {
         final String normalizedFormat = format.trim().toUpperCase(Locale.ROOT);
         if (function.equalsIgnoreCase("TO_DATE") && normalizedFormat.equals("YYYY-MM-DD")) {
-            return LocalDate.parse(literal);
+            return DamengTemporalValues.date(literal);
         }
         if (function.equalsIgnoreCase("TO_TIMESTAMP_TZ")) {
             final String suffix = " TZH:TZM";
@@ -266,23 +335,25 @@ public final class DamengValueConverters extends JdbcValueConverters {
     }
 
     private static LocalDateTime parseTimestamp(String value) {
-        return LocalDateTime.parse(value.replace(' ', 'T'));
+        return DamengTemporalValues.timestamp(value);
     }
 
     private static OffsetDateTime parseOffsetTimestamp(String value) {
-        String normalized = value.trim();
-        if (normalized.length() > 10 && normalized.charAt(10) == ' ') {
-            normalized = normalized.substring(0, 10) + "T" + normalized.substring(11);
-        }
-        return OffsetDateTime.parse(normalized.replace(" +", "+").replace(" -", "-"));
+        return DamengTemporalValues.offsetTimestamp(value);
     }
 
     private static OffsetTime parseOffsetTime(String value) {
+        // TODO Preserve TIME(p > 0) WITH TIME ZONE fractions when a verified DM log API supplies them.
+        // Tested build 08134283904-20220804-166351-20005 retains .123456 in JDBC storage,
+        // but SQL_REDO emits TIME'12:34:56 +05:45' without those fractional seconds.
+        // Online-dictionary MINE_VALUE also omits them. This parser cannot infer missing digits;
+        // querying the current row would corrupt historical replay. Validate snapshot and CRUD
+        // consistency on the replacement API/build before claiming this limitation is resolved.
         return OffsetTime.parse(value.trim().replace(" +", "+").replace(" -", "-"));
     }
 
     private static String decodeUnicode(String value) {
-        Matcher matcher = Pattern.compile("\\\\([0-9a-fA-F]{4})").matcher(value);
+        Matcher matcher = UNICODE_ESCAPE.matcher(value);
         StringBuilder result = new StringBuilder();
         while (matcher.find()) {
             matcher.appendReplacement(result, Matcher.quoteReplacement(String.valueOf((char) Integer.parseInt(matcher.group(1), 16))));

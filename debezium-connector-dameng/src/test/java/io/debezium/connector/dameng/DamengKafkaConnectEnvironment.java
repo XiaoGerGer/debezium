@@ -52,8 +52,9 @@ final class DamengKafkaConnectEnvironment implements AutoCloseable {
     static final String DATABASE_USER = "SYSDBA";
     static final String DATABASE_PASSWORD = "SYSDBA001";
 
-    private static final String JAVA_IMAGE = System.getProperty("dameng.connect.java.image", "hub.badxiao.top/library/flink:2.2.1-java21");
-    private static final String DATABASE_IMAGE = System.getProperty("dameng.image", "hub.badxiao.top/xuxuclassmate/dameng:latest");
+    private static final String JAVA_IMAGE = System.getProperty("dameng.connect.java.image", "eclipse-temurin:21-jre");
+    private static final String DATABASE_IMAGE = System.getProperty("dameng.image",
+            "dameng:8.1.3.162-20240621-rev232765");
     private static final Duration START_TIMEOUT = Duration.ofMinutes(3);
     private static final String SEND_GATE_MARKER = "/tmp/dameng-send-gate-blocked";
     private static final String LOGGING = "<configuration><appender name=\"CONSOLE\" class=\"ch.qos.logback.core.ConsoleAppender\">"
@@ -75,6 +76,11 @@ final class DamengKafkaConnectEnvironment implements AutoCloseable {
     private GenericContainer<?> secondaryWorker;
     private int databasePort;
     private int workerNumber;
+    private long offsetFlushIntervalMillis = 1_000;
+
+    void setOffsetFlushIntervalMillis(long interval) {
+        offsetFlushIntervalMillis = interval;
+    }
 
     DamengKafkaConnectEnvironment() throws Exception {
         this(1);
@@ -101,10 +107,20 @@ final class DamengKafkaConnectEnvironment implements AutoCloseable {
                 .withImagePullPolicy(pullPolicy())
                 .withNetwork(network).withNetworkAliases("dameng")
                 .withLabel("io.debezium.dameng.connect-test", "database")
+                .withEnv("MODE", "dmsingle")
+                .withEnv("SYSDBA_PWD", DATABASE_PASSWORD)
                 .withExposedPorts(5236)
-                .waitingFor(Wait.forLogMessage(".*SYSTEM IS READY.*", 1).withStartupTimeout(START_TIMEOUT));
+                .waitingFor(Wait.forListeningPort().withStartupTimeout(START_TIMEOUT));
         database.start();
         databasePort = database.getMappedPort(5236);
+        Awaitility.await("DM accepts JDBC connections").atMost(START_TIMEOUT).until(() -> {
+            try (var ignored = databaseConnection()) {
+                return true;
+            }
+            catch (SQLException e) {
+                return false;
+            }
+        });
         prepareDatabase();
 
         for (int node = 1; node <= brokerCount; node++) {
@@ -228,7 +244,7 @@ final class DamengKafkaConnectEnvironment implements AutoCloseable {
         properties.setProperty("value.converter", "org.apache.kafka.connect.json.JsonConverter");
         properties.setProperty("key.converter.schemas.enable", "false");
         properties.setProperty("value.converter.schemas.enable", "false");
-        properties.setProperty("offset.flush.interval.ms", "1000");
+        properties.setProperty("offset.flush.interval.ms", Long.toString(offsetFlushIntervalMillis));
         properties.setProperty("offset.flush.timeout.ms", "30000");
         properties.setProperty("scheduled.rebalance.max.delay.ms", "0");
         properties.setProperty("listeners", "http://0.0.0.0:8083");
@@ -250,7 +266,7 @@ final class DamengKafkaConnectEnvironment implements AutoCloseable {
                         + "org.apache.kafka.connect.cli.ConnectDistributed /runtime/worker.properties")
                 .withCopyFileToContainer(MountableFile.forHostPath(runtimeDirectory), "/runtime")
                 // Files.createTempDirectory uses mode 0700 on Linux. The Java image
-                // runs as a non-root user, so copied plugin paths must be readable.
+                // may run as a non-root user, so copied plugin paths must be readable.
                 .withCopyFileToContainer(MountableFile.forHostPath(pluginDirectory, 0755), "/plugins")
                 .withCopyToContainer(Transferable.of(LOGGING), "/runtime/logback.xml")
                 .withCopyToContainer(Transferable.of(propertiesText(properties)), "/runtime/worker.properties")
@@ -293,6 +309,8 @@ final class DamengKafkaConnectEnvironment implements AutoCloseable {
             }
             statement.execute("ALTER DATABASE MOUNT");
             assertThat(database.execInContainer("mkdir", "-p", "/opt/dmdbms/data/DAMENG/dbz_connect_archive").getExitCode()).isZero();
+            assertThat(database.execInContainer("chown", "--reference=/opt/dmdbms/data/DAMENG",
+                    "/opt/dmdbms/data/DAMENG/dbz_connect_archive").getExitCode()).as("archive directory ownership").isZero();
             statement.execute("ALTER DATABASE ARCHIVELOG");
             statement.execute("ALTER DATABASE ADD ARCHIVELOG 'DEST=/opt/dmdbms/data/DAMENG/dbz_connect_archive, TYPE=LOCAL, FILE_SIZE=64, SPACE_LIMIT=1024'");
             statement.execute("ALTER DATABASE OPEN");
@@ -341,7 +359,7 @@ final class DamengKafkaConnectEnvironment implements AutoCloseable {
     }
 
     private static ImagePullPolicy pullPolicy() {
-        return Boolean.getBoolean("dameng.connect.allow.image.pull") ? PullPolicy.defaultPolicy() : ignored -> false;
+        return Boolean.parseBoolean(System.getProperty("dameng.connect.allow.image.pull", "true")) ? PullPolicy.defaultPolicy() : ignored -> false;
     }
 
     private static String propertiesText(Properties properties) {

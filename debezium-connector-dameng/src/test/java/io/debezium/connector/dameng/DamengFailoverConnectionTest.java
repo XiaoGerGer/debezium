@@ -24,7 +24,9 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.kafka.connect.errors.ConnectException;
 import org.junit.jupiter.api.Test;
@@ -37,6 +39,75 @@ import io.debezium.jdbc.JdbcConnection;
 import dm.jdbc.driver.DmDriver;
 
 class DamengFailoverConnectionTest {
+    @ParameterizedTest
+    @CsvSource({ "20,30,changed while validating", "30,30,has not replayed the current primary-open record" })
+    void shouldRetryMixedSourceSamplingAndUnreplayedPrimaryHistory(long initial, long latest, String reason) throws Exception {
+        try (var connection = connectionWithNewPrimaryHistory()) {
+            doReturn(true).when(connection).isStandbyMining();
+            doNothing().when(connection).validateServerRole();
+            doReturn(new DamengConnection.StandbyProgress(300, 300)).when(connection).readStandbyProgress();
+            final var calls = new AtomicInteger();
+            doAnswer(invocation -> {
+                final var result = mock(ResultSet.class);
+                when(result.next()).thenReturn(true, false);
+                when(result.getLong(1)).thenReturn(calls.getAndIncrement() == 0 ? initial : latest);
+                return invocation.<JdbcConnection.ResultSetMapper<Object>> getArgument(1).apply(result);
+            }).when(connection).queryAndMap(eq("SELECT PRIMARY_DB_MAGIC FROM V$RLOG"), any());
+            assertThatThrownBy(connection::readPrimaryStandbyIdentity).isInstanceOf(SQLException.class).hasMessageContaining(reason)
+                    .satisfies(error -> assertThat(((SQLException) error).getSQLState()).isEqualTo("08006"));
+        }
+    }
+
+    @Test
+    void shouldWaitForReplicaReplayBeforeResumingAnAcknowledgedOffset() throws Exception {
+        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().with("database.standby.hosts", "replica:5236").build());
+        try (var connection = spy(new DamengConnection(config.getJdbcConfig()))) {
+            final var history = List.of(new DamengDatabaseIdentity.OpenRecord("open", Instant.EPOCH, 10, 0));
+            final var ready = new DamengDatabaseIdentity(1, 10, 200, history, 20);
+            final var offset = new DamengOffsetContext(config, 150);
+            offset.validatePrimaryStandbyIdentity(ready);
+            doReturn(new DamengDatabaseIdentity(1, 10, 120, history, 20)).when(connection).readPrimaryStandbyIdentity();
+            assertThatThrownBy(() -> connection.validatePrimaryStandbyIdentity(offset)).isInstanceOf(SQLException.class)
+                    .hasMessageContaining("has not replayed through the stored offset")
+                    .satisfies(error -> assertThat(((SQLException) error).getSQLState()).isEqualTo("08006"));
+            doReturn(ready).when(connection).readPrimaryStandbyIdentity();
+            connection.validatePrimaryStandbyIdentity(offset);
+            doNothing().when(connection).validateServerRole();
+            doReturn(new DamengDatabaseIdentity(1, 10, 200, history, 30)).when(connection).readPrimaryStandbyIdentity();
+            assertThatThrownBy(connection::validateUnchangedPrimary).isInstanceOf(SQLException.class).hasMessageContaining("changed while reading");
+        }
+    }
+
+    @Test
+    void shouldRouteCaptureOnlyToStandbyWithoutPassingInternalFlagsToDriver() throws Exception {
+        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+                .with("database.standby.hosts", "a:5236,b:5237").build());
+        final var jdbc = mock(Connection.class);
+        try (var drivers = mockConstruction(DmDriver.class, (driver, context) -> when(driver.connect(anyString(), any())).thenReturn(jdbc));
+                var connection = new DamengConnection(config.getJdbcConfig())) {
+            assertThat(connection.connection()).isSameAs(jdbc);
+            final var properties = ArgumentCaptor.forClass(Properties.class);
+            verify(drivers.constructed().get(0)).connect(eq("jdbc:dm://debezium?debezium=(a:5236,b:5237)"), properties.capture());
+            assertThat(properties.getValue()).containsEntry("loginMode", "2").containsEntry("loginStatus", "4")
+                    .containsEntry("autoReconnect", "0").containsEntry("rwSeparate", "0").doesNotContainKeys("standby.hosts", "failover.hosts");
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "STANDBY,OPEN,true", "PRIMARY,OPEN,false", "NORMAL,OPEN,false", "STANDBY,MOUNT,false", "STANDBY,SUSPEND,false" })
+    void shouldAcceptOnlyOpenStandbyForCapture(String role, String status, boolean accepted) throws Exception {
+        try (var connection = connectionWithRole(false, role, status)) {
+            doReturn(true).when(connection).isStandbyMining();
+            if (accepted) {
+                connection.validateServerRole();
+            }
+            else {
+                assertThatThrownBy(connection::validateServerRole).isInstanceOf(SQLException.class).hasMessageContaining("OPEN STANDBY")
+                        .satisfies(error -> assertThat(((SQLException) error).getSQLState()).isEqualTo("08006"));
+            }
+        }
+    }
+
     @Test
     void shouldPassTheControlledServiceGroupAndRoutingPropertiesToTheDriver() throws Exception {
         final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()

@@ -54,6 +54,7 @@ class DamengStreamingFilterBoundaryTest {
     private static final TableId INCLUDED = new TableId(null, "APP", "A");
     private static final TableId EXCLUDED = new TableId(null, "APP", "B");
     private final DamengConnectorConfig config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+            .with("log.mining.window.strategy", "fixed")
             .with("table.include.list", "APP.A")
             .with("schema.history.internal", MemorySchemaHistory.class.getName())
             .with("schema.history.internal.store.only.captured.tables.ddl", true).build());
@@ -80,11 +81,10 @@ class DamengStreamingFilterBoundaryTest {
         context = mock(ChangeEventSourceContext.class);
         when(context.isRunning()).thenAnswer(invocation -> running.get());
         final var connection = mock(DamengConnection.class);
+        when(connection.createDdlParser()).thenReturn(new DamengDdlParser(StandardCharsets.UTF_8, false, false, false));
         final var jdbc = mock(Connection.class);
         final var statement = mock(PreparedStatement.class);
         rows = mock(ResultSet.class);
-        when(connection.getDatabaseCharset()).thenReturn(StandardCharsets.UTF_8);
-        when(connection.getIniParameter("LENGTH_IN_CHAR")).thenReturn("0");
         when(connection.connection()).thenReturn(jdbc);
         when(connection.logMinerContentsQuery(false)).thenReturn("mine");
         when(connection.readTablePreparedStatement(config, "mine", OptionalLong.empty())).thenReturn(statement);
@@ -128,10 +128,54 @@ class DamengStreamingFilterBoundaryTest {
     }
 
     @Test
-    void shouldPersistRenameOutOfCaptureAndSkipItsDml() throws Exception {
-        run(List.of(ddl(101, "ALTER TABLE APP.A RENAME TO B"), dml(102), commit()));
+    void shouldSkipCompleteNonTableDdlAndContinueDataCapture() throws Exception {
+        run(List.of(ddl(101, "// 权限\nGRANT SELECT ON APP.A TO U; REVOKE SELECT ON APP.A FROM U;"),
+                ddl(102, "COMMENT ON COLUMN APP.A.ID IS q'[it's;--/*]'"),
+                ddl(103, "CREATE PROCEDURE P AS BEGIN NULL; END;"), dml(104), commit()));
         assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(recover().forTable(INCLUDED).retrieveColumnNames()).containsExactly("ID");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "CREATE INDEX I ON APP.A(ID); ALTER TABLE APP.A ADD LOST INT",
+            "CREATE PROCEDURE P AS BEGIN NULL; END; DROP TABLE APP.A",
+            "ALTER TABLE APP.A ADD LOST INT; ALTER TABLE APP.A ADD LOST2 INT",
+            "ALTER TABLE APP.A MOVE",
+            "ALTER TABLE APP.A ADD LOST INT UNKNOWN",
+            "CREATE SCHEMA S AUTHORIZATION SYSDBA CREATE TABLE A(ID INT)",
+            "DROP SCHEMA APP CASCADE",
+            "DROP USER APP CASCADE",
+            "/* unclosed"
+    })
+    void shouldRejectUnsafeDdlBeforeChangingSchemaHistoryOrThisRowsOffset(String sql) throws Exception {
+        final var original = schema.getTables().forTable(INCLUDED);
+        offset.validateDatabaseMagic(0);
+        final var before = offset.getOffset();
+        run(List.of(ddl(101, sql), commit()));
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("LSN 101", "character");
+        assertThat(schema.getTables().forTable(INCLUDED)).isEqualTo(original);
+        assertThat(recover().forTable(INCLUDED)).isEqualTo(original);
+        assertThat(offset.getOffset()).isEqualTo(before);
         assertThat(delivered).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "", " " })
+    void shouldRejectMissingDdlEvenWhenItsObjectIsOutsideCapture(String redo) throws Exception {
+        final var row = new HashMap<>(ddl(101, redo));
+        row.put("DATA_OBJ#", 99L);
+        run(List.of(row, commit()));
+        assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining("Missing Dameng DDL SQL_REDO", "101");
+        assertThat(offset.getLsn()).isEqualTo(90);
+    }
+
+    @Test
+    void shouldPersistRenameOutOfCaptureAndSkipItsDml() throws Exception {
+        run(List.of(dml(100), ddl(101, "ALTER TABLE APP.A RENAME TO B"), dml(102), commit()));
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
         final Tables recovered = recover();
         assertThat(recovered.forTable(INCLUDED)).isNull();
         assertThat(recovered.forTable(EXCLUDED)).isNotNull();
@@ -210,10 +254,10 @@ class DamengStreamingFilterBoundaryTest {
         insert.put("DATA_OBJ#", 9L);
         insert.put("SQL_REDO", "INSERT INTO \"150\".\"OBJ# 9\"(\"COL 1\",\"COL 2\") VALUES(1,'new shape')");
 
-        run(List.of(ddl(101, "DROP TABLE APP.A"), create, insert, commit()));
+        run(List.of(dml(100), ddl(101, "DROP TABLE APP.A"), create, insert, dml(104), commit()));
 
         assertThat(failure.get()).isNull();
-        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(delivered).containsExactly(INCLUDED, INCLUDED);
         assertThat(recover().forTable(INCLUDED).retrieveColumnNames()).containsExactly("ID", "LABEL");
         assertThat(recover().forTable(INCLUDED).attributeWithName("dameng.object.id").asLong()).isEqualTo(9L);
     }

@@ -266,6 +266,8 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
             LOGGER.trace("Window open emitted");
             while (context.snapshotRunning()) {
 
+                final TableId currentTableId = (TableId) context.currentDataCollectionId().getId();
+                tableScanStarted(currentTableId);
                 LOGGER.trace("Checking if current table is invalid");
                 if (isTableInvalid(partition, offsetContext)) {
                     continue;
@@ -275,7 +277,6 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
                     // Closing the current window and repeating schema verification within the following window.
                     break;
                 }
-                final TableId currentTableId = (TableId) context.currentDataCollectionId().getId();
                 if (context.maximumKey().isEmpty()) {
                     currentTable = chunkQueryBuilder.prepareTable(context, refreshTableSchema(currentTable));
                     Object[] maximumKey;
@@ -291,6 +292,7 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
                         context.maximumKey(maximumKey);
                     }
                     catch (SQLException e) {
+                        handleChunkError(e);
                         if (e instanceof SQLNonTransientConnectionException) {
                             closeJdbcConnection();
                         }
@@ -343,6 +345,7 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
                     }
                 }
                 catch (SQLException e) {
+                    handleChunkError(e);
                     if (e instanceof SQLNonTransientConnectionException) {
                         closeJdbcConnection();
                     }
@@ -355,6 +358,7 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
             LOGGER.trace("Window close emitted");
         }
         catch (SQLException e) {
+            handleChunkError(e);
             if (e instanceof SQLNonTransientConnectionException) {
                 closeJdbcConnection();
             }
@@ -365,6 +369,7 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
                     e);
         }
         catch (Exception e) {
+            handleChunkError(e);
             warnAndSkip(partition, offsetContext,
                     SQL_EXCEPTION,
                     "Error while executing incremental snapshot for table '%s', skipping and continuing streaming".formatted(context.currentDataCollectionId().getId()),
@@ -394,6 +399,7 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
                 }
             }
             catch (Exception e) {
+                handleChunkError(e);
                 warnAndSkip(partition, offsetContext, UNKNOWN_SCHEMA,
                         "Schema retrieval failed due to an exception for %s".formatted(currentTableId), e);
                 return true;
@@ -672,6 +678,8 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
      */
     private boolean createDataEventsForTable(P partition) throws SQLException {
         long exportStart = clock.currentTimeInMillis();
+        final long queryStarted = clock.currentTimeInNanos();
+        chunkReadStarted(currentTable.id());
         LOGGER.debug("Exporting data chunk from table '{}' (total {} tables)", currentTable.id(), context.dataCollectionsToBeSnapshottedCount());
 
         final String selectStatement = chunkQueryBuilder.buildChunkQuery(context, currentTable, context.currentDataCollectionId().getAdditionalCondition());
@@ -723,6 +731,7 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
             LOGGER.debug("\t Finished exporting {} records for window of table table '{}'; total duration '{}'", rows,
                     currentTable.id(), Strings.duration(clock.currentTimeInMillis() - exportStart));
             incrementTableRowsScanned(partition, rows);
+            chunkReadCompleted(currentTable.id(), rows, clock.currentTimeInNanos() - queryStarted);
         }
         catch (SQLException e) {
             LOGGER.error("Snapshotting of table {} failed. Skipping it", currentTable.id(), e);
@@ -833,6 +842,26 @@ public abstract class AbstractIncrementalSnapshotChangeEventSource<P extends Par
 
     protected void postReadChunk(IncrementalSnapshotContext<T> context) {
         // no-op
+    }
+
+    /** Observes the current table before metadata checks, including empty tables. */
+    protected void tableScanStarted(TableId tableId) {
+        // no-op
+    }
+
+    /** Observes a chunk SELECT without changing its transaction or watermark boundaries. */
+    protected void chunkReadStarted(TableId tableId) {
+        // no-op
+    }
+
+    /** Reports successfully read rows before watermark deduplication or event dispatch. */
+    protected void chunkReadCompleted(TableId tableId, long rows, long durationNanos) {
+        // no-op
+    }
+
+    /** Allows connectors to abort a failed chunk before reporting or persisting that its table was skipped. */
+    protected void handleChunkError(Exception exception) {
+        // Other connectors retain the default skip-and-continue behavior.
     }
 
     protected void postIncrementalSnapshotCompleted() {

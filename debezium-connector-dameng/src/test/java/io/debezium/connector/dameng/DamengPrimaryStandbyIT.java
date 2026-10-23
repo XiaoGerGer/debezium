@@ -23,6 +23,8 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.Configuration;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
@@ -41,8 +43,9 @@ class DamengPrimaryStandbyIT extends AbstractAsyncEngineConnectorTest {
         return 64;
     }
 
-    @Test
-    void shouldRestartAnIncompleteSnapshotAfterManualSwitchover() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = { false, true })
+    void shouldRestartAnIncompleteSnapshotAfterManualSwitchover(boolean standby) throws Exception {
         try (var environment = new DamengPrimaryStandbyEnvironment()) {
             environment.start();
             execute(environment, "CREATE TABLE SYSDBA." + table + " (ID INT PRIMARY KEY, LABEL VARCHAR(100))");
@@ -59,6 +62,7 @@ class DamengPrimaryStandbyIT extends AbstractAsyncEngineConnectorTest {
             }
             config = Configuration.create().with("topic.prefix", "dameng")
                     .with("database.failover.hosts", environment.endpoints())
+                    .with("database.standby.hosts", standby ? environment.endpoints() : "")
                     .with("database.user", DamengPrimaryStandbyEnvironment.USER).with("database.password", DamengPrimaryStandbyEnvironment.PASSWORD)
                     .with("database.dbname", "DAMENG").with("table.include.list", "SYSDBA\\." + table)
                     .with("database.socket.timeout.ms", 15_000).with("database.query.timeout.ms", 10_000)

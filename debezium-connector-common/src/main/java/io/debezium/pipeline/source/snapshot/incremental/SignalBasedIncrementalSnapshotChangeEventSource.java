@@ -117,13 +117,13 @@ public class SignalBasedIncrementalSnapshotChangeEventSource<P extends Partition
 
         String signalWindowStatement = "INSERT INTO " + signalTableName + " VALUES (?, ?, ?)";
         signalMetadata = new SignalMetadata(Instant.now(), null);
-        jdbcConnection.prepareUpdate(signalWindowStatement, x -> {
+        getSignalConnection().prepareUpdate(signalWindowStatement, x -> {
             LOGGER.trace("Emitting open window for chunk = '{}' to signal table '{}'", context.currentChunkId(), signalTableName);
             x.setString(1, context.currentChunkId() + "-open");
             x.setString(2, OpenIncrementalSnapshotWindow.NAME);
             x.setString(3, signalMetadata.metadataString());
         });
-        jdbcConnection.commit();
+        getSignalConnection().commit();
     }
 
     @Override
@@ -135,9 +135,14 @@ public class SignalBasedIncrementalSnapshotChangeEventSource<P extends Partition
         }
 
         LOGGER.trace("Emitting close window for chunk = '{}' to signal table '{}'", context.currentChunkId(), signalTableName);
-        WatermarkWindowCloser watermarkWindowCloser = getWatermarkWindowCloser(connectorConfig, jdbcConnection, signalTableName);
+        WatermarkWindowCloser watermarkWindowCloser = getWatermarkWindowCloser(connectorConfig, getSignalConnection(), signalTableName);
 
         watermarkWindowCloser.closeWindow(partition, offsetContext, context.currentChunkId());
+    }
+
+    /** Allows replica readers to write watermarks through a separate primary connection. */
+    protected JdbcConnection getSignalConnection() {
+        return jdbcConnection;
     }
 
     private WatermarkWindowCloser getWatermarkWindowCloser(CommonConnectorConfig connectorConfig, JdbcConnection jdbcConnection, String signalTable) {

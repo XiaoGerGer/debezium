@@ -54,6 +54,68 @@ class DamengKafkaConnectIT {
     private long latestCommitLsn;
 
     @Test
+    void shouldResumeDurableRecoveryBaselineAfterWorkerKillBeforeAnyOffsetCommit() throws Exception {
+        try (var environment = new DamengKafkaConnectEnvironment()) {
+            // Deliberately keep source offsets absent. Kafka schema history must
+            // durably fix the cut even if the very first worker is killed.
+            environment.setOffsetFlushIntervalMillis(3_600_000);
+            environment.start();
+            try (var database = environment.databaseConnection(); var consumer = consumer(environment, topic)) {
+                execute(database, "CREATE TABLE " + qualifiedTable() + " (ID INT PRIMARY KEY, LABEL VARCHAR(100))");
+                execute(database, "INSERT INTO " + qualifiedTable() + " VALUES(1,'skipped before recovery')");
+                database.commit();
+                registerConnector(environment, Map.of("recovery.restart.nonce", "incident-first"));
+                awaitRunning(environment);
+                final var baseline = awaitRecoveryBaseline(environment);
+                assertThat(baseline.path("recovery_nonce").asText()).isEqualTo("incident-first");
+                execute(database, "INSERT INTO " + qualifiedTable() + " VALUES(2,'after baseline')");
+                database.commit();
+                awaitChanges(consumer, false, change("c", 2, null, "after baseline"));
+                environment.killWorker();
+                try (var offsets = consumer(environment, DamengKafkaConnectEnvironment.OFFSET_TOPIC)) {
+                    final var partitions = offsets.partitionsFor(DamengKafkaConnectEnvironment.OFFSET_TOPIC).stream()
+                            .map(info -> new org.apache.kafka.common.TopicPartition(info.topic(), info.partition())).toList();
+                    assertThat(partitions).isNotEmpty();
+                    assertThat(offsets.endOffsets(partitions).values()).as("no source offset was ever written before SIGKILL").containsOnly(0L);
+                }
+                execute(database, "ALTER TABLE " + qualifiedTable() + " ADD EXTRA VARCHAR(40)");
+                execute(database, "INSERT INTO " + qualifiedTable() + " VALUES(3,'while stopped','new schema')");
+                database.commit();
+                environment.startWorker();
+                awaitRunning(environment);
+                awaitChanges(consumer, false, new ExpectedChange("c", 3, null, "while stopped", null, "new schema"));
+                assertThat(awaitRecoveryBaseline(environment)).isEqualTo(baseline);
+                // Removing the incident parameter is not a request for another cut.
+                final var response = request(environment, "GET", "/connectors/" + connectorName + "/config", null);
+                final var updated = (com.fasterxml.jackson.databind.node.ObjectNode) JSON.readTree(response.body());
+                updated.remove("recovery.restart.nonce");
+                assertThat(request(environment, "PUT", "/connectors/" + connectorName + "/config", updated.toString()).statusCode()).isEqualTo(200);
+                execute(database, "INSERT INTO " + qualifiedTable() + " VALUES(4,'nonce removed','same generation')");
+                database.commit();
+                awaitChanges(consumer, false, new ExpectedChange("c", 4, null, "nonce removed", null, "same generation"));
+                assertOnlyKnownReplays(consumer);
+                awaitRunning(environment);
+            }
+        }
+    }
+
+    private JsonNode awaitRecoveryBaseline(DamengKafkaConnectEnvironment environment) throws Exception {
+        try (var consumer = consumer(environment, historyTopic)) {
+            final long deadline = System.nanoTime() + TIMEOUT.toNanos();
+            while (System.nanoTime() < deadline) {
+                for (var record : consumer.poll(Duration.ofMillis(200))) {
+                    final var position = JSON.readTree(record.value()).path("position");
+                    if (position.has("dameng_recovery_baseline")) {
+                        assertThat(position.path("recovery_baseline_lsn").asLong()).isPositive();
+                        return position;
+                    }
+                }
+            }
+            throw new AssertionError("Recovery baseline was not persisted in Kafka schema history");
+        }
+    }
+
+    @Test
     void shouldRecoverPackagedConnectorAfterTaskRestartAndWorkerKill() throws Exception {
         try (var environment = new DamengKafkaConnectEnvironment()) {
             environment.start();
@@ -230,7 +292,10 @@ class DamengKafkaConnectIT {
                     // Replicated Kafka must elect a replacement and publish the
                     // complete source change while the former leader is paused.
                     awaitTypedChanges(consumer, known, List.of(new TypedChange("u", 1, initial, changed)));
-                    assertThat(environment.topicLeader(topic)).isNotEqualTo(oldLeader);
+                    Awaitility.await("Kafka elects a replacement topic leader")
+                            .atMost(TIMEOUT)
+                            .ignoreExceptions()
+                            .untilAsserted(() -> assertThat(environment.topicLeader(topic)).isNotEqualTo(oldLeader));
                 }
                 finally {
                     environment.resumeBroker();

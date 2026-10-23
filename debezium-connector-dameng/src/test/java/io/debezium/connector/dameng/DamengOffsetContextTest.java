@@ -24,6 +24,22 @@ import io.debezium.relational.TableId;
 class DamengOffsetContextTest {
     private final DamengConnectorConfig config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
 
+    @Test
+    void shouldRoundTripRecoveryGenerationAndRejectInvalidRecoveryPositions() {
+        final var offset = new DamengOffsetContext(config, 100);
+        offset.setRecoveryBaseline("incident-1", 100);
+        assertThat(new DamengOffsetContext.Loader(config).load(offset.getOffset()).getOffset()).isEqualTo(offset.getOffset());
+        assertThatThrownBy(() -> offset.setRecoveryBaseline("", 100)).hasMessageContaining("Invalid");
+        assertThatThrownBy(() -> offset.setRecoveryBaseline(null, 100)).hasMessageContaining("Invalid");
+        assertThatThrownBy(() -> offset.setRecoveryBaseline("first", 0)).hasMessageContaining("Invalid");
+        final Map<String, Object> damaged = new HashMap<>(offset.getOffset());
+        damaged.put("lsn", 99L);
+        assertThatThrownBy(() -> new DamengOffsetContext.Loader(config).load(damaged)).hasMessageContaining("precedes");
+        damaged.put("lsn", 100L);
+        damaged.put("commit_lsn", 99L);
+        assertThatThrownBy(() -> new DamengOffsetContext.Loader(config).load(damaged)).hasMessageContaining("precedes");
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = { false, true })
     void shouldLoadNumericAndStringOffsets(boolean strings) {

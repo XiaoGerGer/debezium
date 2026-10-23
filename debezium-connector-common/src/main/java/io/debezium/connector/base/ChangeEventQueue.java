@@ -14,6 +14,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
@@ -79,6 +80,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
     private final Supplier<PreviousContext> loggingContextSupplier;
     private final Queue<Long> sizeInBytesQueue;
     private long currentQueueSizeInBytes = 0;
+    private final AtomicLong enqueueWaitNanos = new AtomicLong();
 
     // Sometimes it is necessary to update the record before it is delivered depending on the content
     // of the following record. In that cases the easiest solution is to provide a single cell buffer
@@ -250,7 +252,13 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
                 // signal poll() to drain queue
                 this.isFull.signalAll();
                 // queue size or queue sizeInBytes threshold reached, so wait a bit
-                this.isNotFull.await(pollInterval.toMillis(), TimeUnit.MILLISECONDS);
+                final long waitStarted = System.nanoTime();
+                try {
+                    this.isNotFull.await(pollInterval.toMillis(), TimeUnit.MILLISECONDS);
+                }
+                finally {
+                    enqueueWaitNanos.addAndGet(System.nanoTime() - waitStarted);
+                }
             }
 
             queue.enqueue(record);
@@ -367,6 +375,11 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
     @Override
     public long currentQueueSizeInBytes() {
         return currentQueueSizeInBytes;
+    }
+
+    @Override
+    public long enqueueWaitNanos() {
+        return enqueueWaitNanos.get();
     }
 
     public boolean isBuffered() {

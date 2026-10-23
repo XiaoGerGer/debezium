@@ -20,6 +20,21 @@ import io.debezium.connector.dameng.DamengDatabaseIdentity.OpenRecord;
 
 class DamengDatabaseIdentityTest {
     @Test
+    void shouldPersistSourceLineageAndValidateLocalArchivesSeparatelyFromTheReplicaIdentity() {
+        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().with("database.standby.hosts", "replica:5236").build());
+        final var identity = new DamengDatabaseIdentity(1, 10, 200, List.of(open("a", 1, 10, 100)), 20);
+        final var offset = new DamengOffsetContext(config, 150);
+        offset.validatePrimaryStandbyIdentity(identity);
+        assertThat(offset.getOffset().get(DamengOffsetContext.DATABASE_MAGIC_KEY)).isEqualTo(10L);
+        assertThat(identity.readingDatabaseMagic()).isEqualTo(20);
+        assertThat(identity.containsArchiveSource(10, 100, 200)).isTrue();
+        assertThat(identity.containsArchiveSource(20, 100, 200)).isFalse();
+        final var otherReader = new DamengDatabaseIdentity(1, 10, 200, identity.history(), 30);
+        offset.validatePrimaryStandbyIdentity(otherReader);
+        assertThat(offset.getOffset().get(DamengOffsetContext.DATABASE_MAGIC_KEY)).isEqualTo(10L);
+    }
+
+    @Test
     void shouldRejectClockOrderThatWouldHideAnUnsynchronizedPromotion() {
         assertThatThrownBy(() -> identity(20, 500, open("a", 2, 10, 100), open("b-promotion", 1, 20, 200), open("b-restart", 3, 20, 300)))
                 .isInstanceOf(ConnectException.class).hasMessageContaining("ambiguously ordered");
