@@ -1,0 +1,11 @@
+apiVersion: 1
+providers:
+  - name: dameng-cdc
+    orgId: 1
+    folder: Dameng CDC
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 15
+    options:
+      path: /etc/grafana/provisioning/dashboards/dameng

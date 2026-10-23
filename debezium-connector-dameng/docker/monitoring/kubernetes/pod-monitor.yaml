@@ -1,0 +1,20 @@
+# Apply this PodMonitor in a namespace selected by the Prometheus resource.
+# Change the pod selector and namespace below to match the Connect deployment.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: dameng-connect
+  labels:
+    app.kubernetes.io/name: dameng-connect
+spec:
+  namespaceSelector:
+    matchNames:
+      - debezium
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dameng-connect
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

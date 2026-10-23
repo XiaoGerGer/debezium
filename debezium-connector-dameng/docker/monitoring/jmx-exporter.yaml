@@ -1,0 +1,849 @@
+# JMX Exporter 1.4.0. JVM metrics are exported by the agent itself.
+startDelaySeconds: 5
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+includeObjectNames:
+- debezium.dameng:type=connector-metrics,*
+- kafka.connect:type=source-task-metrics,*
+- kafka.connect:type=connect-worker-metrics,*
+- kafka.producer:type=producer-metrics,*
+rules:
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>MiningWindowByteBudget:.*
+  name: dameng_mining_window_byte_budget
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Soft whole-archive-file budget in bytes; zero in fixed LSN mode. Not a heap limit.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>SelectedArchiveFileBytes:.*
+  name: dameng_selected_archive_file_bytes
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Total LEN of forward files selected at planning time, including shared boundaries. Not actual I/O or reconstruction.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>SelectedArchiveFileCount:.*
+  name: dameng_selected_archive_file_count
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Number of forward archive files selected at planning time, including shared boundaries.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>StandbyReplayableLsn:.*
+  name: dameng_standby_replayable_lsn
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Standby SLSN confirmed eligible for replay, zero outside standby capture.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>StandbyReplayedLsn:.*
+  name: dameng_standby_replayed_lsn
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Standby RPKG_LSN with replay completed, zero outside standby capture.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>StandbyMiningUpperLsn:.*
+  name: dameng_standby_mining_upper_lsn
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Minimum archived, replayable and replayed source LSN available for standby mining.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>CurrentMiningBatchSize:.*
+  name: dameng_mining_window_lsn_span
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Planned forward LSN span from the latest archive selection or fixed policy. Not a row count.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>LastWindowLsnSpan:.*
+  name: dameng_last_window_lsn_span
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Actual advance of the most recently completed iteration.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>QueueEnqueueWaitDurationMillis:.*
+  name: dameng_queue_enqueue_wait_seconds_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Completed queue-full waits, including condition-lock reacquisition. Overlaps dispatch time.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>ForwardMiningDurationMillis:.*
+  name: dameng_forward_mining_seconds_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Ordinary forward mining time in successfully completed iterations.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>ReconstructionDurationMillis:.*
+  name: dameng_reconstruction_seconds_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Historical reconstruction time in successfully completed iterations.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>DispatchDurationMillis:.*
+  name: dameng_dispatch_seconds_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Parsing and dispatch time in successfully completed iterations, including queue waits.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>LastForwardMiningDurationMillis:.*
+  name: dameng_last_forward_mining_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Forward mining time in the last successfully completed iteration.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>LastReconstructionDurationMillis:.*
+  name: dameng_last_reconstruction_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Reconstruction time in the last successfully completed iteration, zero if none.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(streaming), server=([^,>]+)(?:, [^>]+)?><>LastDispatchDurationMillis:.*
+  name: dameng_last_dispatch_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Dispatch time in the last successfully completed iteration, including queue waits.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:, [^>]+)?><>TransactionBufferMemoryBytes:.*
+  name: dameng_transaction_buffer_memory_bytes
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Estimated resident transaction cache bytes.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:, [^>]+)?><>TransactionBufferDiskBytes:.*
+  name: dameng_transaction_buffer_disk_bytes
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Current encoded temporary transaction file bytes.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:, [^>]+)?><>TransactionBufferRecords:.*
+  name: dameng_transaction_buffer_records
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Retained complete transaction records across windows.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:, [^>]+)?><>SpilledTransactions:.*
+  name: dameng_transaction_spills_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Spill operations in this streaming execution, including reconstruction re-spills.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotRemainingTableCount:.*
+  name: dameng_incremental_snapshot_remaining_tables
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Unfinished incremental snapshot tables, including the current table; retained while paused and zero after completion. Not remaining rows
+    or a completion percentage.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotRunning:.*
+  name: dameng_incremental_snapshot_running
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: An incremental snapshot has unfinished work; also true while paused.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotPaused:.*
+  name: dameng_incremental_snapshot_paused
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: An incremental snapshot is paused; running remains true while work is unfinished.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotRowsScanned:.*
+  name: dameng_incremental_snapshot_rows_scanned_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Incremental JDBC rows read during this Task lifecycle, including rereads and rows removed by deduplication. Not Kafka acknowledgements.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotRowsEnqueued:.*
+  name: dameng_incremental_snapshot_rows_enqueued_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Incremental snapshot row events successfully dispatched to the event queue during this Task lifecycle. Excludes streaming DML and Kafka
+    acknowledgements.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotWindowsCompleted:.*
+  name: dameng_incremental_snapshot_windows_completed_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Incremental snapshot windows successfully emitted during this Task lifecycle.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotLastQueryDurationMillis:.*
+  name: dameng_incremental_snapshot_last_query_duration_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Last completed incremental chunk read, including JDBC fetch and row conversion. Retained until another query or Task restart.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotCurrentCloseWaitDurationMillis:.*
+  name: dameng_incremental_snapshot_current_close_wait_duration_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Elapsed time while a written CLOSE watermark remains unprocessed, including time paused with an outstanding watermark. Not pure LogMiner time; the dashboard shows this only in waiting_close.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotLastCloseWaitDurationMillis:.*
+  name: dameng_incremental_snapshot_last_close_wait_duration_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Last completed wait for CLOSE watermark processing. Retained until another completed wait or Task restart.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotLastEmitDurationMillis:.*
+  name: dameng_incremental_snapshot_last_emit_duration_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Last completed incremental window emission including conversion and queue waits; excludes Kafka acknowledgement.
+  cache: true
+  valueFactor: 0.001
+- pattern: 'debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotPhase: (.+)'
+  name: dameng_incremental_snapshot_phase
+  type: GAUGE
+  value: 1
+  labels:
+    context: $1
+    server: $2
+    phase: $3
+  help: Current incremental snapshot phase as an info-style sample with value one.
+  cache: false
+- pattern: 'debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>IncrementalSnapshotCurrentTable: (.+)'
+  name: dameng_incremental_snapshot_current_table
+  type: GAUGE
+  value: 1
+  labels:
+    context: $1
+    server: $2
+    table: $3
+  help: Current incremental snapshot table as an info-style sample with value one; omitted when empty.
+  cache: false
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotRunning:.*
+  name: dameng_snapshot_running
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Whether a snapshot is running.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotCompleted:.*
+  name: dameng_snapshot_completed
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Whether the most recent snapshot completed.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotAborted:.*
+  name: dameng_snapshot_aborted
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Whether the most recent snapshot was aborted.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotPaused:.*
+  name: dameng_snapshot_paused
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Whether a snapshot is paused.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotDurationInSeconds:.*
+  name: dameng_snapshot_duration_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Total snapshot elapsed time, including acquisition, reads and queue waits.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotPausedDurationInSeconds:.*
+  name: dameng_snapshot_paused_duration_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Snapshot paused time.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>TotalTableCount:.*
+  name: dameng_snapshot_total_tables
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Tables selected for snapshot rows.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>RemainingTableCount:.*
+  name: dameng_snapshot_remaining_tables
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Selected tables whose snapshot rows are not complete.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotLockWaiting:.*
+  name: dameng_snapshot_lock_waiting
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: A LOCK TABLE statement is currently executing.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotLocksHeld:.*
+  name: dameng_snapshot_locks_held
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: The snapshot transaction holds acquired locks; remains true if rollback fails until task cleanup.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>LockedTableCount:.*
+  name: dameng_snapshot_locked_tables
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Successfully acquired shared table locks in the current snapshot transaction.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotLockWaitDurationMillis:.*
+  name: dameng_snapshot_lock_wait_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Cumulative LOCK TABLE execution time including any active attempt; includes JDBC overhead.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotMaxLockWaitDurationMillis:.*
+  name: dameng_snapshot_max_lock_wait_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Longest LOCK TABLE attempt in this transaction, including a pending attempt.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>SnapshotLockHoldDurationMillis:.*
+  name: dameng_snapshot_lock_hold_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Elapsed time from first successful acquisition until confirmed transaction rollback; zero after release.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>LastSnapshotLockStatisticsAvailable:.*
+  name: dameng_snapshot_last_lock_statistics_available
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: A completed lock measurement is available for five minutes after confirmed rollback.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>LastSnapshotLockWaitDurationMillis:.*
+  name: dameng_snapshot_last_lock_wait_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Last completed cumulative acquisition time; zero after five minutes or a new snapshot.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>LastSnapshotMaxLockWaitDurationMillis:.*
+  name: dameng_snapshot_last_max_lock_wait_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Last completed longest single-table attempt; zero after five minutes or a new snapshot.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>LastSnapshotLockHoldDurationMillis:.*
+  name: dameng_snapshot_last_lock_hold_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Last completed transaction-wide holding time; zero after five minutes or a new snapshot.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=(snapshot), server=([^,>]+)(?:, [^>]+)?><>LastSnapshotLockedTableCount:.*
+  name: dameng_snapshot_last_locked_tables
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Tables locked in the last completed transaction; zero after five minutes or a new snapshot.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>OldestReplayLsn:.*
+  name: dameng_replay_lsn
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Oldest safe replay position; not a downstream acknowledged position.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>ScannedUpperLsn:.*
+  name: dameng_scanned_upper_lsn
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Upper position of a completed mining scan; not a delivered position.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>LatestArchivedLsn:.*
+  name: dameng_latest_archived_lsn
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Most recently observed archived upper position.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>WindowBufferEstimatedBytes:.*
+  name: dameng_window_buffer_estimated_bytes
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Cumulative estimated reservation for the current or last sampled window; not
+    live heap.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>PeakWindowBufferEstimatedBytes:.*
+  name: dameng_peak_window_buffer_estimated_bytes
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Peak estimated reservation since metrics reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>WindowBufferRecords:.*
+  name: dameng_window_buffer_records
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Input rows in the current or last sampled window, including markers and fragments.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>PeakWindowBufferRecords:.*
+  name: dameng_peak_window_buffer_records
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Peak input row count since metrics reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>OpenTransactions:.*
+  name: dameng_open_transactions
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Unfinished transactions at the last scan outcome; not a live database transaction
+    count.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>LastMiningDurationMillis:.*
+  name: dameng_last_mining_duration_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Last mining attempt including setup, fetch, reconstruction and cleanup; excludes
+    later DML decode and dispatch.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>MaxMiningDurationMillis:.*
+  name: dameng_max_mining_duration_seconds
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Maximum mining attempt duration since reset.
+  cache: true
+  valueFactor: 0.001
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>BufferLimitFailures:.*
+  name: dameng_buffer_limit_failures_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Resident transaction metadata or single SQL resource limit failures since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>MiningSessions:.*
+  name: dameng_mining_sessions_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Mining session attempts including reconstruction and failed attempts, since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>ReconstructionSessions:.*
+  name: dameng_reconstruction_sessions_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Boundary-triggered historical reconstruction attempts since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>MinedRows:.*
+  name: dameng_mined_rows_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Raw rows fetched including continuation pieces, markers and repeated history, since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>ReconstructedRows:.*
+  name: dameng_reconstructed_rows_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Raw rows fetched during boundary-triggered historical reconstruction since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>Connected:.*
+  name: dameng_connected
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Connector streaming connection state.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>QueueTotalCapacity:.*
+  name: dameng_queue_capacity_records
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Total event queue capacity in records.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>QueueRemainingCapacity:.*
+  name: dameng_queue_remaining_records
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Available event queue capacity in records.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>CurrentQueueSizeInBytes:.*
+  name: dameng_queue_bytes
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Event queue bytes when byte accounting is enabled.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>TotalNumberOfEventsSeen:.*
+  name: dameng_events_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Change events observed since reset; not downstream acknowledgements.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>TotalNumberOfCreateEventsSeen:.*
+  name: dameng_create_events_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Create change events observed since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>TotalNumberOfUpdateEventsSeen:.*
+  name: dameng_update_events_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Update change events observed since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>TotalNumberOfDeleteEventsSeen:.*
+  name: dameng_delete_events_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Delete change events observed since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>NumberOfErroneousEvents:.*
+  name: dameng_erroneous_events_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Erroneous change events observed since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>NumberOfEventsFiltered:.*
+  name: dameng_filtered_events_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Filtered change events observed since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>NumberOfCommittedTransactions:.*
+  name: dameng_committed_transactions_total
+  type: COUNTER
+  labels:
+    context: $1
+    server: $2
+  help: Transactions observed by the streaming metrics since reset.
+  cache: true
+- pattern: debezium\.dameng<type=connector-metrics, context=([^,>]+), server=([^,>]+)(?:,
+    [^>]+)?><>MilliSecondsSinceLastEvent:.*
+  name: dameng_seconds_since_last_event
+  type: GAUGE
+  labels:
+    context: $1
+    server: $2
+  help: Time since the last observed event; idle sources can be healthy.
+  cache: true
+  valueFactor: 0.001
+- pattern: kafka\.connect<type=source-task-metrics, connector=([^,>]+), task=([^,>]+)><>source-record-write-rate:.*
+  name: kafka_connect_source_write_rate_records
+  type: GAUGE
+  labels:
+    connector: $1
+    task: $2
+  cache: true
+- pattern: kafka\.connect<type=source-task-metrics, connector=([^,>]+), task=([^,>]+)><>source-record-poll-rate:.*
+  name: kafka_connect_source_poll_rate_records
+  type: GAUGE
+  labels:
+    connector: $1
+    task: $2
+  cache: true
+- pattern: kafka\.connect<type=source-task-metrics, connector=([^,>]+), task=([^,>]+)><>source-record-write-total:.*
+  name: kafka_connect_source_written_records_total
+  type: COUNTER
+  labels:
+    connector: $1
+    task: $2
+  cache: true
+- pattern: kafka\.connect<type=source-task-metrics, connector=([^,>]+), task=([^,>]+)><>source-record-poll-total:.*
+  name: kafka_connect_source_polled_records_total
+  type: COUNTER
+  labels:
+    connector: $1
+    task: $2
+  cache: true
+- pattern: kafka\.connect<type=source-task-metrics, connector=([^,>]+), task=([^,>]+)><>source-record-active-count:.*
+  name: kafka_connect_source_active_records
+  type: GAUGE
+  labels:
+    connector: $1
+    task: $2
+  cache: true
+- pattern: kafka\.connect<type=source-task-metrics, connector=([^,>]+), task=([^,>]+)><>poll-batch-avg-time-ms:.*
+  name: kafka_connect_source_poll_duration_seconds
+  type: GAUGE
+  labels:
+    connector: $1
+    task: $2
+  cache: true
+  valueFactor: 0.001
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>record-send-rate:.*
+  name: kafka_producer_record_send_rate_records
+  type: GAUGE
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>record-send-total:.*
+  name: kafka_producer_sent_records_total
+  type: COUNTER
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>record-retry-total:.*
+  name: kafka_producer_record_retries_total
+  type: COUNTER
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>record-error-total:.*
+  name: kafka_producer_record_errors_total
+  type: COUNTER
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>request-latency-avg:.*
+  name: kafka_producer_request_latency_seconds
+  type: GAUGE
+  labels:
+    client_id: $1
+  cache: true
+  valueFactor: 0.001
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>request-latency-max:.*
+  name: kafka_producer_request_latency_max_seconds
+  type: GAUGE
+  labels:
+    client_id: $1
+  cache: true
+  valueFactor: 0.001
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>bufferpool-wait-ratio:.*
+  name: kafka_producer_buffer_wait_ratio
+  type: GAUGE
+  help: Fraction of time producer threads spend waiting for buffer allocation over the Kafka metrics window.
+  labels:
+    client_id: $1
+  cache: true
+# Kafka 3.9 also provides bufferpool-wait-time-ns-total. Select only one alias.
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>bufferpool-wait-time-total:.*
+  name: kafka_producer_buffer_wait_seconds_total
+  type: COUNTER
+  help: Cumulative time producer threads wait for buffer allocation, converted from nanoseconds to seconds. Resets when the producer is recreated.
+  labels:
+    client_id: $1
+  cache: true
+  valueFactor: 0.000000001
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>records-per-request-avg:.*
+  name: kafka_producer_records_per_request
+  type: GAUGE
+  help: Average records per request over the Kafka metrics window.
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>batch-size-avg:.*
+  name: kafka_producer_batch_size_bytes
+  type: GAUGE
+  help: Average bytes per partition batch over the Kafka metrics window, after compression when enabled. Not the configured batch.size.
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>record-size-avg:.*
+  name: kafka_producer_record_size_bytes
+  type: GAUGE
+  help: Average uncompressed record size over the Kafka metrics window. Not just the serialized value size.
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>buffer-available-bytes:.*
+  name: kafka_producer_buffer_available_bytes
+  type: GAUGE
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>buffer-total-bytes:.*
+  name: kafka_producer_buffer_capacity_bytes
+  type: GAUGE
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>outgoing-byte-rate:.*
+  name: kafka_producer_outgoing_rate_bytes
+  type: GAUGE
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>record-queue-time-avg:.*
+  name: kafka_producer_record_queue_seconds
+  type: GAUGE
+  labels:
+    client_id: $1
+  cache: true
+  valueFactor: 0.001
+- pattern: kafka\.producer<type=producer-metrics, client-id=([^>]+)><>compression-rate-avg:.*
+  name: kafka_producer_compression_ratio
+  type: GAUGE
+  labels:
+    client_id: $1
+  cache: true
+- pattern: kafka\.connect<type=connect-worker-metrics, connector=([^>]+)><>connector-running-task-count:.*
+  name: kafka_connect_running_tasks
+  type: GAUGE
+  labels:
+    connector: $1
+  cache: true
+- pattern: kafka\.connect<type=connect-worker-metrics, connector=([^>]+)><>connector-failed-task-count:.*
+  name: kafka_connect_failed_tasks
+  type: GAUGE
+  labels:
+    connector: $1
+  cache: true
+- pattern: kafka\.connect<type=connect-worker-metrics, connector=([^>]+)><>connector-paused-task-count:.*
+  name: kafka_connect_paused_tasks
+  type: GAUGE
+  labels:
+    connector: $1
+  cache: true

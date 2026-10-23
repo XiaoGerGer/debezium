@@ -1,0 +1,204 @@
+rule_files:
+- prometheus-rules.yaml
+evaluation_interval: 15s
+# Prometheus 3.5 promtool: tolerate only floating-point mantissa last-bit differences.
+fuzzy_compare: true
+tests:
+- name: initialization does not look like a fast scan
+  interval: 15s
+  input_series:
+  - series: dameng_scanned_upper_lsn{context="streaming",server="test"}
+    values: 0 9000000 9000015
+  - series: dameng_latest_archived_lsn{context="streaming",server="test"}
+    values: 0 9000000 9000015
+  promql_expr_test:
+  - expr: dameng:scan_rate_lsn
+    eval_time: 30s
+    exp_samples: []
+  - expr: dameng:archive_rate_lsn
+    eval_time: 30s
+    exp_samples: []
+- name: advancing positions measure LSN per second
+  interval: 15s
+  input_series:
+  - series: dameng_scanned_upper_lsn{context="streaming",server="test"}
+    values: 1000+15x8
+  - series: dameng_latest_archived_lsn{context="streaming",server="test"}
+    values: 2000+30x8
+  promql_expr_test:
+  - expr: dameng:scan_rate_lsn
+    eval_time: 2m
+    exp_samples:
+    - labels: dameng:scan_rate_lsn{context="streaming",server="test"}
+      value: 1
+  - expr: dameng:archive_rate_lsn
+    eval_time: 2m
+    exp_samples:
+    - labels: dameng:archive_rate_lsn{context="streaming",server="test"}
+      value: 2
+- name: position rollback suppresses misleading slope
+  interval: 15s
+  input_series:
+  - series: dameng_scanned_upper_lsn{context="streaming",server="test"}
+    values: 10000+15x4 9000+15x3
+  - series: dameng_latest_archived_lsn{context="streaming",server="test"}
+    values: 10000+15x4 9000+15x3
+  promql_expr_test:
+  - expr: dameng:scan_rate_lsn
+    eval_time: 2m
+    exp_samples: []
+  - expr: dameng:archive_rate_lsn
+    eval_time: 2m
+    exp_samples: []
+- name: an idle source has zero scan and archive rates
+  interval: 15s
+  input_series:
+  - series: dameng_scanned_upper_lsn{context="streaming",server="test"}
+    values: 9000000+0x8
+  - series: dameng_latest_archived_lsn{context="streaming",server="test"}
+    values: 9000000+0x8
+  promql_expr_test:
+  - expr: dameng:scan_rate_lsn
+    eval_time: 2m
+    exp_samples:
+    - labels: dameng:scan_rate_lsn{context="streaming",server="test"}
+      value: 0
+  - expr: dameng:archive_rate_lsn
+    eval_time: 2m
+    exp_samples:
+    - labels: dameng:archive_rate_lsn{context="streaming",server="test"}
+      value: 0
+- name: backlog recording rule preserves Kubernetes discovery labels
+  interval: 15s
+  input_series:
+  - series: dameng_scanned_upper_lsn{context="streaming",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 9000000 9000010
+  - series: dameng_latest_archived_lsn{context="streaming",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 9000020 9000040
+  promql_expr_test:
+  - expr: dameng:scan_backlog_lsn
+    eval_time: 15s
+    exp_samples:
+    - labels: dameng:scan_backlog_lsn{context="streaming",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 30
+- name: incremental rates distinguish JDBC reads and snapshot enqueue while preserving all discovery labels
+  interval: 15s
+  input_series:
+  - series: dameng_incremental_snapshot_rows_scanned_total{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 0+150x8
+  - series: dameng_incremental_snapshot_rows_enqueued_total{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 0+120x8
+  - series: dameng_incremental_snapshot_rows_scanned_total{context="snapshot",server="dm-other",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 0+30x8
+  - series: dameng_incremental_snapshot_rows_enqueued_total{context="snapshot",server="dm-other",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 0+15x8
+  promql_expr_test:
+  - expr: dameng:incremental_snapshot_scan_rate_rows
+    eval_time: 2m
+    exp_samples:
+    - labels: dameng:incremental_snapshot_scan_rate_rows{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 10
+    - labels: dameng:incremental_snapshot_scan_rate_rows{context="snapshot",server="dm-other",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 2
+  - expr: dameng:incremental_snapshot_enqueue_rate_rows
+    eval_time: 2m
+    exp_samples:
+    - labels: dameng:incremental_snapshot_enqueue_rate_rows{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 8
+    - labels: dameng:incremental_snapshot_enqueue_rate_rows{context="snapshot",server="dm-other",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 1
+- name: incremental rates require at least two samples
+  interval: 15s
+  input_series:
+  - series: dameng_incremental_snapshot_rows_scanned_total{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: '10000'
+  - series: dameng_incremental_snapshot_rows_enqueued_total{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: '9000'
+  promql_expr_test:
+  - expr: dameng:incremental_snapshot_scan_rate_rows
+    eval_time: 0s
+    exp_samples: []
+  - expr: dameng:incremental_snapshot_enqueue_rate_rows
+    eval_time: 0s
+    exp_samples: []
+- name: incremental Task counter reset does not create a negative rate or a restart spike
+  interval: 15s
+  input_series:
+  - series: dameng_incremental_snapshot_rows_scanned_total{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 0 210 420 630 0 210 420 630 840
+  - series: dameng_incremental_snapshot_rows_enqueued_total{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 0 105 210 315 0 105 210 315 420
+  promql_expr_test:
+  - expr: dameng:incremental_snapshot_scan_rate_rows
+    eval_time: 2m
+    exp_samples:
+    - labels: dameng:incremental_snapshot_scan_rate_rows{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 12
+  - expr: dameng:incremental_snapshot_enqueue_rate_rows
+    eval_time: 2m
+    exp_samples:
+    - labels: dameng:incremental_snapshot_enqueue_rate_rows{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 6
+- name: incremental last measurements are hidden after completion and paused work stays visible
+  interval: 15s
+  input_series:
+  - series: dameng_incremental_snapshot_running{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 1 1 0
+  - series: dameng_incremental_snapshot_paused{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 0 1 0
+  - series: dameng_incremental_snapshot_last_query_duration_seconds{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 0.2+0x2
+  - series: dameng_incremental_snapshot_remaining_tables{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 2 2 0
+  promql_expr_test:
+  - expr: dameng_incremental_snapshot_last_query_duration_seconds and (dameng_incremental_snapshot_running == 1)
+    eval_time: 15s
+    exp_samples:
+    - labels: dameng_incremental_snapshot_last_query_duration_seconds{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 0.2
+  - expr: dameng_incremental_snapshot_last_query_duration_seconds and (dameng_incremental_snapshot_running == 1)
+    eval_time: 30s
+    exp_samples: []
+  - expr: dameng_incremental_snapshot_remaining_tables
+    eval_time: 15s
+    exp_samples:
+    - labels: dameng_incremental_snapshot_remaining_tables{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 2
+  - expr: dameng_incremental_snapshot_remaining_tables
+    eval_time: 30s
+    exp_samples:
+    - labels: dameng_incremental_snapshot_remaining_tables{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 0
+- name: current CLOSE wait and current table join only their own source without dropping discovery labels
+  interval: 15s
+  input_series:
+  - series: dameng_incremental_snapshot_running{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 1+0x2
+  - series: dameng_incremental_snapshot_current_close_wait_duration_seconds{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 3 4 0
+  - series: dameng_incremental_snapshot_phase{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404",phase="waiting_close"}
+    values: 1 1 stale
+  - series: dameng_incremental_snapshot_phase{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404",phase="reading"}
+    values: _ _ 1
+  - series: dameng_incremental_snapshot_current_table{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404",table="APP.CUSTOMERS"}
+    values: 1+0x2
+  - series: dameng_incremental_snapshot_running{context="snapshot",server="dm-other",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+    values: 0+0x2
+  - series: dameng_incremental_snapshot_current_table{context="snapshot",server="dm-other",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404",table="APP.ORDERS"}
+    values: 1+0x2
+  promql_expr_test:
+  - expr: dameng_incremental_snapshot_current_close_wait_duration_seconds and ignoring(phase) (dameng_incremental_snapshot_phase{phase="waiting_close"} == 1) and
+      (dameng_incremental_snapshot_running == 1)
+    eval_time: 15s
+    exp_samples:
+    - labels: dameng_incremental_snapshot_current_close_wait_duration_seconds{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404"}
+      value: 4
+  - expr: dameng_incremental_snapshot_current_close_wait_duration_seconds and ignoring(phase) (dameng_incremental_snapshot_phase{phase="waiting_close"} == 1) and
+      (dameng_incremental_snapshot_running == 1)
+    eval_time: 30s
+    exp_samples: []
+  - expr: dameng_incremental_snapshot_current_table and ignoring(table) (dameng_incremental_snapshot_running == 1)
+    eval_time: 15s
+    exp_samples:
+    - labels: dameng_incremental_snapshot_current_table{context="snapshot",server="dm-prod",cluster="prod-a",namespace="debezium",pod="connect-0",job="connect-metrics",instance="10.2.4.17:9404",table="APP.CUSTOMERS"}
+      value: 1

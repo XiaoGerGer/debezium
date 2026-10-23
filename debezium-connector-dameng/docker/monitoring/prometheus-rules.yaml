@@ -1,0 +1,28 @@
+groups:
+- name: dameng-cdc
+  interval: 15s
+  rules:
+  - record: dameng:scan_backlog_lsn
+    expr: clamp_min(dameng_latest_archived_lsn{context="streaming"} - dameng_scanned_upper_lsn{context="streaming"},
+      0)
+  - record: dameng:replay_span_lsn
+    expr: clamp_min(dameng_scanned_upper_lsn{context="streaming"} - dameng_replay_lsn{context="streaming"},
+      0)
+  - record: dameng:scan_rate_lsn
+    # Initialization is not scan progress. Suppress a window containing a zero
+    # position or a decrease (for example, a task restart at an older offset).
+    expr: clamp_min(deriv(dameng_scanned_upper_lsn{context="streaming"}[2m]), 0)
+      and (min_over_time(dameng_scanned_upper_lsn{context="streaming"}[2m]) > 0)
+      unless (resets(dameng_scanned_upper_lsn{context="streaming"}[2m]) > 0)
+  - record: dameng:archive_rate_lsn
+    expr: clamp_min(deriv(dameng_latest_archived_lsn{context="streaming"}[2m]), 0)
+      and (min_over_time(dameng_latest_archived_lsn{context="streaming"}[2m]) > 0)
+      unless (resets(dameng_latest_archived_lsn{context="streaming"}[2m]) > 0)
+  - record: dameng:queue_fill_ratio
+    expr: clamp_max(clamp_min((dameng_queue_capacity_records{context="streaming"}
+      - dameng_queue_remaining_records{context="streaming"}) / dameng_queue_capacity_records{context="streaming"},
+      0), 1)
+  - record: dameng:incremental_snapshot_scan_rate_rows
+    expr: rate(dameng_incremental_snapshot_rows_scanned_total{context="snapshot"}[2m])
+  - record: dameng:incremental_snapshot_enqueue_rate_rows
+    expr: rate(dameng_incremental_snapshot_rows_enqueued_total{context="snapshot"}[2m])

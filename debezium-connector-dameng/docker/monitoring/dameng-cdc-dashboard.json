@@ -1,0 +1,6116 @@
+{
+  "uid": "dameng-cdc-overview",
+  "title": "Dameng CDC · 运行观测",
+  "description": "支持 Kubernetes Prometheus Operator 与静态抓取；依赖 Kubernetes PrometheusRule 或 Prometheus rule_files 中的 recording rules。快照锁、日志追赶、事务恢复、Kafka 发送、JVM 与备库重放。",
+  "tags": [
+    "dameng",
+    "debezium",
+    "cdc",
+    "kafka-connect",
+    "kubernetes",
+    "prometheus"
+  ],
+  "schemaVersion": 39,
+  "version": 13,
+  "editable": true,
+  "style": "dark",
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "15s",
+      "30s",
+      "1m",
+      "5m"
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "数据源",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1
+      },
+      {
+        "name": "cluster",
+        "label": "集群",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(jmx_scrape_duration_seconds, cluster)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "namespace",
+        "label": "命名空间",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(jmx_scrape_duration_seconds{cluster=~\"$cluster\"}, namespace)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "job",
+        "label": "采集 Job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(jmx_scrape_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\"}, job)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "instance",
+        "label": "Worker · instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(jmx_scrape_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\"}, instance)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false
+      },
+      {
+        "name": "server",
+        "label": "源标识",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(dameng_scanned_upper_lsn{context=\"streaming\",cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\"}, server)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "connector",
+        "label": "Connect 任务",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(kafka_connect_source_write_rate_records{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\"}, connector)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "sort": 1,
+        "multi": false,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "description": "含义与单位：本面板覆盖采集端的归档、日志挖掘、事务恢复、快照锁、Kafka 发送和 Worker JVM。\n\n判读：先选择 Worker，再同时选择匹配的「源标识」和「Connect 任务」。源标识是 topic.prefix，Connect 任务是 REST Connector 名称，两者目前不会自动关联。JVM 指标属于整个 Worker。\n\n排查与优化：先看积压趋势，再用挖掘、重建、分发和队列等待区分瓶颈。一次只调整一个参数，在相近业务负载下比较吞吐、延迟、错误和资源占用。",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 16,
+        "h": 4
+      },
+      "transparent": false,
+      "options": {
+        "mode": "markdown",
+        "content": "# DAMENG · CDC 运行观测\n归档 → 挖掘 → 事务重建 → Kafka　 |　**实时进度 · 性能定位 · 恢复边界**"
+      }
+    },
+    {
+      "id": 2,
+      "type": "text",
+      "title": "读数指南",
+      "description": "含义与单位：归档上界是最近观测到的归档位置；扫描上界是已完成挖掘的上界；重放起点是内存中记录的安全恢复位置。单位均为 LSN。\n\n判读：LSN 不能换算成固定行数、字节数或秒数。扫描完成不代表事件已写入 Kafka；实际重启位置还取决于 Connect 已持久化的 offset。备库可安全挖掘的位置还受 SLSN、RPKG_LSN 限制。\n\n排查与优化：归档与扫描差距大时查挖掘和下游；扫描与重放差距大时查跨窗口事务。无数据时先确认筛选、Exporter、PrometheusRule 和 Task 状态。",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 4
+      },
+      "transparent": false,
+      "options": {
+        "mode": "markdown",
+        "content": "- 🟦 **扫描上界**：已读完的日志位置\n- 🟪 **重放起点**：重启仍需读取的位置\n- 🟨 **归档上界**：可供挖掘的日志位置"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Worker 指标采集",
+      "description": "含义与单位：Prometheus 对所选 Worker 指标端点的抓取状态 up：1 为成功，0 为失败。卡片取匹配目标的最小值。\n\n判读：抓取成功只说明 Agent 端点可访问，不能证明 Connector Task 正常。没有匹配目标时显示无数据，不等同于 0。\n\n排查与优化：失败时检查 Targets 的 last error、PodMonitor 标签和命名空间选择器、metrics 命名端口、9404 端口、网络策略与超时。采集成功但 CDC 不动时转查 Task REST 状态和日志。\n\n指标：`up`。",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "min(up{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "value": 1,
+                "color": "green"
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "离线",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "在线",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "待扫描积压 · LSN",
+      "description": "含义与单位：max(归档上界 − 扫描上界, 0)，单位 LSN；卡片显示所选源中的最大积压。\n\n判读：持续下降表示正在追赶，持续上升表示扫描落后于归档增长。它不是业务消息数或端到端延迟。备库归档中可能包含尚未到安全重放边界的日志，不能把全部差值都归因于 Connector 慢。\n\n排查与优化：先联看追赶速度、备库安全边界、前进挖掘与队列等待。前进耗时高且队列不满时做有界窗口对照；队列满时查 Producer。无值先检查 dameng-cdc recording rules 和两项原始 LSN 指标，颜色阈值需按实际容量调整。\n\n指标：`dameng:scan_backlog_lsn`。",
+      "gridPos": {
+        "x": 4,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(dameng:scan_backlog_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#22D3EE",
+                "value": null
+              },
+              {
+                "value": 50000,
+                "color": "orange"
+              },
+              {
+                "value": 1000000,
+                "color": "red"
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "扫描推进 · LSN/s",
+      "description": "含义与单位：扫描上界在过去 2 分钟的线性回归斜率，负值截为 0，单位 LSN/秒；卡片对所选源求和。\n\n判读：初始化零值或 LSN 回退出现在两分钟范围内时会抑制结果；无值不代表零吞吐。多数据库 LSN 单位不代表同等工作量，分析性能应选一个源。此值不是 Kafka 确认速率。\n\n排查与优化：与同一源的归档增长速度比较。持续落后时拆看前进挖掘、重建、发送和等待；优先改善最慢阶段。需要原始指标和 recording rules，刚启动时等待足够样本。\n\n指标：`dameng:scan_rate_lsn`。",
+      "gridPos": {
+        "x": 8,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(dameng:scan_rate_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: LSN/s",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#38BDF8",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "变更事件 · 条/s",
+      "description": "含义与单位：streaming 事件观察计数 dameng_events_total 的 2 分钟 rate，单位条/秒；对所选源求和。\n\n判读：这是 Connector 事件监听器口径，公共计数还可包含过滤和错误回调；不等于业务 Topic 成功持久化条数。恢复回放可能重复计数；增量快照 READ 等事件也不能只按 INSERT/UPDATE/DELETE 总和理解。\n\n排查与优化：有积压却长期低吞吐时联看扫描、重建、队列与 Kafka 写出。无积压且源端空闲时零值正常；源端有写入但没有事件时检查捕获过滤、事务提交和 Task 错误日志。无数据时用 count_over_time(dameng_events_total{context=\"streaming\"}[2m]) 检查同一序列是否至少有两个样本。\n\n指标：`dameng_events_total`。",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(dameng_events_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}[2m]))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: 条/s",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#A78BFA",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "最近挖掘耗时",
+      "description": "含义与单位：最近记录的挖掘耗时，单位秒；卡片取所选源最大值。完成窗口时包含归档检查、前进挖掘、必要的历史重建及结束前校验，不含随后事件解析发送。\n\n判读：该 gauge 也在单次挖掘会话结束时更新，抓取可能命中中间值；不是正在执行的窗口计时器，也不是端到端延迟。长时间不变可能是空闲、卡在当前调用或没有新采样。\n\n排查与优化：用 dameng_last_forward_mining_seconds、dameng_last_reconstruction_seconds、dameng_last_dispatch_seconds 拆分最近成功轮次。前进慢时查归档、LogMiner 启停、JDBC、缓存落盘与 GC；不要只因单轮时间长就缩窗，应比较实际 LSN/秒和积压趋势。\n\n指标：`dameng_last_mining_duration_seconds`。",
+      "gridPos": {
+        "x": 16,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(dameng_last_mining_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#38BDF8",
+                "value": null
+              },
+              {
+                "value": 1,
+                "color": "orange"
+              },
+              {
+                "value": 5,
+                "color": "red"
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "事件队列占用",
+      "description": "含义与单位：(事件队列总容量 − 剩余容量) / 总容量，按记录条数计算；0～1 显示为 0%～100%，卡片取所选源最大值。\n\n判读：持续接近满表示 Worker 取出事件跟不上入队；接近空也可能是源端空闲或挖掘慢。这里不包含 max.queue.size.in.bytes 的字节占用，因此条数不满仍可能触发字节限制。\n\n排查与优化：联看入队等待、Producer 缓冲等待、批次和请求延迟。等待高时先提高下游能力；max.queue.size / max.queue.size.in.bytes 主要吸收突发，增大前评估堆。无值先查 dameng-cdc recording rules。\n\n指标：`dameng:queue_fill_ratio`。",
+      "gridPos": {
+        "x": 20,
+        "y": 4,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(dameng:queue_fill_ratio{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              },
+              {
+                "value": 0.7,
+                "color": "orange"
+              },
+              {
+                "value": 0.9,
+                "color": "red"
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "JVM 堆使用率",
+      "description": "含义与单位：所选 Worker 的 JVM 堆已用量 / 最大堆，0～1 显示为百分比。查询先分别对已用量和最大值求和再相除。\n\n判读：多个任务共用一个 JVM，此值不能归属到单个任务；也不包含线程栈、直接内存、Metaspace 和容器文件缓存。GC 后能回落的锯齿通常与持续抬高的基线含义不同。\n\n排查与优化：结合 GC、容器内存、事务缓存和队列字节数定位。多任务共享堆时累计评估缓存与 Producer buffer.memory；Xmx 外需给 JVM 非堆和系统留空间。已有落盘能力时可评估事务缓存阈值与磁盘吞吐，避免盲目扩大所有缓存。\n\n指标：`jvm_memory_max_bytes`、`jvm_memory_used_bytes`。",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(jvm_memory_used_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",area=\"heap\"}) / sum(jvm_memory_max_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",area=\"heap\"})",
+          "instant": true,
+          "range": false,
+          "legendFormat": "JVM 堆使用率"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#38BDF8"
+          },
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Worker CPU · 单核比例",
+      "description": "含义与单位：Worker 进程累计 CPU 秒的 2 分钟 rate；1 显示为 100%，约等于占用一个 CPU 核，多个线程可超过 100%。\n\n判读：这是整个 JVM 的 CPU 用量，不是 Pod CPU 配额利用率，也不是达梦数据库 CPU。低值不能证明没有瓶颈，线程可能在等待 JDBC、磁盘或 Kafka。\n\n排查与优化：高值结合 JFR/线程采样检查序列化、SQL 解码、压缩与 GC，并查看 K8s CPU throttling；低值但慢时拆分 I/O 和等待。增加 CPU 前先确认热点可以并行且没有被容器配额限制。\n\n指标：`process_cpu_seconds_total`。",
+      "gridPos": {
+        "x": 6,
+        "y": 8,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(process_cpu_seconds_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\"}[2m]))",
+          "instant": true,
+          "range": false,
+          "legendFormat": "Worker CPU · 单核比例"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#A78BFA"
+          },
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "Worker 运行时长",
+      "description": "含义与单位：Prometheus 当前时间减 Worker 进程启动时间，单位秒；卡片取匹配进程中的最大值。\n\n判读：下降或归零通常对应 JVM 重启或抓取对象改变；Connector Task 单独重启不一定改变此值。不是任务运行时长，也不是 CDC 延迟。\n\n排查与优化：频繁重置时查看 Pod restartCount、上次退出原因、OOMKilled、探针、滚动发布和 Worker 日志。先解决重启原因；任务频繁失败而 JVM 不重启时查 Connect REST 状态。\n\n指标：`process_start_time_seconds`。",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(time() - process_start_time_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\"})",
+          "instant": true,
+          "range": false,
+          "legendFormat": "Worker 运行时长"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#2DD4BF"
+          },
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 34,
+      "type": "stat",
+      "title": "Exporter 采集耗时",
+      "description": "含义与单位：JMX Exporter 最近一次读取 MBean 并生成指标的耗时，单位秒；卡片取所选目标最大值。\n\n判读：不包含完整 Prometheus 网络抓取链路，也不是 LogMiner 耗时。时长逼近 scrapeTimeout 时可能导致采集失败；短任务过程也可能被采集间隔漏掉。\n\n排查与优化：检查 jmx_scrape_error、Prometheus Targets、CPU 和 GC。优先限制无关 MBean/高基数属性、改善 Agent 规则和资源，再评估抓取间隔或超时，避免仅延长超时掩盖运行阻塞。\n\n指标：`jmx_scrape_duration_seconds`。",
+      "gridPos": {
+        "x": 18,
+        "y": 8,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(jmx_scrape_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\"})",
+          "instant": true,
+          "range": false,
+          "legendFormat": "Exporter 采集耗时"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#FBBF24"
+          },
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 35,
+      "type": "row",
+      "title": "Snapshot · 快照与共享表锁",
+      "description": "含义与单位：本区域展示初始快照执行状态、共享表锁获取与持有时间，以及最近一次释放结果。\n\n判读：锁指标由 Connector 的 JDBC 调用计时，不能代替数据库锁视图。备库读取模式下，共享锁在主库获取；增量快照不使用这里的全程共享表锁机制。\n\n排查与优化：获取锁慢先定位主库阻塞事务；获取快但持锁长则查读取、备库重放和下游队列。完成结果即时保留 5 分钟，历史曲线由 Prometheus 保留期决定。",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 36,
+      "type": "stat",
+      "title": "公共快照运行标志",
+      "description": "含义与单位：公共 SnapshotRunning 标志，1 为公共快照流程正在执行，0 为当前未执行。初始快照和增量快照共用部分公共指标，不能只凭该值判断是哪一种快照。\n\n判读：0 不保证成功；增量状态请看独立的 Incremental Snapshot 区域及 IncrementalSnapshotRunning。锁指标仅描述初始/结构快照的共享表锁。\n\n排查与优化：先区分快照类型，再查表锁、读块、CLOSE 水位、备库回放与队列。初始快照结合 snapshot.max.duration.ms，增量快照结合分块阶段耗时。\n\n指标：dameng_snapshot_running。",
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "未运行",
+                  "color": "blue"
+                },
+                "1": {
+                  "text": "快照中",
+                  "color": "orange"
+                }
+              }
+            }
+          ],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 37,
+      "type": "stat",
+      "title": "获取表锁中",
+      "description": "含义与单位：当前是否有 LOCK TABLE JDBC 调用尚未返回：1 为获取锁中，0 为没有进行中的获取调用。\n\n判读：1 可能包含数据库阻塞、执行和网络时间，并不证明全在等数据库锁；0 也不表示已释放先前获得的锁。备库读取模式仍需查看主库锁会话。\n\n排查与优化：从 acquiring shared lock 日志定位表，再查阻塞会话和长事务。与当前锁表数、持锁时长联看；评估 database.query.timeout.ms 和 snapshot.max.duration.ms，不能只调大超时。\n\n指标：`dameng_snapshot_lock_waiting`。",
+      "gridPos": {
+        "x": 4,
+        "y": 13,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_lock_waiting{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "未等待",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "获取中",
+                  "color": "orange"
+                }
+              }
+            }
+          ],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 38,
+      "type": "stat",
+      "title": "当前锁表数量",
+      "description": "含义与单位：本次快照事务已经成功获取共享锁的表数，单位张；确认回滚成功后清零。\n\n判读：不是数据库全局锁数量，也不是所有配置表的数量。尚在等待的表不计入；数量不再增长可能正在等待下一张表或已经进入读取阶段。\n\n排查与优化：超出预期时核对日志中的加锁表及 schema/table 过滤、schema history 保存范围；排查等待或读取慢时联看持锁时间。为减少持锁影响应规划采集范围和快照时段，不靠跳过必要结构信息解决。\n\n指标：`dameng_snapshot_locked_tables`。",
+      "gridPos": {
+        "x": 8,
+        "y": 13,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_locked_tables{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 39,
+      "type": "stat",
+      "title": "当前持锁时长",
+      "description": "含义与单位：从第一张表成功获取共享锁起，到快照事务确认回滚释放锁为止的经过时间，单位秒。释放后当前值归零。\n\n判读：后续表锁获取、schema/数据读取、备库等待和事件队列等待均可能包含在内；不是各表持锁时间相加。回滚失败时释放尚未确认，计时可能继续增长。\n\n排查与优化：获取锁慢查阻塞事务；读取或发送慢则查 JDBC、备库重放、Producer 和队列。初始快照需保留一致性锁；如业务可接受先 CDC 后补数据，可规划 no_data 后用信号增量快照，no_data 的结构快照也可能短暂加锁。\n\n指标：`dameng_snapshot_lock_hold_seconds`。",
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_lock_hold_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 40,
+      "type": "stat",
+      "title": "累计获取锁耗时",
+      "description": "含义与单位：本次快照所有 LOCK TABLE 调用耗时之和，单位秒，包含正在执行和失败的获取尝试。释放后当前值清零。\n\n判读：这是本次快照的 gauge，不是进程累计 counter，不能直接 rate。含 JDBC 和网络开销，不是数据库纯锁等待；第一张表加锁后的其他获取耗时与持锁时间重叠，不能相加。\n\n排查与优化：结合每张表 acquiring/acquired 日志区分某一张表长时间阻塞和大量表调用累计。定位数据库阻塞会话，合理安排快照时间并检查网络和查询超时。\n\n指标：`dameng_snapshot_lock_wait_seconds`。",
+      "gridPos": {
+        "x": 16,
+        "y": 13,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_lock_wait_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 41,
+      "type": "stat",
+      "title": "公共快照待完成表",
+      "description": "含义与单位：公共 RemainingTableCount，单位张，表示公共快照进度监听器尚未报告完成的表。初始和增量快照共用部分指标，不能将该值单独当作增量快照剩余表数。\n\n判读：不是剩余行数或未加锁表数；no_data 不扫描存量。增量快照应看独立区域中的当前表、阶段、读取和入队计数。\n\n排查与优化：结合对应快照日志区分大表读取、CLOSE 等待和下游背压；评估 snapshot.fetch.size 和 incremental.snapshot.chunk.size，不能只增加超时。\n\n指标：dameng_snapshot_remaining_tables。",
+      "gridPos": {
+        "x": 20,
+        "y": 13,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_remaining_tables{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 42,
+      "type": "stat",
+      "title": "最近持锁时长 · 5 分钟",
+      "description": "含义与单位：最近一次确认释放锁的快照事务持锁时长，单位秒；LastSnapshotLockStatisticsAvailable=1 时才显示。\n\n判读：结果保留 5 分钟，新快照开始、JMX reset 或 Task 重启会清除；过期无数据不表示没有持锁。快照失败后若回滚成功也可留下结果，因此有结果不代表快照成功。\n\n排查与优化：持锁长时与同次累计/最长单表获取耗时比较：获取慢查锁冲突，获取快查读取和下游。超过即时保留期用历史曲线或 released 日志，历史期限由 Prometheus 存储配置决定。\n\n指标：`dameng_snapshot_last_lock_hold_seconds`、`dameng_snapshot_last_lock_statistics_available`。",
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_last_lock_hold_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_snapshot_last_lock_statistics_available{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无近期结果"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 43,
+      "type": "stat",
+      "title": "最近累计获取锁耗时",
+      "description": "含义与单位：最近一次确认释放锁的快照中，所有 LOCK TABLE 调用耗时之和，单位秒，包含失败尝试。\n\n判读：结果即时保留 5 分钟并由 available 标志过滤；新快照或指标重置会清除。它与持锁时长可能重叠，不是纯数据库阻塞时间，也不保证快照成功。\n\n排查与优化：与最近最长单表获取耗时和锁表数联看。累计高而单表最大不高时关注表数量、JDBC 往返；单表最大接近累计时从日志定位该表和阻塞事务。\n\n指标：`dameng_snapshot_last_lock_statistics_available`、`dameng_snapshot_last_lock_wait_seconds`。",
+      "gridPos": {
+        "x": 6,
+        "y": 17,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_last_lock_wait_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_snapshot_last_lock_statistics_available{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无近期结果"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 44,
+      "type": "stat",
+      "title": "最近最长单表获取锁耗时",
+      "description": "含义与单位：最近一次确认释放锁的快照中，单次 LOCK TABLE 获取调用的最大耗时，单位秒，失败的尝试也参与最大值。\n\n判读：不是该表持锁时长，也不包含表名；即时结果保留 5 分钟，新快照或指标重置清除，历史曲线仍受 Prometheus 保留期控制。\n\n排查与优化：从 acquiring/acquired/could not acquire 日志对应表和耗时，检查主库阻塞事务、权限和网络。较大值不应直接通过提高超时解决。\n\n指标：`dameng_snapshot_last_lock_statistics_available`、`dameng_snapshot_last_max_lock_wait_seconds`。",
+      "gridPos": {
+        "x": 12,
+        "y": 17,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_last_max_lock_wait_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_snapshot_last_lock_statistics_available{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无近期结果"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 45,
+      "type": "stat",
+      "title": "最近快照锁表数量",
+      "description": "含义与单位：最近一次确认释放锁的快照事务成功锁住的表数，单位张；仅 available=1 时显示。\n\n判读：失败获取的表不计入，所以失败快照可能小于计划范围。结果保留 5 分钟；无数据不等于零张，零张也可能是第一次加锁就失败后成功回滚。\n\n排查与优化：对照此次快照日志、过滤范围和任务状态。数量异常时先确认是否发生失败或重新快照，不要据此直接放宽采集权限或扩大捕获范围。\n\n指标：`dameng_snapshot_last_lock_statistics_available`、`dameng_snapshot_last_locked_tables`。",
+      "gridPos": {
+        "x": 18,
+        "y": 17,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_last_locked_tables{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_snapshot_last_lock_statistics_available{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无近期结果"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 46,
+      "type": "timeseries",
+      "title": "实时快照 · 获取锁与持锁",
+      "description": "含义与单位：「累计获取锁」是本次所有 LOCK TABLE 调用耗时；「持锁」从首张表成功加锁计到确认释放。两条线单位均为秒，释放后清零。\n\n判读：两种时间重叠，不能相加。默认 15 秒抓取可能看不到短暂快照，零值不能证明从未加锁；回滚失败时当前持锁仍可能持续。\n\n排查与优化：获取锁持续增长查阻塞会话；持锁增长而获取已稳定时查快照读取、备库等待、队列和 Producer。短过程看最近结果和每表/释放日志；按诊断需要评估抓取频率。\n\n指标：`dameng_snapshot_lock_hold_seconds`、`dameng_snapshot_lock_wait_seconds`。",
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_lock_wait_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "累计获取锁",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_lock_hold_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "持锁",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "最近窗口"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#38BDF8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "生命周期最大值"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FBBF24"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 47,
+      "type": "timeseries",
+      "title": "完成快照 · 持锁记录",
+      "description": "含义与单位：每次快照确认回滚释放锁后发布的持锁总时长与获取锁累计耗时，单位秒；结果在曲线上保留为最长 5 分钟的可见区段。\n\n判读：曲线区段宽度是指标保留时间，纵轴才是实际耗时。新快照会提前清除旧值；失败快照成功回滚也可产生结果，回滚失败不发布已释放结果。历史由 Prometheus 存储保留期决定。\n\n排查与优化：回看业务受影响时段并关联日志，区分锁竞争和读取/发送拖长持锁。若抓取间隔超过保留时间可能漏掉结果，改用合理采集周期并保留释放日志。\n\n指标：`dameng_snapshot_last_lock_hold_seconds`、`dameng_snapshot_last_lock_statistics_available`、`dameng_snapshot_last_lock_wait_seconds`。",
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_last_lock_hold_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_snapshot_last_lock_statistics_available{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "完成持锁",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_snapshot_last_lock_wait_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_snapshot_last_lock_statistics_available{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "完成获取锁",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "最近窗口"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#38BDF8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "生命周期最大值"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FBBF24"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 62,
+      "type": "row",
+      "title": "Incremental Snapshot · 增量快照",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 63,
+      "type": "stat",
+      "title": "增量快照运行",
+      "description": "含义与单位：独立增量快照状态，1 为存在尚未完成的增量快照，0 为当前无增量快照。\n\n判读：暂停期间仍为 1；与初始快照/共享表锁指标分开。失败看阶段和 Task 状态，0 不代表补数成功。\n\n排查与优化：长期运行时依次检查读块、CLOSE 确认、备库回放和事件队列。\n\n指标：dameng_incremental_snapshot_running。",
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "未运行",
+                  "color": "blue"
+                },
+                "1": {
+                  "text": "进行中",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 64,
+      "type": "stat",
+      "title": "增量快照暂停",
+      "description": "含义与单位：1 为增量快照已暂停，0 为未暂停。\n\n判读：暂停时 Running 仍为 1；采样间隔内的短暂停可能不可见。\n\n排查与优化：确认是否发送过 pause-snapshot，按业务计划恢复；暂停不是增加 chunk.size 能解决的性能问题。\n\n指标：dameng_incremental_snapshot_paused。",
+      "gridPos": {
+        "x": 3,
+        "y": 29,
+        "w": 3,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_paused{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "未暂停",
+                  "color": "blue"
+                },
+                "1": {
+                  "text": "已暂停",
+                  "color": "orange"
+                }
+              }
+            }
+          ],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 65,
+      "type": "stat",
+      "title": "当前增量快照表",
+      "description": "含义与单位：显示当前表名，包含实际 schema/table 标识；不同源以 server 和 Worker 区分。\n\n判读：无当前表时不导出该 series；面板还按 running 过滤，失败后即使底层保留表名也会隐藏。抓取间隔可能看不到短暂处理的小表。表名是当前样本标签，不是每表历史吞吐统计。\n\n排查与优化：某表长期不变时对照阶段及耗时；reading 查主键索引/执行计划，waiting_close 查信号归档与挖掘，emitting 查队列和 Producer。\n\n指标：dameng_incremental_snapshot_current_table。",
+      "gridPos": {
+        "x": 6,
+        "y": 29,
+        "w": 9,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_current_table{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and ignoring(table) (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "{{server}} · {{table}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "当前无增量表"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26,
+          "titleSize": 19
+        }
+      }
+    },
+    {
+      "id": 66,
+      "type": "stat",
+      "title": "当前增量快照阶段",
+      "description": "含义与单位：当前阶段标签：idle 空闲、preparing 准备/写 OPEN、reading 查询本块、waiting_close 等待 CLOSE 被处理、emitting 发送缓存、paused 暂停、failed 失败。\n\n判读：这是抓取时刻的状态，短阶段可能漏采；不是每阶段耗时占比。暂停是有未完成工作。\n\n排查与优化：reading 查 JDBC/索引，waiting_close 查主备回放、信号可见性及 LogMiner；emitting 查队列、转换和下游；failed 查 Task 日志。\n\n指标：dameng_incremental_snapshot_phase。",
+      "gridPos": {
+        "x": 15,
+        "y": 29,
+        "w": 9,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_phase{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "{{server}} · {{phase}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26,
+          "titleSize": 19
+        }
+      }
+    },
+    {
+      "id": 67,
+      "type": "stat",
+      "title": "增量读取速度 · 行/s",
+      "description": "含义与单位：增量 JDBC 读取行数的两分钟平均增长率，单位行/秒。\n\n判读：两分钟平均速率，需至少两个样本；逐源和 Worker 保留标签。Task 重启 counter 清零由 rate 处理，采样不足显示暂无数据；不代表 Kafka 确认速度。读取可包含重试重读和随后被 CDC 去重的行。\n\n排查与优化：低速时对比本块查询耗时和 CLOSE 等待；固定每块等待高可对照调整 chunk.size，查询慢优先查执行计划与 snapshot.fetch.size。\n\n指标：dameng:incremental_snapshot_scan_rate_rows。",
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:incremental_snapshot_scan_rate_rows{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:行/s",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 68,
+      "type": "stat",
+      "title": "增量入队速度 · 行/s",
+      "description": "含义与单位：增量快照行事件成功 dispatch 入队的两分钟平均增长率，单位行/秒；不含流式 DML。\n\n判读：两分钟平均速率，需至少两个样本；逐源和 Worker 保留标签。Task 重启 counter 清零由 rate 处理，采样不足显示暂无数据；不代表 Kafka 确认速度。CDC 去重、过滤或重读使读取与入队数量不同，不能直接相减当丢失行数。\n\n排查与优化：读取快而入队慢查 CLOSE 水位等待和发送耗时；发送慢且队列满查 Worker、Producer 与 Broker。\n\n指标：dameng:incremental_snapshot_enqueue_rate_rows。",
+      "gridPos": {
+        "x": 6,
+        "y": 33,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:incremental_snapshot_enqueue_rate_rows{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:行/s",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 69,
+      "type": "stat",
+      "title": "累计读取 · Task 生命周期",
+      "description": "含义与单位：本 Task 生命周期内所有增量快照累计 JDBC 读取行数，单位行。\n\n判读：不是本次快照或当前表进度，包含重读和随后去重的行；Task 重启清零。没有总行数百分比或 ETA。\n\n排查与优化：用速率观察当前进度；判断补数完整性仍需核对快照完成信号、日志和业务数据。\n\n指标：dameng_incremental_snapshot_rows_scanned_total。",
+      "gridPos": {
+        "x": 12,
+        "y": 33,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_rows_scanned_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 70,
+      "type": "stat",
+      "title": "累计入队 · Task 生命周期",
+      "description": "含义与单位：本 Task 生命周期内增量快照成功 dispatch 入队的行事件累计数，单位行。\n\n判读：不含流式 DML，不代表 Kafka 已确认或下游已消费；不是本次快照/当前表计数，Task 重启清零。\n\n排查与优化：入队增长停滞时结合当前阶段定位；核对最终交付另查 Connect 写入、Kafka 和消费者。\n\n指标：dameng_incremental_snapshot_rows_enqueued_total。",
+      "gridPos": {
+        "x": 18,
+        "y": 33,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_rows_enqueued_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 71,
+      "type": "timeseries",
+      "title": "增量快照 · 读取与入队速度",
+      "description": "含义与单位：两分钟平均读取和成功入队速率，单位行/秒，按源与 Worker 分开。\n\n判读：两分钟平均速率，需至少两个样本；逐源和 Worker 保留标签。Task 重启 counter 清零由 rate 处理，采样不足显示暂无数据；不代表 Kafka 确认速度。每块批量更新会产生脉冲；去重后入队可能少于读取，不能推断丢数。\n\n排查与优化：读取和入队同步低查读块及固定水位等待；读取高、入队低查 CLOSE 与发送背压。增大 chunk.size 前评估行宽、堆内存及 CDC 延迟。\n\n指标：dameng:incremental_snapshot_scan_rate_rows、dameng:incremental_snapshot_enqueue_rate_rows。",
+      "gridPos": {
+        "x": 0,
+        "y": 37,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:incremental_snapshot_scan_rate_rows{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "读取 行/s · {{server}} · {{instance}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:incremental_snapshot_enqueue_rate_rows{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "入队 行/s · {{server}} · {{instance}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:行/s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 72,
+      "type": "timeseries",
+      "title": "每块耗时 · 查询 / CLOSE / 发送",
+      "description": "含义与单位：最近完成的读块、CLOSE 确认等待和缓存发送耗时，单位秒。\n\n判读：保留最近测量，非实时累计；只有增量 Running=1 才显示，阶段刚开始尚无新结果时可能显示上块结果。各测量口径不是完整总耗时，不能作为完整性能占比。\n\n排查与优化：查询高查主键索引、SQL、网络/fetch 和转换；CLOSE 高查信号提交/归档可见性、备库回放与 LogMiner；发送高查转换、队列与下游。零归档积压不能排除水位等待。\n\n指标：dameng_incremental_snapshot_last_query_duration_seconds、dameng_incremental_snapshot_last_close_wait_duration_seconds、dameng_incremental_snapshot_last_emit_duration_seconds。",
+      "gridPos": {
+        "x": 12,
+        "y": 37,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_last_query_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "最近查询 · {{server}} · {{instance}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_last_close_wait_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "最近 CLOSE 等待 · {{server}} · {{instance}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_last_emit_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "最近缓存发送 · {{server}} · {{instance}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 73,
+      "type": "stat",
+      "title": "已完成块 · Task 生命周期",
+      "description": "含义与单位：本 Task 生命周期内成功完成发送的增量快照窗口数，单位块。\n\n判读：不是业务事务数或本次快照块数，Task 重启清零；最后一块可能不足 chunk.size，不能用块数乘块大小当准确行数。\n\n排查与优化：块完成间隔长时结合各阶段定位；不要通过降低一致性保障换取更高块数。\n\n指标：dameng_incremental_snapshot_windows_completed_total。",
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_windows_completed_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 79,
+      "type": "stat",
+      "title": "剩余增量快照表",
+      "description": "含义与单位：尚未完成的增量快照表数，单位张，包含当前正在处理的表；任务完成后为 0，暂停期间保留。\n\n判读：这是增量专属状态，不是公共 RemainingTableCount。不是剩余行数、百分比或预计耗时；一张大表可能长时间保持 1。\n\n排查与优化：结合当前表、阶段和读取/入队速率区分慢表、水位等待或下游背压。不要按表数推算已处理数据比例，也不要仅为让数量下降而跳过失败表。\n\n指标：dameng_incremental_snapshot_remaining_tables。",
+      "gridPos": {
+        "x": 4,
+        "y": 45,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_remaining_tables{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"}",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 74,
+      "type": "stat",
+      "title": "当前 CLOSE 等待",
+      "description": "含义与单位：当前块从 CLOSE 写入提交返回后，到对应 CLOSE 被处理的已等待时长，单位秒。\n\n判读：底层只要存在未处理 CLOSE 就继续计时，暂停期间也可能增长；面板为避免误读，仅在 waiting_close 阶段显示，暂停时隐藏是 UI 策略。不是纯数据库挖掘耗时，含信号归档/主备回放可见性和扫描分发等待。\n\n排查与优化：等待持续增长查信号提交与日志、备库安全边界和挖掘窗口耗时；同时确认 Task 状态。不要因为扫描积压为零就排除此阶段。\n\n指标：dameng_incremental_snapshot_current_close_wait_duration_seconds。",
+      "gridPos": {
+        "x": 8,
+        "y": 45,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_current_close_wait_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and ignoring(phase) (dameng_incremental_snapshot_phase{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\",phase=\"waiting_close\"} == 1) and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 75,
+      "type": "stat",
+      "title": "最近本块查询",
+      "description": "含义与单位：最近完成的增量读块耗时，单位秒，包含 JDBC 查询、fetch、类型转换与去重缓存构建。\n\n判读：只在完成后更新，读取进行中保持前一块值；任务无增量工作后隐藏，零值也可能尚无样本。\n\n排查与优化：高耗时检查块 SQL、主键/复合键索引、执行计划、驱动与网络；snapshot.fetch.size 是 fetch 提示，chunk.size 是整块上限，分别验证。\n\n指标：dameng_incremental_snapshot_last_query_duration_seconds。",
+      "gridPos": {
+        "x": 12,
+        "y": 45,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_last_query_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 76,
+      "type": "stat",
+      "title": "最近 CLOSE 等待",
+      "description": "含义与单位：最近完成的 CLOSE 水位确认等待，单位秒。\n\n判读：在对应 CLOSE 被处理后更新；等待中仍保留上一块结果，当前值看旁边实时等待卡片。任务结束后隐藏，不表示确认已到 Kafka。\n\n排查与优化：高耗时检查信号归档/备库回放与 LogMiner 窗口和分发，不能仅凭零积压判断无等待。\n\n指标：dameng_incremental_snapshot_last_close_wait_duration_seconds。",
+      "gridPos": {
+        "x": 16,
+        "y": 45,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_last_close_wait_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 77,
+      "type": "stat",
+      "title": "最近本块发送",
+      "description": "含义与单位：最近完成的增量缓存发送耗时，单位秒，含转换、分发和队列等待。\n\n判读：发送完成后才更新；任务结束后隐藏。入队成功不代表 Kafka ack，队列等待和流式 dispatch 统计可能重叠。\n\n排查与优化：高耗时结合队列占用和队列满等待；下游慢查 Producer 批次/请求延迟、Broker、序列化和 SMT，不能单靠增大挖掘窗口解决。\n\n指标：dameng_incremental_snapshot_last_emit_duration_seconds。",
+      "gridPos": {
+        "x": 20,
+        "y": 45,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_incremental_snapshot_last_emit_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} and (dameng_incremental_snapshot_running{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\",context=\"snapshot\"} == 1)",
+          "legendFormat": "{{server}} · {{instance}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 26
+        }
+      }
+    },
+    {
+      "id": 78,
+      "type": "text",
+      "title": "增量快照 · 如何读这一区域",
+      "description": "含义与单位：增量快照按 OPEN、查询、CLOSE 确认、发送串行推进。本说明解释指标之间的关系。\n\n判读：扫描速度、入队速度、Kafka 确认和下游消费分别属于不同阶段；累计行数是 Task 生命周期，不是本次快照。\n\n排查与优化：先定位耗时，再单参数对照调整；保持 CDC 一致性和足够内存预算。",
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 24,
+        "h": 6
+      },
+      "transparent": false,
+      "options": {
+        "mode": "markdown",
+        "content": "🟦 **reading 慢**：查主键索引、分块 SQL、执行计划、JDBC fetch/网络及转换。snapshot.fetch.size 与 incremental.snapshot.chunk.size 作用不同。\n\n🟨 **waiting_close 慢**：查信号提交、归档可见性、备库回放、LogMiner 扫描与分发；**扫描积压为零仍可能等待水位**。准备阶段还可包含 OPEN 提交与备库屏障，不计入 CLOSE 等待。\n\n🟪 **emitting 慢**：查队列满等待、序列化/SMT、Producer 和 Broker。入队速率仅统计增量快照事件，**不是 Kafka 确认速率**。\n\n每次块查询和发送都在当前流程串行执行。更大的块可能摊薄固定等待，也增加去重缓存、单次停顿和 CDC 延迟；用相同负载对照验证。累计计数跨本 Task 的多次快照，重启清零；没有可靠总行数时不计算百分比或 ETA。"
+      }
+    },
+    {
+      "id": 48,
+      "type": "row",
+      "title": "Streaming · 日志挖掘与事件队列",
+      "description": "含义与单位：本区域按源标识 topic.prefix 展示 LSN、事务恢复范围、挖掘窗口、事件队列与阶段耗时。\n\n判读：选择单个源便于定位；All 下概览有 sum/max 聚合，多条曲线可能同名。内存重放位置与扫描上界均不代表 Kafka 已提交 offset。\n\n排查与优化：先判断可安全读取的日志是否充足，再区分前进挖掘、历史重建和下游等待。窗口策略必须用实际吞吐验证，不能只看积压大小或单轮耗时。",
+      "gridPos": {
+        "x": 0,
+        "y": 55,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "日志位置 · 归档 / 扫描 / 重放",
+      "description": "含义与单位：三条线分别是最近归档上界、已完成挖掘的扫描上界，以及内存中的安全重放起点，单位 LSN。\n\n判读：归档减扫描是待扫描范围；扫描减重放是恢复保留范围。扫描上界在分发前即可更新，重放起点需在窗口完成后更新；两者都不是 Kafka 的持久化确认。备库还需看安全挖掘上界。\n\n排查与优化：归档增长但扫描停滞查窗口、数据库调用和下游；扫描前进而重放不动查未完成事务或恢复重建需求。保留覆盖持久化恢复位置的归档，临时落盘缓存不能替代重启所需日志。\n\n指标：`dameng_latest_archived_lsn`、`dameng_replay_lsn`、`dameng_scanned_upper_lsn`。",
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 15,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_latest_archived_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "归档上界",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_scanned_upper_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "扫描上界",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_replay_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "重放起点",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 3,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "归档上界"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FBBF24"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "扫描上界"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#38BDF8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "重放起点"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#A78BFA"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "待扫描积压 · 越接近零越好",
+      "description": "含义与单位：每个源的 max(归档上界 − 扫描上界, 0)，单位 LSN，由 dameng:scan_backlog_lsn 记录规则生成。\n\n判读：主要看趋势：下降说明在追赶，上涨说明扫描落后；零只表示扫描追平所观测归档，不保证 Kafka 或业务消费者已经追平。备库积压还可能来自尚未安全重放的归档。\n\n排查与优化：有积压时联看扫描/归档速率和阶段耗时；评估扩窗后用积压下降速度验证收益，同时观察发送等待和内存。不要通过跳到最新 LSN 来掩盖性能问题。无值检查规则加载与输入指标。\n\n指标：`dameng:scan_backlog_lsn`。",
+      "gridPos": {
+        "x": 15,
+        "y": 56,
+        "w": 9,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:scan_backlog_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "待扫描 LSN",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "待扫描 LSN"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FB7185"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "追赶能力 · 扫描与归档增长",
+      "description": "含义与单位：扫描速度和归档增长都是过去 2 分钟 LSN gauge 的回归斜率，负值截为 0；净追赶速度=扫描速度−归档增长，单位 LSN/秒。\n\n判读：同一源持续正值表示具有消化积压能力，负值表示继续落后。追平后通常接近 0，不需要一直为正。含初始零值/位置回退时相关速率暂不显示；短时波动受归档分批更新影响。\n\n排查与优化：在相近负载下比较调整前后的趋势，先定位前进挖掘、重建或发送瓶颈。备库同时检查重放边界；缺数据核对记录规则和两分钟样本。不要把 LSN/秒当作行/秒。\n\n指标：`dameng:archive_rate_lsn`、`dameng:scan_rate_lsn`。",
+      "gridPos": {
+        "x": 0,
+        "y": 65,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:scan_rate_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "扫描速度",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:archive_rate_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "归档增长",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:scan_rate_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"} - dameng:archive_rate_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "净追赶速度",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: LSN/s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "扫描速度"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#38BDF8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "归档增长"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FBBF24"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "净追赶速度"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2DD4BF"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "事件吞吐 · INSERT / UPDATE / DELETE",
+      "description": "含义与单位：streaming 上下文 CREATE、UPDATE、DELETE 事件计数分别求 2 分钟 rate，单位条/秒。\n\n判读：一条影响多行的 SQL 可以产生多条行事件。公共计数在带操作类型的过滤/错误回调中也可增长，不能拿这些曲线直接对账 Kafka；READ、TRUNCATE 等不属于这三条曲线，恢复回放也会影响计数。\n\n排查与优化：某类事件长期异常为零时查源端实际操作、事务提交、捕获/转换过滤和日志。原始计数有值但曲线无数据时，用 count_over_time(dameng_create_events_total{context=\"streaming\"}[2m]) 检查同一序列是否至少有两个样本；再核对抓取间隔和失败记录。数据一致性需要按主键和事件语义对账，不能只比较计数。\n\n指标：`dameng_create_events_total`、`dameng_delete_events_total`、`dameng_update_events_total`。",
+      "gridPos": {
+        "x": 12,
+        "y": 65,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(dameng_create_events_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "INSERT",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(dameng_update_events_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "UPDATE",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(dameng_delete_events_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "DELETE",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: 条/s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "INSERT"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2DD4BF"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "UPDATE"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#38BDF8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "DELETE"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FB7185"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "流式连接",
+      "description": "含义与单位：Connector 流式阶段报告的连接状态：1 为已连接，0 为未连接；卡片取所选源最小值。\n\n判读：属于运行状态标志，不是每次 scrape 都重新探测 JDBC；1 不保证日志正在推进或 Kafka 正常。无指标可能是 Task 未运行、未进入流式阶段或筛选不匹配。\n\n排查与优化：0 或无值时查看 REST Task 状态和失败堆栈，检查数据库网络、权限、角色和主备切换。1 但无进度时继续查归档供应、窗口耗时及队列等待。\n\n指标：`dameng_connected`。",
+      "gridPos": {
+        "x": 0,
+        "y": 73,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "min(dameng_connected{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "value": 1,
+                "color": "green"
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "未连接",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "已连接",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "待重放事务",
+      "description": "含义与单位：事务缓存中尚未看到提交且未判定整事务回滚的事务数，单位笔；取所选源最大值，随挖掘和窗口处理更新。\n\n判读：是挖掘进度视角，不是数据库当前活动事务数。数据库已提交但 COMMIT 尚未扫描到的事务仍会计入；数量少也可能是一笔很大的事务。\n\n排查与优化：结合重放起点、扫描进度、事务缓存内存/磁盘和源端长事务定位。长期不降时区分扫描落后与未提交事务；合理安排业务事务大小和归档保留，按实测堆/磁盘容量配置事务缓存。\n\n指标：`dameng_open_transactions`。",
+      "gridPos": {
+        "x": 4,
+        "y": 73,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(dameng_open_transactions{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#A78BFA",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "重放跨度 · LSN",
+      "description": "含义与单位：max(扫描上界 − 安全重放起点, 0)，单位 LSN；卡片取所选源最大恢复跨度。\n\n判读：表示当前内存状态依赖的恢复范围，不是每轮实际重读量或重读倍数。前向窗口会缓存跨窗口事务，只有需要重建时才重读；持久化 offset 可能比内存位置更旧。\n\n排查与优化：跨度持续增加时查长事务、未完成事务与历史重建耗时。保留更早持久化位置需要的归档；单纯调小窗口不能让长期未提交事务消失。无值检查 dameng-cdc 记录规则。\n\n指标：`dameng:replay_span_lsn`。",
+      "gridPos": {
+        "x": 8,
+        "y": 73,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(dameng:replay_span_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#A78BFA",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "窗口累计估算",
+      "description": "含义与单位：当前或最近一次挖掘会话累计读取记录的估算字节，包含 SQL 分片、随后丢弃的记录等，卡片取所选源最大值。\n\n判读：每次会话重新累计，历史重建可覆盖前向读数。它是输入工作量，不是驻留内存、JVM 堆或归档文件大小；旧累计预算已废弃，该值本身不会触发停止。\n\n排查与优化：值大且挖掘慢时结合每窗口记录数和重建判断工作量。内存问题看 JVM 堆和 dameng_transaction_buffer_memory_bytes，落盘问题看 dameng_transaction_buffer_disk_bytes 及磁盘；不要再调整已忽略的 log.mining.buffer.max.bytes/max.records。\n\n指标：`dameng_window_buffer_estimated_bytes`。",
+      "gridPos": {
+        "x": 12,
+        "y": 73,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(dameng_window_buffer_estimated_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#38BDF8",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "窗口容量失败",
+      "description": "含义与单位：事务缓冲器报告容量越界的累计次数，卡片对所选源求和；Task 重建或指标 reset 后归零。保留旧标题，但不是窗口累计输入预算超限。\n\n判读：主要涉及单条 SQL payload、事务元数据/数量等不可继续缓存的限制；磁盘满、落盘限额和 I/O 异常须另外查日志，零值不能排除这些错误。该累计卡片也不是最近 5 分钟失败次数。\n\n排查与优化：按失败日志区分 log.mining.buffer.max.sql.bytes、log.mining.buffer.max.transactions、log.mining.buffer.memory.bytes 与 log.mining.buffer.spill.max.bytes，再评估资源并调整相应限制。避免把所有阈值一次调大；窗口失败时不要跳过恢复所需归档。\n\n指标：`dameng_buffer_limit_failures_total`。",
+      "gridPos": {
+        "x": 16,
+        "y": 73,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(dameng_buffer_limit_failures_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              },
+              {
+                "value": 1,
+                "color": "red"
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "发送错误 · 5 分钟",
+      "description": "含义与单位：业务 Producer record-errors-total 在最近 5 分钟的 increase，并对所选 Producer 求和，单位失败记录数。\n\n判读：统计发送错误，不是可重试次数，也不是数据库解析错误。Prometheus 根据采样外推，可能出现小数；没有样本不等于 0，Task 状态和完整错误范围仍需查日志。\n\n排查与优化：出现增长时优先看 Producer/Task 异常、Topic 权限、消息大小限制、Broker 可用性、超时和网络。不要靠降低 acks 或跳过失败记录换吞吐；恢复后核对重试和数据一致性。\n\n指标：`kafka_producer_record_errors_total`。",
+      "gridPos": {
+        "x": 20,
+        "y": 73,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(kafka_producer_record_errors_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              },
+              {
+                "value": 1,
+                "color": "red"
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "暂无数据"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32
+        }
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "事务恢复范围 · 与窗口耗时一起看",
+      "description": "含义与单位：扫描上界减安全重放起点的非负差值，单位 LSN，展示恢复保留范围的变化。\n\n判读：跨度大并不证明当前正在重读。跨窗口未完成事务可钉住起点，前向扫描仍能继续；重建发生时范围可能远大于 log.mining.batch.size。\n\n排查与优化：与待重放事务、历史重建耗时/会话数、窗口耗时一起看。长事务导致范围扩大时协调业务事务和归档保留；重建频繁时查提交/回滚边界。记录规则缺失时会无值。\n\n指标：`dameng:replay_span_lsn`。",
+      "gridPos": {
+        "x": 0,
+        "y": 77,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:replay_span_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "重放跨度",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 18,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "重放跨度"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#A78BFA"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "LogMiner 窗口耗时",
+      "description": "含义与单位：「最近窗口」为最近记录的挖掘耗时；「生命周期最大值」为指标初始化或 reset 后的最大值，单位秒。会话结束和完整窗口挖掘完成都会更新。\n\n判读：完成窗口读数含归档校验、前进挖掘、重建和结束前校验，不含之后事件解析发送；抓取也可能看到中间会话值。最大值不是所选时间段最大值，旧尖峰不会随故障恢复自动下降。\n\n排查与优化：先查最近成功轮次的 forward/reconstruction/dispatch 三项秒数。前进慢时拆查归档、LogMiner 启停、查询、JDBC、缓存落盘和 GC；扩大窗口可能摊薄固定开销，应比较吞吐与积压，不按单轮时长直接判断好坏。\n\n指标：`dameng_last_mining_duration_seconds`、`dameng_max_mining_duration_seconds`。",
+      "gridPos": {
+        "x": 12,
+        "y": 77,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_last_mining_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "最近窗口",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_max_mining_duration_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "生命周期最大值",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "最近窗口"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#38BDF8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "生命周期最大值"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FBBF24"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "窗口累计估算与生命周期峰值",
+      "description": "含义与单位：当前或最近会话的累计输入估算字节及指标生命周期峰值，单位字节；包括 SQL 分片和已丢弃/落盘的记录。\n\n判读：当前累计每次会话重新开始，峰值仅在初始化或 reset 后清零。二者不是实际堆占用，也不是峰值瞬时驻留量；历史重建会增加工作量但不一定同比增加常驻内存。\n\n排查与优化：与读取记录数、重建次数和窗口耗时联看。调事务缓存需看 resident memory/disk 指标和 GC；旧 log.mining.buffer.max.bytes/max.records 已忽略，不用累计量设置停止阈值。\n\n指标：`dameng_peak_window_buffer_estimated_bytes`、`dameng_window_buffer_estimated_bytes`。",
+      "gridPos": {
+        "x": 0,
+        "y": 85,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_window_buffer_estimated_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "窗口累计估算",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_peak_window_buffer_estimated_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "生命周期峰值",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "窗口累计估算"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#38BDF8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "生命周期峰值"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FBBF24"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "事件队列占用趋势",
+      "description": "含义与单位：事件队列按条数计算的占用比例，0～1 显示为百分比，由总容量和剩余容量计算。\n\n判读：持续满表示下游消费跟不上；低占用可能是上游慢或空闲。启用队列字节上限时，字节占满可能先于条数占满；该曲线不是入队等待时间。\n\n排查与优化：联看 dameng_queue_enqueue_wait_seconds_total、Producer 可用缓冲、缓冲等待和请求延迟。先提高瓶颈阶段吞吐，再评估 max.queue.size / max.queue.size.in.bytes 承接突发所需的堆空间；缺值检查 recording rules。\n\n指标：`dameng:queue_fill_ratio`。",
+      "gridPos": {
+        "x": 12,
+        "y": 85,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng:queue_fill_ratio{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "队列占用",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "队列占用"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2DD4BF"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 57,
+      "type": "timeseries",
+      "title": "挖掘窗口 · 策略跨度与实际推进",
+      "description": "含义与单位：计划跨度是 archive_bytes 模式最近一次选中文件后得到的 LSN 范围；fixed 模式为配置的固定跨度。实际推进是最近成功轮次的 LSN 差，不是记录数，也不限制完整历史重建。\n\n判读：默认按文件 LEN 的 64 MiB 软预算选窗，LSN 跨度随文件边界变化。只支持 archive_bytes 和 fixed；不会根据单轮耗时自动扩大或缩小配置值。\n\n排查与优化：联看文件预算、所选文件总长度、前进/重建/入队耗时及积压趋势。用 log.mining.window.strategy=fixed、log.mining.batch.size=10000 作对照；文件模式调 log.mining.window.max.bytes。不要仅凭跨度变大判断性能改善。\n\n指标：`dameng_last_window_lsn_span`、`dameng_mining_window_lsn_span`。",
+      "gridPos": {
+        "x": 0,
+        "y": 93,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_mining_window_lsn_span{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "计划跨度 {{server}} {{instance}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_last_window_lsn_span{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "上轮实际推进",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 58,
+      "type": "timeseries",
+      "title": "挖掘与发送 · 阶段耗时速率",
+      "description": "含义与单位：对前进挖掘、历史重建、解析发送、队列满等待的累计秒数求 2 分钟 rate，单位秒/秒；0.4 表示窗口平均每秒新增 0.4 秒该阶段耗时，不是单轮耗时。\n\n判读：前进、重建、发送三项只在成功轮次完成后累计，长窗口集中更新会使短区间速率超过 1。发送包含解析、入队和事务释放；队列等待与发送重叠且可能有多个写线程，不能相加成总耗时，也不同于 Producer 缓冲等待。\n\n排查与优化：前进高查归档/LogMiner/JDBC/落盘；重建高查跨窗口提交回滚；发送高且等待低查解码、SMT、序列化和 GC；队列等待高查 Worker/Producer。延长观察范围平滑长窗口尖峰，旧插件无埋点时不能只改 Exporter 获取数据。\n\n指标：`dameng_dispatch_seconds_total`、`dameng_forward_mining_seconds_total`、`dameng_queue_enqueue_wait_seconds_total`、`dameng_reconstruction_seconds_total`。",
+      "gridPos": {
+        "x": 12,
+        "y": 93,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(dameng_forward_mining_seconds_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "前向挖掘 s/s",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(dameng_reconstruction_seconds_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "历史重建 s/s",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(dameng_dispatch_seconds_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "解析与发送 s/s",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(dameng_queue_enqueue_wait_seconds_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "队列满等待 s/s（与发送重叠）",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:s/s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 59,
+      "type": "timeseries",
+      "title": "Standby · 备库重放与安全挖掘边界",
+      "description": "含义与单位：备库 SLSN 表示允许重放边界，RPKG_LSN 表示已完成重放位置；安全挖掘上界取归档上界、SLSN、RPKG_LSN 三者最小值，单位 LSN。\n\n判读：面板过滤值为 0 的样本；非备库模式通常无曲线，无数据不能直接判断故障。归档领先并不表示全都可以安全挖掘，LSN 差也不是复制延迟秒数。\n\n排查与优化：SLSN/RPKG_LSN 落后先查主备复制确认、网络、备库 CPU/磁盘与重放；安全上界明显领先扫描位置时查 Connector 和发送链路。不能绕过安全边界来提高表面扫描速度。\n\n指标：`dameng_standby_mining_upper_lsn`、`dameng_standby_replayable_lsn`、`dameng_standby_replayed_lsn`。",
+      "gridPos": {
+        "x": 0,
+        "y": 100,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_standby_replayable_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\"} > 0",
+          "legendFormat": "允许重放 · SLSN {{server}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_standby_replayed_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\"} > 0",
+          "legendFormat": "已完成重放 · RPKG_LSN {{server}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_standby_mining_upper_lsn{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",server=~\"$server\"} > 0",
+          "legendFormat": "安全挖掘上界 {{server}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 3,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "归档文件 · 字节预算与选取规模",
+      "description": "含义与单位：预算是 log.mining.window.max.bytes，所选文件规模是选窗时完整文件 LEN 的总和，单位字节；包括已扫描部分、预分配空间和共享边界所需文件。不是本轮实际磁盘读取量、JVM 内存或历史重建大小。\n\n判读：archive_bytes 默认 64 MiB；末个文件、超大单文件及共享边界可超过预算。活动文件可能 LEN 很大但实际归档很少，不会等写满。其他策略预算为 0，空闲时保留最近选取值。\n\n排查与优化：积压较大且下游有余量时，用不同预算对照吞吐、延迟、重建次数和落盘。降低预算不保证缩小一个超大文件内的窗口。LEN 缺失时检查 V$ARCH_FILE 或显式回退 fixed；不得伪造字节估计。\n\n指标：`dameng_mining_window_byte_budget`、`dameng_selected_archive_file_bytes`。",
+      "gridPos": {
+        "x": 0,
+        "y": 108,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_mining_window_byte_budget{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "预算 {{server}} {{instance}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_selected_archive_file_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "所选文件 LEN {{server}} {{instance}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "归档文件 · 每轮所选文件数",
+      "description": "含义与单位：archive_bytes 模式最近选窗所需归档文件数量，含共享边界文件；选取时更新，不包括之后的历史重建。\n\n判读：文件数不是事务数或 LSN 跨度，同样数量的文件大小可能不同。空闲时保留最近值，JMX reset 清零，固定模式为 0。\n\n排查与优化：文件数多且总长度小时检查频繁归档切换；单文件较大时先观察字节面板，降低预算不会拆分完整文件。结合会话启动耗时判断是否值得扩大预算，持续背压先处理下游。\n\n指标：`dameng_selected_archive_file_count`。",
+      "gridPos": {
+        "x": 12,
+        "y": 108,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dameng_selected_archive_file_count{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",context=\"streaming\",server=~\"$server\",instance=~\"$instance\"}",
+          "legendFormat": "前向文件数 {{server}} {{instance}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 49,
+      "type": "row",
+      "title": "Kafka · 写入与发送",
+      "description": "含义与单位：本区域按 Connect 任务名选择业务 Producer，展示写出速率、请求与排队延迟、缓冲等待和批次效率。\n\n判读：Producer 通过默认 client_id=connector-producer-<connector>-<task> 匹配；覆盖客户端 ID 后需同步调整查询。源标识与任务名独立，应选同一采集任务；Worker 指标保留 task 标签。\n\n排查与优化：持续有负载且每请求一条、缓冲等待高时先查单条大小和实际 batch.size，再查请求延迟。Worker 用 producer.*，Connector 配置用 producer.override.* 且需覆盖策略允许；核对实际生效值后逐项对照。",
+      "gridPos": {
+        "x": 0,
+        "y": 115,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Kafka 写入 · Worker 与 Producer",
+      "description": "含义与单位：Worker 曲线是 source-record-write-rate，Producer 曲线是 record-send-rate，均为客户端滚动统计的条/秒，查询直接展示 gauge。\n\n判读：Worker 按成功写出回调统计并扣除被过滤记录；Producer 按发送记录统计，重试、SMT 过滤及统计窗口不同都可能导致曲线不一致。两者均不能证明下游业务已消费或 offset 已持久化。\n\n排查与优化：有积压但两条线低时先查挖掘供给，再查队列、批次、请求延迟、序列化/SMT。差距大时看重试、错误与过滤配置，不用两个速率简单相减判断丢消息。恢复回放允许至少一次重复。\n\n指标：`kafka_connect_source_write_rate_records`、`kafka_producer_record_send_rate_records`。",
+      "gridPos": {
+        "x": 0,
+        "y": 116,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_connect_source_write_rate_records{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",connector=~\"$connector\",instance=~\"$instance\"}",
+          "legendFormat": "Worker {{connector}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_producer_record_send_rate_records{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}",
+          "legendFormat": "Producer {{client_id}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: 条/s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Kafka 请求延迟与记录排队时间",
+      "description": "含义与单位：请求平均延迟是请求发出到响应的滚动平均时长；记录排队时间来自批次等待发送的 queue-time-avg，单位秒。\n\n判读：两者都不包含 Worker 在 BufferPool.allocate 中等待新缓冲的那段时间；也不等于端到端 CDC 延迟。空闲时平均值可能为 NaN，图例 lastNotNull 可能显示较早的值。\n\n排查与优化：请求慢查 Broker 磁盘、ISR/副本确认、网络和限流；请求快但排队/缓冲等待高查每请求记录数、分区分布、batch.size 和 linger.ms。保留确认与顺序保证，先做单参数对照。\n\n指标：`kafka_producer_record_queue_seconds`、`kafka_producer_request_latency_seconds`。",
+      "gridPos": {
+        "x": 12,
+        "y": 116,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_producer_request_latency_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}",
+          "legendFormat": "请求平均延迟",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_producer_record_queue_seconds{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}",
+          "legendFormat": "Producer 记录排队平均时间",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Producer 缓冲等待比例",
+      "description": "含义与单位：Kafka 滚动统计窗口内等待 Producer 缓冲分配的时间比例；0.04 显示 4%。不是缓冲占用率、消息失败率，也不是 Debezium 入队等待比例。\n\n判读：扩窗后集中发送可增加短时等待。4% 本身不能判异常；若同负载下积压下降且错误稳定，不应只为追求 0 而缩窗。与可用缓冲接近 0、队列满同时持续出现才更支持下游容量不足。\n\n排查与优化：持续每请求一条且请求快时查记录大小和 batch.size；16 KiB 批次可对照 64 KiB，必要时再单测 linger.ms=5。请求慢查 Broker/网络。buffer.memory 主要吸收突发，增加前评估多任务共享堆，保持 ACK 和顺序设置。\n\n指标：`kafka_producer_buffer_wait_ratio`。",
+      "gridPos": {
+        "x": 0,
+        "y": 124,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_producer_buffer_wait_ratio{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}",
+          "legendFormat": "{{client_id}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Kafka 网络输出",
+      "description": "含义与单位：业务 Producer 的 outgoing-byte-rate，单位字节/秒，包含其网络请求协议开销；压缩会影响发送字节量。\n\n判读：不是纯业务 JSON 大小、Broker 磁盘写入量或端到端带宽。重试和控制请求也会影响流量；多 Producer 曲线应按客户端区分。\n\n排查与优化：高流量伴随排队时查 Pod/Broker 网络、带宽和限流；可评估双方支持的 compression.type 并同时观察 CPU 和延迟。低流量但等待高可能是小批次/请求慢，先联看批次和请求延迟，不能只加网络带宽。\n\n指标：`kafka_producer_outgoing_rate_bytes`。",
+      "gridPos": {
+        "x": 12,
+        "y": 124,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_producer_outgoing_rate_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}",
+          "legendFormat": "{{client_id}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 52,
+      "type": "stat",
+      "title": "Producer 缓冲等待 · 所选时段",
+      "description": "含义与单位：对 Producer 缓冲分配等待累计秒数，在 Grafana 右上所选时间范围内计算 increase；瞬时查询按各业务 Producer 展示，单位秒。\n\n判读：处理可观察到的 counter reset 并对时间边界外推，因此是采样估算。起始样本前无法补采，少于有效样本时无值。与 Debezium 队列等待可能重叠，不能相加；不同长度的时间范围不可直接比总值。\n\n排查与优化：比较相同观察时长、业务负载和消息格式下调优前后的值，联看缓冲等待比例、批次、吞吐和积压。优先改善发送能力，再按内存余量评估缓存突发容量。\n\n指标：`kafka_producer_buffer_wait_seconds_total`。",
+      "gridPos": {
+        "x": 0,
+        "y": 131,
+        "w": 6,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "increase(kafka_producer_buffer_wait_seconds_total{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}[$__range])",
+          "legendFormat": "{{client_id}}",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#FBBF24",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "样本不足",
+          "displayName": "${__field.labels.client_id}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "text": {
+          "valueSize": 32,
+          "titleSize": 12
+        }
+      }
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "Producer 可用缓冲比例",
+      "description": "含义与单位：Producer buffer-available-bytes / buffer-total-bytes，0～1 显示为可用缓冲百分比。\n\n判读：越接近 0 表示可分配缓冲越少，不是 JVM 剩余堆比例。短时降到 0 后恢复可能只是发送突发；长期接近 0 且等待上升说明发送无法及时释放缓冲。\n\n排查与优化：联看批次、每请求记录数、请求延迟和 Kafka 写出。buffer.memory 可增加突发缓冲，但不能解决持续发送不足；每个任务有自己的 Producer，多任务时需要合计堆占用。\n\n指标：`kafka_producer_buffer_available_bytes`、`kafka_producer_buffer_capacity_bytes`。",
+      "gridPos": {
+        "x": 6,
+        "y": 131,
+        "w": 6,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_producer_buffer_available_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"} / kafka_producer_buffer_capacity_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}",
+          "legendFormat": "{{client_id}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Producer 每请求平均记录数",
+      "description": "含义与单位：records-per-request-avg：Producer 每个发送请求携带的平均记录数，单位条/请求，是 Kafka 滚动统计值。\n\n判读：请求可包含多个分区批次，所以不是每批记录数。每请求约 1 条不必然错误，低流量、消息分散、linger.ms=0 或单条记录较大都可能造成。无近期样本可为 NaN。\n\n排查与优化：持续有负载且缓冲等待上升时，核对实际 batch.size、单条大小和请求延迟。单条约 8 KiB 配 16 KiB 批次处于两条能否装下的边界；可单测 producer.override.batch.size=65536，仍小再评估 producer.override.linger.ms=5。Worker 配置用 producer.*，任务覆盖需策略允许；以积压、延迟和错误验证，不能保证每请求固定 8 条。\n\n指标：`kafka_producer_records_per_request`。",
+      "gridPos": {
+        "x": 12,
+        "y": 131,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_producer_records_per_request{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}",
+          "legendFormat": "{{client_id}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 55,
+      "type": "timeseries",
+      "title": "Producer 批次与记录大小",
+      "description": "含义与单位：「批次」为每分区发送 batch 大小估算的滚动均值，含批次开销并受压缩影响；「单条记录」在当前 Kafka 3.9.1 客户端中对每批最大记录的未压缩大小估算上界取滚动平均，单位字节，不是全部消息的算术平均或纯 JSON value 大小。\n\n判读：实际 batch 大小不是配置 batch.size，请求还可包含多个 batch。两条平均值不能直接相除得到精确条数，压缩开启时尤其如此；单条 8 KB 的平均值不能证明两条总能装入 16 KiB。\n\n排查与优化：批次与单条接近且有发送压力时查实际 batch.size、分区分布和 linger.ms。可先单测 64 KiB 批次，比较每请求记录数、等待、吞吐和内存；批次增大不会强制等待装满。无样本时不要把 NaN 当作 0。\n\n指标：`kafka_producer_batch_size_bytes`、`kafka_producer_record_size_bytes`。",
+      "gridPos": {
+        "x": 0,
+        "y": 137,
+        "w": 8,
+        "h": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_producer_batch_size_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}",
+          "legendFormat": "批次 · {{client_id}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kafka_producer_record_size_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",client_id=~\"connector-producer-$connector-[0-9]+\",instance=~\"$instance\"}",
+          "legendFormat": "单条记录 · {{client_id}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 56,
+      "type": "text",
+      "title": "缓冲等待 · 判断与优化方向",
+      "description": "含义与单位：本说明将 Debezium 队列等待、Producer 缓冲等待、发送批次和网络请求延迟串联起来，用于定位下游背压。\n\n判读：各阶段等待可能重叠；积压正在下降时，少量 Producer 等待不必立即调整。约 8 KiB 单条消息与 16 KiB 批次组合值得验证，但平均值不能确定每批实际条数。\n\n排查与优化：保持有效的挖掘窗口，先核对实际生效参数。Worker 级 producer.batch.size 或 Connector 级 producer.override.batch.size 可单测 65536；覆盖需策略允许，再按延迟预算评估 linger.ms。每次只改一项并比较相同负载。",
+      "gridPos": {
+        "x": 8,
+        "y": 137,
+        "w": 16,
+        "h": 10
+      },
+      "transparent": false,
+      "options": {
+        "mode": "markdown",
+        "content": "**如何形成等待**：Producer 缓冲耗尽 → Worker 等待分配内存、暂不继续 poll → Debezium 队列填满 → 挖掘线程等空位。缓冲等待比例不是队列占用率，累计等待也不是端到端延迟。\n\n**先看批次效率**：持续有负载、每请求约 1 条、请求延迟低而缓冲等待高时，优先评估 `producer.batch.size=65536`；再根据延迟预算小幅调整 `linger.ms`。Worker 使用 `producer.*`；单任务覆盖使用 `producer.override.*`，且须由 Worker 的 override policy 允许。\n\n**再看发送能力**：请求延迟高时检查 Broker 磁盘、网络和限流；网络带宽不足时评估压缩并观察 CPU。等待低但队列仍满时，继续查序列化、SMT 和 GC。`buffer.memory` 和事件队列容量主要吸收突发；增大 LogMiner 窗口不能修复下游瓶颈。\n\n**本地对照参考**：221 列、65,400 条事件、单分区单副本，批次 16 → 64 KiB 后耗时 32.2 → 17.9 秒，Producer 缓冲等待 22.1 → 0 秒。64 KiB 尚不是生产最优值；调优后需复核吞吐、延迟、内存、重试及数据一致性。保持 ACK 与顺序保障，不以降低可靠性换速度。\n\n**指标边界**：旧压测约 8 秒 Debezium 队列满等待来自 JFR。新版另有独立队列等待计时，需要更新 connector/common JAR；旧镜像无该指标。它与 Producer 等待重叠，不能相加。右上时间范围决定累计等待的范围；平均值来自 Kafka 滚动窗口，空闲时可能无数据。"
+      }
+    },
+    {
+      "id": 50,
+      "type": "row",
+      "title": "JVM · 内存与 GC",
+      "description": "含义与单位：本区域展示 Worker JVM 堆内存与各 GC 收集器的耗时。\n\n判读：同一 Worker 的多个 Connector 共用进程；选择源或 Connect 任务不会把 JVM 指标切分到该任务。JVM 堆不包含全部容器内存。\n\n排查与优化：结合容器内存/CPU 限额、事务缓存、队列和 Producer 缓冲综合评估。不要把每个任务的缓存都按整个 JVM 堆大小设置。",
+      "gridPos": {
+        "x": 0,
+        "y": 147,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "JVM 堆内存 · 实际使用量",
+      "description": "含义与单位：JVM heap 的已使用、已提交、最大容量，单位字节。已提交表示 JVM 当前已获得可用的堆容量，最大容量通常受 Xmx 限制。\n\n判读：不是 Pod RSS 或容器总内存；已提交不等于正在使用。所有 Task 共享该堆。Xms=Xmx 时已提交接近最大值可以是正常配置，判断压力需看已用量和 GC 后基线。\n\n排查与优化：持续增长且 GC 后不回落时用 JFR/堆分析定位事务缓存、队列、Producer 或其他对象。按容器限制为非堆、线程栈和文件缓存留余量；事务落盘可降低部分常驻内存，但要检查磁盘空间与吞吐。\n\n指标：`jvm_memory_committed_bytes`、`jvm_memory_max_bytes`、`jvm_memory_used_bytes`。",
+      "gridPos": {
+        "x": 0,
+        "y": 148,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "jvm_memory_used_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",area=\"heap\"}",
+          "legendFormat": "已使用堆",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "jvm_memory_committed_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",area=\"heap\"}",
+          "legendFormat": "已提交堆",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "jvm_memory_max_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\",area=\"heap\"}",
+          "legendFormat": "最大堆",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "已使用堆"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#38BDF8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "已提交堆"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#A78BFA"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "最大堆"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FBBF24"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "JVM GC 时间占比",
+      "description": "含义与单位：各 GC 收集器累计 collection time 的 2 分钟 rate，0.1 显示 10%，表示窗口平均每秒增加约 0.1 秒收集耗时。\n\n判读：不是完整应用暂停占比，收集器实现不同，多个 GC 曲线不能机械相加成停顿时间。短窗口和批量更新可能产生尖峰；长尾暂停还需 GC 日志或 JFR。\n\n排查与优化：持续升高时联看堆基线、分配速率、CPU 配额、批次及缓存大小。优先降低无效对象分配和过大的常驻缓存，再在容器内存预算内评估 Xmx/收集器设置，并验证吞吐与延迟。\n\n指标：`jvm_gc_collection_seconds_sum`。",
+      "gridPos": {
+        "x": 12,
+        "y": 148,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "transparent": false,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(jvm_gc_collection_seconds_sum{cluster=~\"$cluster\",namespace=~\"$namespace\",job=~\"$job\",instance=~\"$instance\"}[2m])",
+          "legendFormat": "{{gc}}",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 51,
+      "type": "row",
+      "title": "读数指南 · 排查与指标边界",
+      "description": "含义与单位：本区域汇总跨指标排查路径和指标边界，帮助把扫描、恢复、发送和资源问题分开。\n\n判读：仪表盘阈值是提示，不是统一生产标准；指标缺失不能按零值解读，历史图例可能显示上一个有效样本。\n\n排查与优化：先固定同一任务和时间范围，确认 Targets、Task 状态与规则正常，再按阶段比较调优结果；不要用单个百分比或累计峰值直接下结论。",
+      "gridPos": {
+        "x": 0,
+        "y": 155,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 29,
+      "type": "text",
+      "title": "如何定位瓶颈",
+      "description": "含义与单位：排查顺序是归档/备库日志供给、前进挖掘、必要重建、事件分发、Worker/Producer，最后关联 CPU、堆和 GC。\n\n判读：队列空既可能空闲也可能上游慢；队列满既可能持续发送不足也可能瞬时突发。重放起点不动不代表每轮都在重读，要看历史重建计时。\n\n排查与优化：前进慢先拆启停/查询/JDBC/落盘；等待高查批次和请求响应；处理慢但等待低查 CPU 热点。已有积压且大窗口提升吞吐时保留对照结果，再逐项优化下游，不同时更改多个参数。",
+      "gridPos": {
+        "x": 0,
+        "y": 156,
+        "w": 16,
+        "h": 4
+      },
+      "transparent": false,
+      "options": {
+        "mode": "markdown",
+        "content": "**扫描速度低 + 队列接近空**：优先看 LogMiner 初始化、日志重读和 SQL 解码。\n\n**队列持续接近满 + Producer 缓冲等待上升**：先看每请求记录数、批次大小与请求延迟，按 Kafka 区域的优化指南判断。\n\n**重放起点不动 + 扫描上界推进**：检查跨窗口事务及重扫成本。\n\n**无新事件 + 无积压**：通常是源端空闲，不能直接视为异常。"
+      }
+    },
+    {
+      "id": 30,
+      "type": "text",
+      "title": "指标边界",
+      "description": "含义与单位：LSN 是日志位置；窗口累计估算是输入工作量；队列占用是容量比例；等待是墙钟计时；这些量不能互相替代。\n\n判读：扫描上界不等于已提交 offset，事件计数不等于 Kafka/消费者对账。生命周期峰值不等于所选时段峰值，rate/increase 需多个样本，快照最近锁结果即时保留 5 分钟。\n\n排查与优化：缺数据先查版本埋点、Exporter、PodMonitor、PrometheusRule 与筛选。比较前后时统一任务、负载、消息格式与时间长度，保留确认和恢复语义，用积压、延迟、错误及资源共同判断收益。",
+      "gridPos": {
+        "x": 16,
+        "y": 156,
+        "w": 8,
+        "h": 4
+      },
+      "transparent": false,
+      "options": {
+        "mode": "markdown",
+        "content": "LSN 不是行数或字节数。\n\n扫描上界不是已持久化 offset。\n\n窗口估算不是 JVM 堆使用量。\n\n面板展示实际采样，启动后速率需要积累样本。"
+      }
+    }
+  ],
+  "links": [
+    {
+      "title": "Prometheus",
+      "url": "http://localhost:9090",
+      "targetBlank": true,
+      "type": "link"
+    }
+  ]
+}
