@@ -741,13 +741,13 @@ public final class DamengDdlParser {
             tokens.expect(")");
         }
         boolean timeZone = false;
+        boolean localTimeZone = false;
         if (name.equals("TIMESTAMP") || name.equals("DATETIME") || name.equals("TIME") || name.equals("DATETIME2")) {
             if (tokens.take("WITH")) {
-                // TODO Add LOCAL TIME ZONE DDL metadata when the source time-zone contract in
-                // DamengValueConverters.schemaBuilder is implemented and verified. Preserve its
-                // distinct type semantics; snapshot and historical redo must agree on the instant.
-                // LOCAL TIME ZONE depends on the database session and is not treated as
-                // a standard offset timestamp without an explicit conversion contract.
+                localTimeZone = tokens.take("LOCAL");
+                if (localTimeZone && !name.equals("TIMESTAMP")) {
+                    throw tokens.error("LOCAL TIME ZONE requires TIMESTAMP");
+                }
                 tokens.expect("TIME");
                 tokens.expect("ZONE");
                 timeZone = true;
@@ -780,7 +780,7 @@ public final class DamengDdlParser {
             case "RAW", "VARBINARY" -> Types.VARBINARY;
             case "DATE" -> Types.DATE;
             case "TIME" -> timeZone ? Types.TIME_WITH_TIMEZONE : Types.TIME;
-            case "TIMESTAMP", "DATETIME", "DATETIME2" -> timeZone ? Types.TIMESTAMP_WITH_TIMEZONE : Types.TIMESTAMP;
+            case "TIMESTAMP", "DATETIME", "DATETIME2" -> timeZone && !localTimeZone ? Types.TIMESTAMP_WITH_TIMEZONE : Types.TIMESTAMP;
             default -> throw tokens.error("Unsupported DM column type " + name);
         };
         if (length < 0) {
@@ -813,10 +813,11 @@ public final class DamengDdlParser {
         else if (jdbcType == Types.FLOAT || jdbcType == Types.DOUBLE) {
             length = 53;
         }
-        if (timeZone && !name.equals("TIME")) {
+        if (timeZone && !localTimeZone && !name.equals("TIME")) {
             name = "DATETIME";
         }
-        column.jdbcType(jdbcType).type(name + (timeZone ? " WITH TIME ZONE" : ""), expression(tokens.values.subList(start, tokens.index)))
+        column.jdbcType(jdbcType).type(name + (localTimeZone ? " WITH LOCAL TIME ZONE" : timeZone ? " WITH TIME ZONE" : ""),
+                expression(tokens.values.subList(start, tokens.index)))
                 .length(length).scale(scale);
         if (jdbcType == Types.CHAR || jdbcType == Types.NCHAR) {
             // Persist resolved semantics with the historical column; querying its

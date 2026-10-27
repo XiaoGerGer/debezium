@@ -282,8 +282,7 @@ final class DamengTestDatabase {
         for (int index = 0; index < cases.size(); index++) {
             final var type = cases.get(index);
             catalog.append(index + 1).append('\t').append(type.name()).append('\t')
-                    .append("settings=").append(type.settings()).append('\t').append("values=").append(type.values().size())
-                    .append('\t').append("rejected=").append(type.rejected().size()).append('\n');
+                    .append("settings=").append(type.settings()).append('\t').append("values=").append(type.values().size()).append('\n');
         }
         Files.writeString(directory.resolve("case-catalog.txt"), catalog);
     }

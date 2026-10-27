@@ -1358,15 +1358,15 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
         assertThat(after(old).get("AMOUNT")).isEqualTo(new java.math.BigDecimal("12.345678"));
         assertThat(after(old).getInt32("FLEX")).isEqualTo(123);
         assertThat(after(old).schema().field("AMOUNT").schema().parameters().get("scale")).isEqualTo("6");
-        assertThat(after(old).get("STAMP")).isEqualTo(java.time.LocalDateTime.of(2026, 10, 10, 12, 34, 56, 123_000_000)
-                .toInstant(java.time.ZoneOffset.UTC).toEpochMilli());
+        assertThat(after(old).getString("STAMP")).isEqualTo("2026-10-10 12:34:56.123");
+        assertThat(after(old).schema().field("STAMP").schema().name()).isNull();
         final var updated = nextDataRecord();
         assertThat(envelope(updated).getString("op")).isEqualTo("u");
         assertThat(before(updated).get("AMOUNT")).isEqualTo(new java.math.BigDecimal("12.345678000"));
         assertThat(after(updated).get("AMOUNT")).isEqualTo(new java.math.BigDecimal("123456789012345678901.123456789"));
         assertThat(after(updated).schema().field("AMOUNT").schema().parameters().get("scale")).isEqualTo("9");
-        assertThat(after(updated).get("STAMP")).isEqualTo(java.time.LocalDateTime.of(2026, 10, 10, 12, 34, 56)
-                .toEpochSecond(java.time.ZoneOffset.UTC) * 1_000_000 + 654_321);
+        assertThat(after(updated).getString("STAMP")).isEqualTo("2026-10-10 12:34:56.654321");
+        assertThat(after(updated).schema().field("STAMP").schema().name()).isNull();
         stopConnector();
         storeOffsets(config, Map.of(updated.sourcePartition(), updated.sourceOffset()));
         consumedLines.clear();

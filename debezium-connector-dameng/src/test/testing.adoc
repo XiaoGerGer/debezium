@@ -137,7 +137,7 @@ The additional tests retain the repository's Kafka dependency version (`4.3.0`).
 |Independent checks
 
 |`DamengDatatypesIT.shouldPreserveStoredFloatingPointBitsInSnapshotAndStreaming`
-|REAL, FLOAT(24), FLOAT, FLOAT(53) and DOUBLE with long fractional values, negative values, tiny finite values, large finite values, zero and negative zero. Additional cases cover DOUBLE's maximum finite value, REAL's documented upper boundary, minimum normal values, minimum subnormal values and the adjacent DOUBLE values on either side of one. Prepared JDBC floating point parameters avoid imposing decimal SQL literal parsing on the extreme values. JDBC reads the value actually stored by DM; snapshot and streamed values must retain exactly those floating point bits. There is no tolerance that can hide rounding to six decimal places.
+|REAL, FLOAT(24), FLOAT, FLOAT(53) and DOUBLE with long fractional values, negative values, tiny finite values, large finite values, zero and negative zero. Additional cases cover DOUBLE's maximum finite value, REAL's documented upper boundary, minimum normal values, minimum subnormal values and the adjacent DOUBLE values on either side of one. Prepared JDBC floating point parameters avoid imposing decimal SQL literal parsing on the extreme values. JDBC reads the value actually stored by DM; snapshot and streamed values must retain the stored nonzero bits. Positive and negative zero compare as equal numeric values. There is no tolerance that can hide rounding to six decimal places.
 
 |`DamengDatatypesIT.shouldPreserveStoredDecimalBoundariesAndUpdateBeforeImages`
 |38-digit integers, high-scale DECIMAL, small unconstrained NUMBER, declared trailing zeros and database-side scale rounding. Snapshot, INSERT, UPDATE before/after and DELETE images are checked against JDBC, including the declared fixed decimal scale. Native NUMERIC's documented scale range is zero through its precision; Oracle negative-scale assumptions are not copied into the native-mode fixture.
@@ -161,11 +161,21 @@ The additional tests retain the repository's Kafka dependency version (`4.3.0`).
 |The packaged plugin sends exact decimal strings, BIGINT boundaries, pre-epoch/microsecond timestamps, binary bytes, padded CHAR, BIT and NULL values through the existing JSON converters. Three brokers/controllers use replication factor three and minimum ISR two. The business partition's actual leader is paused; another leader must be elected and publish the complete source UPDATE before the former leader resumes. A second distributed worker joins and the assigned worker is killed. The survivor recovers Kafka-managed state and publishes a primary key move, INSERT and DELETE without another initial snapshot. JDBC-derived complete row images and first-delivery operation order are checked.
 |===
 
-The floating point tests expose existing discrepancies: high-precision stored values become rounded streamed values, some tiny nonzero values become zero, and negative zero loses its sign during the schema-enabled JSON converter round trip. The raw snapshot Struct preserves negative zero in all five declarations tested; its subsequent JSON decoding does not. The earlier direct LogMiner probe located ordinary fractional rounding in SQL_REDO/MINE_VALUE before connector conversion. The JSON round-trip discrepancy is a separate issue in the current Kafka conversion path, not evidence that DM LogMiner lost the snapshot value. These assertions remain enabled and require the original stored value. A failure is evidence of the data discrepancy; it must not be interpreted as a successful compatibility test. The earlier successful coverage/build results below predate these additional semantic assertions.
+The floating point tests expose existing discrepancies: high-precision stored values become rounded streamed values and some tiny nonzero values become zero. The raw snapshot Struct preserves negative zero in all five declarations tested; its subsequent JSON decoding does not preserve the sign. Positive and negative zero are treated as equal by numeric consistency assertions. The earlier direct LogMiner probe located ordinary fractional rounding in SQL_REDO/MINE_VALUE before connector conversion. The JSON round-trip discrepancy is a separate issue in the current Kafka conversion path, not evidence that DM LogMiner lost the snapshot value. The exact-value engine and floating boundary assertions remain available with `-Ddameng.datatype.floating.diagnostics=true`; they are skipped in the routine database suite while the DM LogMiner precision limitation is unresolved. NaN and other database-rejected inputs are absent from the current CDC consistency catalog. An explicit diagnostic run still fails on any stored-value discrepancy; a routine suite result does not establish lossless floating point CDC. The earlier successful coverage/build results below predate these additional semantic assertions.
 
 The REAL upper-bound fixture follows the https://eco.dameng.com/document/dm/zh-cn/pm/dm_sql-introduction.html[official DM SQL type specification]: its documented range ends at `3.4E38`, below Java's `Float.MAX_VALUE`. The local JDBC driver's `setFloat` rejects the latter as overflow. Such a rejected input is not a connector data-loss result; the regression uses the float representation of the documented bound instead.
+The floating boundary catalog no longer inserts `3.5E38` or `1E309` as rejection-only examples because they exceed the documented REAL and DOUBLE ranges.
 
-Run the routine engine/database regression with `verify -Pdameng-tests`; run a database capability probe or load benchmark explicitly with `verify -Pdameng-probes -Dit.test=<ProbeIT>`. The probe profile selects only `*ProbeIT`, `*BenchmarkIT`, and `*PerformanceIT`. Use `verify -Pdameng-all-tests` when you intentionally need every Failsafe test, including diagnostics. Run the packaged worker regression separately with `verify -Pdameng-connect-tests,assembly`. Ordinary `test` does not run these Failsafe integration tests. Surefire/Failsafe XML, rather than this implementation inventory, determines the result of each invocation.
+To retest the unresolved floating precision limitation, run the strict assertions explicitly. A nonzero exit indicates that the database still returns a different stored value through LogMiner.
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng -am verify -Pdameng-tests \
+  '-Dit.test=DamengDatatypesIT#shouldPreserveStoredFloatingPointBitsInSnapshotAndStreaming' \
+  -Ddameng.datatype.floating.diagnostics=true
+----
+
+Run the routine engine/database regression with `verify -Pdameng-tests`; run a database capability probe or load benchmark explicitly with `verify -Pdameng-probes -Dit.test=<ProbeIT>`. The probe profile selects only `*ProbeIT`, `*BenchmarkIT`, and `*PerformanceIT`. Use `verify -Pdameng-all-tests` to select every Failsafe test class; known floating limitations still require `-Ddameng.datatype.floating.diagnostics=true`. Run the packaged worker regression separately with `verify -Pdameng-connect-tests,assembly`. Ordinary `test` does not run these Failsafe integration tests. Surefire/Failsafe XML, rather than this implementation inventory, determines the result of each invocation.
 
 === Recorded execution on 2026-10-10
 
@@ -260,16 +270,15 @@ Compatibility strategy unit tests are in `io.debezium.connector.dameng.compatibi
 
 
 `DamengDatatypeCases` supplies the same inputs to `DamengDatatypesIT` (complete embedded engine) and `DamengDatatypeProbeIT` (JDBC/archived-redo components).
-The catalog covers integer bounds and their neighbors, zero and overflow, BIT coercion, every DECIMAL precision from 1 to 38 with distinct scale endpoints and midpoint,
-decimal aliases and handling modes, unconstrained NUMBER exponent bounds, floating declarations and IEEE finite boundaries, all documented TIME precisions 0 through 6,
+The catalog covers accepted integer bounds and their neighbors, zero, BIT coercion, every DECIMAL precision from 1 to 38 with distinct scale endpoints and midpoint,
+decimal aliases and handling modes, accepted unconstrained NUMBER exponent values, floating declarations and IEEE finite boundaries, all documented TIME precisions 0 through 6,
 all documented TIMESTAMP precisions 0 through 9, BCE/early/future dates and the calendar transition, fractional time zones and offset bounds, character/byte length boundaries,
 empty strings, embedded NUL, Unicode and supplementary characters, binary padding/length and all four binary handling modes.
 Declared VARCHAR/VARBINARY maxima use `USING LONG ROW` to distinguish the declared length limit from the page's shorter row limit.
-Tests record database rejection rather than silently dropping declarations that an older build does not accept.
+The CDC consistency catalog contains only inputs accepted by the tested database build; it does not treat database rejection as a connector result.
 INTERVAL coverage includes all thirteen qualifiers, every leading precision 1 through 9, and the full cross product with fractional precision 0 through 6 for the four qualifiers ending in SECOND, plus default declarations (346 cases).
-Each declaration exercises the positive and negative maximum, zero, the smallest positive and negative unit, NULL and rejected leading overflow.
+Each declaration exercises the positive and negative maximum, zero, the smallest positive and negative unit, and NULL.
 Independent interval expectations use the JDBC driver's binary-backed component getters, not the production SQL literal decoder or the common interval formatter.
-REAL/DOUBLE NaN and infinity inputs have separately recorded database capability results.
 External LOB streaming and arbitrary user-defined complex types remain outside this catalog.
 
 Each accepted boundary is read independently from JDBC at the relevant operation, then compared with snapshot, committed INSERT, value-to-NULL UPDATE,
@@ -360,17 +369,16 @@ The current native datatype mappings and known lossy LogMiner values are summari
 The complete native component/engine matrix in `target/consistency-final-mode-0` executed 795 instances:
 657 passed, 64 assertion failures, 74 database input/declaration errors and no skips. It remains `BUILD FAILURE`.
 Thirty-nine existing failed cases became successful after the calendar, empty binary, default TIME and long-row DDL fixes.
-The LOCAL TIME ZONE engine case now rejects unsafe schema semantics; it was previously an incomplete passing check.
+At the time of this historical run, the LOCAL TIME ZONE engine case rejected unsafe schema semantics. The current connector instead applies an explicitly lossy UTC assumption for this type; see the connector manual and its targeted snapshot/streaming test.
 The same invocation passed all 648 unit tests, 2 architecture checks, 51 `DamengConnectorIT` tests and 6 `DamengConnectionIT` tests.
 These passing regressions do not override the strict datatype failures.
 
-Eight real connector cases separately verify negative zero and NaN in snapshot and INSERT/UPDATE/DELETE raw Connect output.
+Four real connector cases verify negative zero in snapshot and INSERT/UPDATE/DELETE raw Connect output.
 The strict matrix still requires schema-enabled JSON round trips; it does not use the Connect-only assertion helper.
 `DamengJsonConverterCompatibilityTest` documents the stock Kafka 4.3.0 decoder's negative-zero and NaN losses.
 Its diagnostic success is not datatype acceptance.
 `shouldDiagnoseMineValueAvailabilityWithoutReplacingHistoricalRowsWithCurrentData` compares dictionary-free and online dictionary mining
 after the row has been deleted. On this build, online `MINE_VALUE` still rounds doubles and omits TIME WITH TIME ZONE fractions.
-`shouldDiagnoseBoundaryInputThroughLiteralsAndJdbcBinding` records old-build input capability for SQL and JDBC paths independently.
 The final check `/tmp/dameng-consistency-coverage-final.log` passed 648 unit tests, 2 architecture checks, Checkstyle and the 95% line gate.
 It reports LINE 2,486/2,574 (96.58120%), BRANCH 1,492/1,690 (88.28402%) and CLASS 62/62.
 The old execution-data file was moved aside before the full datatype matrix; this result combines only this round's unit, architecture,

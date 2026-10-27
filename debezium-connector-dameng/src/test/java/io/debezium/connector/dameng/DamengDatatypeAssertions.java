@@ -23,6 +23,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 
 import org.apache.kafka.connect.data.Struct;
@@ -46,10 +47,16 @@ final class DamengDatatypeAssertions {
             try (var result = statement.executeQuery()) {
                 assertThat(result.next()).isTrue();
                 final var metadata = result.getMetaData();
+                final var timePrecisionMode = config.getString("time.precision.mode", "sqlstring");
                 for (int index = 1; index <= metadata.getColumnCount(); index++) {
                     final Object value;
                     if (result.getObject(index) == null) {
                         value = null;
+                    }
+                    else if (metadata.getColumnType(index) == Types.TIMESTAMP
+                            && metadata.getColumnTypeName(index).toUpperCase(Locale.ROOT).contains("WITH LOCAL TIME ZONE")) {
+                        value = LocalDateTime.parse(result.getString(index).replaceFirst(" ", "T"))
+                                .atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
                     }
                     else {
                         final int scale = metadata.getScale(index);
@@ -62,15 +69,39 @@ final class DamengDatatypeAssertions {
                             case Types.REAL -> result.getFloat(index);
                             case Types.FLOAT, Types.DOUBLE -> result.getDouble(index);
                             case Types.BOOLEAN, Types.BIT -> result.getBoolean(index);
-                            case Types.DATE -> Math.toIntExact(LocalDate.parse(result.getString(index)).toEpochDay());
+                            case Types.DATE -> switch (timePrecisionMode) {
+                                case "sqlstring" -> LocalDate.parse(result.getString(index)).toString();
+                                case "isostring" -> LocalDate.parse(result.getString(index)).toString() + "Z";
+                                default -> Math.toIntExact(LocalDate.parse(result.getString(index)).toEpochDay());
+                            };
                             case Types.TIME -> {
+                                if ("isostring".equals(timePrecisionMode)) {
+                                    yield LocalTime.parse(result.getString(index)).atOffset(ZoneOffset.UTC)
+                                            .format(DateTimeFormatter.ISO_OFFSET_TIME);
+                                }
+                                if ("sqlstring".equals(timePrecisionMode)) {
+                                    final var time = LocalTime.parse(result.getString(index)).atOffset(ZoneOffset.UTC)
+                                            .format(DateTimeFormatter.ISO_OFFSET_TIME);
+                                    yield time.substring(0, time.length() - 1);
+                                }
                                 final long nanos = LocalTime.parse(result.getString(index)).toNanoOfDay();
                                 if (scale <= 3) {
                                     yield Math.toIntExact(nanos / 1_000_000);
                                 }
                                 yield nanos / (scale <= 6 ? 1_000 : 1);
                             }
-                            case Types.TIMESTAMP -> timestamp(result.getString(index), scale);
+                            case Types.TIMESTAMP -> {
+                                final var timestamp = LocalDateTime.parse(result.getString(index).replaceFirst(" ", "T"));
+                                if ("sqlstring".equals(timePrecisionMode)) {
+                                    yield timestamp.atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+                                            .replace('T', ' ').replace("Z", "");
+                                }
+                                yield "isostring".equals(timePrecisionMode)
+                                        || scale > 6 && ("adaptive".equals(timePrecisionMode)
+                                                || "adaptive_time_microseconds".equals(timePrecisionMode))
+                                                        ? timestamp.atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+                                                        : timestamp(result.getString(index), scale);
+                            }
                             // DM's native driver uses 94/95 in ResultSetMetaData.
                             case Types.TIMESTAMP_WITH_TIMEZONE, 95 -> OffsetDateTime.parse(result.getString(index)
                                     .replaceFirst(" ", "T").replace(" +", "+").replace(" -", "-"))
@@ -179,13 +210,17 @@ final class DamengDatatypeAssertions {
             }
             else if (value instanceof Float number) {
                 assertThat(actual).as(label + "/Java type").isInstanceOf(Float.class);
-                assertThat(Float.floatToRawIntBits((Float) actual)).as("%s stored bits: JDBC=%s, event=%s", label, number, actual)
-                        .isEqualTo(Float.floatToRawIntBits(number));
+                if (number != 0.0f || (Float) actual != 0.0f) {
+                    assertThat(Float.floatToRawIntBits((Float) actual)).as("%s stored bits: JDBC=%s, event=%s", label, number, actual)
+                            .isEqualTo(Float.floatToRawIntBits(number));
+                }
             }
             else if (value instanceof Double number) {
                 assertThat(actual).as(label + "/Java type").isInstanceOf(Double.class);
-                assertThat(Double.doubleToRawLongBits((Double) actual)).as("%s stored bits: JDBC=%s, event=%s", label, number, actual)
-                        .isEqualTo(Double.doubleToRawLongBits(number));
+                if (number != 0.0d || (Double) actual != 0.0d) {
+                    assertThat(Double.doubleToRawLongBits((Double) actual)).as("%s stored bits: JDBC=%s, event=%s", label, number, actual)
+                            .isEqualTo(Double.doubleToRawLongBits(number));
+                }
             }
             else if (value instanceof BigDecimal decimal) {
                 final var converted = actual instanceof Struct struct

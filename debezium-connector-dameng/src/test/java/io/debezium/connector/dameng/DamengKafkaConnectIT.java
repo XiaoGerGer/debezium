@@ -348,7 +348,8 @@ class DamengKafkaConnectIT {
             }
             else {
                 final var time = result.getTimestamp("STAMP").toLocalDateTime();
-                row.put("STAMP", time.toEpochSecond(ZoneOffset.UTC) * 1_000_000 + time.getNano() / 1_000);
+                row.put("STAMP", time.atOffset(ZoneOffset.UTC).format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+                        .replace('T', ' ').replace("Z", ""));
             }
             row.put("RAW_VALUE", result.getBytes("RAW_VALUE") == null ? null : Base64.getEncoder().encodeToString(result.getBytes("RAW_VALUE")));
             row.put("FIXED", result.getString("FIXED"));

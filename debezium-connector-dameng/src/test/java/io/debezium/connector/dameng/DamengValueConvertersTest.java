@@ -36,6 +36,9 @@ import io.debezium.relational.Column;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
 import io.debezium.relational.ValueConverter;
+import io.debezium.time.IsoTimestamp;
+import io.debezium.time.NanoTimestamp;
+import io.debezium.time.ZonedTimestamp;
 
 class DamengValueConvertersTest {
     private final DamengValueConverters converters = new DamengValueConverters(
@@ -81,7 +84,7 @@ class DamengValueConvertersTest {
     @Test
     void shouldDecodeDate() {
         assertThat(convert(column(Types.DATE), new SqlExpression("TO_DATE('2026-09-24','YYYY-MM-DD')")))
-                .isEqualTo((int) LocalDate.of(2026, 9, 24).toEpochDay());
+                .isEqualTo("2026-09-24");
     }
 
     @ParameterizedTest
@@ -108,10 +111,10 @@ class DamengValueConvertersTest {
         final var parts = value.substring(value.startsWith("-") ? 1 : 0).split("-");
         final int year = Integer.parseInt(parts[0]) * (value.startsWith("-") ? -1 : 1);
         final var date = LocalDate.of(year, Integer.parseInt(parts[1]), Integer.parseInt(parts[2]));
-        assertThat(convert(column(Types.DATE), new SqlExpression("DATE'" + value + "'"))).isEqualTo((int) date.toEpochDay());
+        assertThat(convert(column(Types.DATE), new SqlExpression("DATE'" + value + "'"))).isEqualTo(date.toString());
         final var timestamp = date.atTime(12, 34, 56, 123456000);
         assertThat(convert(column(Types.TIMESTAMP), new SqlExpression("TIMESTAMP'" + value + " 12:34:56.123456'")))
-                .isEqualTo(timestamp.toEpochSecond(ZoneOffset.UTC) * 1_000_000 + 123456);
+                .isEqualTo(timestamp.toString().replace('T', ' '));
         assertThat(converters.convertLogMinerValue(new SqlExpression("TIMESTAMP'" + value + " 12:34:56.123456 +08:00'"),
                 column(Types.TIMESTAMP_WITH_TIMEZONE), input -> input))
                 .isEqualTo(timestamp.atOffset(ZoneOffset.ofHours(8)));
@@ -123,19 +126,66 @@ class DamengValueConvertersTest {
                 .isInstanceOf(DataException.class).hasMessageContaining("Invalid LogMiner value");
     }
 
-    @Test
-    void shouldRejectLocalTimezoneSchemaInsteadOfSilentlyPublishingAReaderDependentTimestamp() {
+    @ParameterizedTest
+    @ValueSource(strings = { "adaptive", "isostring", "sqlstring" })
+    void shouldTreatOnlyLocalTimezoneValuesAsUtc(String precisionMode) {
         final var column = Column.editor().name("LOCAL_TS").jdbcType(Types.TIMESTAMP).type("TIMESTAMP WITH LOCAL TIME ZONE")
                 .length(36).scale(6).optional(true).create();
-        assertThatThrownBy(() -> converters.schemaBuilder(column)).isInstanceOf(DataException.class)
-                .hasMessageContaining("LOCAL_TS", "source session time zone", "column.exclude.list");
+        final var modeConverters = new DamengValueConverters(new DamengConnectorConfig(
+                DamengConnectorConfigTest.configuration().with("time.precision.mode", precisionMode).build()));
+        final var field = new Field(column.name(), 0, modeConverters.schemaBuilder(column).optional().build());
+        final var converter = modeConverters.converter(column, field);
+        assertThat(field.schema().name()).isEqualTo(ZonedTimestamp.SCHEMA_NAME);
+        assertThat(converter.convert(LocalDateTime.of(2000, 2, 29, 12, 34, 56, 123456000)))
+                .isEqualTo("2000-02-29T12:34:56.123456Z");
+        assertThat(converter.convert(new SqlExpression("TIMESTAMP'2000-02-29 12:34:56.123456'")))
+                .isEqualTo("2000-02-29T12:34:56.123456Z");
+        assertThat(converter.convert(null)).isNull();
+        assertThat(convert(column(Types.TIMESTAMP), new SqlExpression("TIMESTAMP'2000-02-29 12:34:56.123456'")))
+                .isEqualTo("2000-02-29 12:34:56.123456");
     }
 
     @Test
     void shouldDecodeMicrosecondTimestamp() {
-        final var instant = LocalDateTime.of(2026, 9, 24, 12, 34, 56, 123456000).toInstant(ZoneOffset.UTC);
         assertThat(convert(column(Types.TIMESTAMP), new SqlExpression("TO_TIMESTAMP('2026-09-24 12:34:56.123456','YYYY-MM-DD HH24:MI:SS.FF6')")))
-                .isEqualTo(instant.getEpochSecond() * 1_000_000 + 123456);
+                .isEqualTo("2026-09-24 12:34:56.123456");
+    }
+
+    @Test
+    void shouldRetainNumericTemporalRepresentationWhenExplicitlyConfigured() {
+        final var numeric = new DamengValueConverters(new DamengConnectorConfig(
+                DamengConnectorConfigTest.configuration().with("time.precision.mode", "adaptive").build()));
+        final var date = column(Types.DATE);
+        final var dateField = new Field(date.name(), 0, numeric.schemaBuilder(date).optional().build());
+        assertThat(numeric.converter(date, dateField).convert(new SqlExpression("DATE'2026-09-24'")))
+                .isEqualTo((int) LocalDate.of(2026, 9, 24).toEpochDay());
+        final var timestamp = column(Types.TIMESTAMP);
+        final var timestampField = new Field(timestamp.name(), 0, numeric.schemaBuilder(timestamp).optional().build());
+        assertThat(numeric.converter(timestamp, timestampField).convert(new SqlExpression("TIMESTAMP'2026-09-24 12:34:56.123456'")))
+                .isEqualTo(LocalDateTime.of(2026, 9, 24, 12, 34, 56, 123456000).toEpochSecond(ZoneOffset.UTC) * 1_000_000 + 123456);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { 7, 8, 9 })
+    void shouldUseStableIsoSchemaForWideTimestamps(int precision) {
+        final var column = Column.editor().name("VALUE").jdbcType(Types.TIMESTAMP).type("TIMESTAMP(" + precision + ")")
+                .length(36).scale(precision).optional(true).create();
+        for (var mode : new String[]{ "adaptive", "adaptive_time_microseconds" }) {
+            final var modeConverters = new DamengValueConverters(new DamengConnectorConfig(
+                    DamengConnectorConfigTest.configuration().with("time.precision.mode", mode).build()));
+            final var field = new Field(column.name(), 0, modeConverters.schemaBuilder(column).optional().build());
+            final var converter = modeConverters.converter(column, field);
+            assertThat(field.schema().name()).isEqualTo(IsoTimestamp.SCHEMA_NAME);
+            assertThat(converter.convert(LocalDateTime.of(1, 1, 1, 0, 0)))
+                    .isEqualTo("0001-01-01T00:00:00Z");
+            assertThat(converter.convert(new SqlExpression("TIMESTAMP'9999-12-31 23:59:59.999999999'")))
+                    .isEqualTo("9999-12-31T23:59:59.999999999Z");
+            assertThat(converter.convert(null)).isNull();
+        }
+
+        final var nanosConverters = new DamengValueConverters(new DamengConnectorConfig(
+                DamengConnectorConfigTest.configuration().with("time.precision.mode", "nanoseconds").build()));
+        assertThat(nanosConverters.schemaBuilder(column).build().name()).isEqualTo(NanoTimestamp.SCHEMA_NAME);
     }
 
     @Test

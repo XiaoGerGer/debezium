@@ -31,9 +31,12 @@ import org.apache.kafka.connect.errors.DataException;
 
 import io.debezium.data.VariableScaleDecimal;
 import io.debezium.jdbc.JdbcValueConverters;
+import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.Column;
 import io.debezium.relational.ValueConverter;
 import io.debezium.time.Interval;
+import io.debezium.time.IsoTimestamp;
+import io.debezium.time.ZonedTimestamp;
 
 public final class DamengValueConverters extends JdbcValueConverters {
     private static final Pattern STRING_FUNCTION = Pattern.compile("^([A-Za-z_]+)\\s*\\(\\s*'((?:''|[^'])*)'\\s*\\)$");
@@ -66,19 +69,11 @@ public final class DamengValueConverters extends JdbcValueConverters {
             DamengInterval.type(column.typeName());
             return Interval.builder();
         }
-        if (column.typeName() != null && column.typeName().toUpperCase(Locale.ROOT).replaceAll("\\s+", " ").contains("WITH LOCAL TIME ZONE")) {
-            // TODO Support LOCAL TIME ZONE after verifying a recoverable source time-zone contract.
-            // Snapshot uses the reader's time zone, but dictionary-free redo omits the writer's
-            // time zone and, on the tested build, does not adjust to the mining session's zone.
-            // Assuming both texts are UTC and converting to one output zone preserves their mismatch.
-            // A task-level source-zone setting could work only if every relevant redo value has a
-            // verified common time basis; defaulting that setting to UTC does not establish it.
-            // Read snapshots in UTC and interpret redo in its verified source zone before UTC
-            // normalization. Validate different writer zones, explicit offsets, DST, restart,
-            // historical replay and primary/standby switch before enabling this mapping.
-            // Keep rejecting it until the source-time-zone behavior is verified end to end.
-            throw new DataException("Unsupported Dameng TIMESTAMP WITH LOCAL TIME ZONE column " + column.name()
-                    + ": archived redo omits the source session time zone; exclude this column with column.exclude.list");
+        if (isLocalTimeZone(column)) {
+            return ZonedTimestamp.builder();
+        }
+        if (useWideTimestampIsoString(column)) {
+            return IsoTimestamp.builder();
         }
         if (hasVariableScale(column) && decimalMode == DecimalMode.PRECISE) {
             return VariableScaleDecimal.builder();
@@ -96,9 +91,13 @@ public final class DamengValueConverters extends JdbcValueConverters {
         if (DamengInterval.isInterval(column)) {
             return value -> DamengInterval.convert(value, column);
         }
-        final ValueConverter delegate = hasVariableScale(column) && decimalMode == DecimalMode.PRECISE
-                ? value -> convertVariableScale(column, field, value)
-                : super.converter(column, field);
+        final ValueConverter delegate = isLocalTimeZone(column)
+                ? value -> convertLocalTimeZoneAsUtc(value, column)
+                : useWideTimestampIsoString(column)
+                        ? value -> convertTimestampToUtcIsoString(column, field, value)
+                        : hasVariableScale(column) && decimalMode == DecimalMode.PRECISE
+                                ? value -> convertVariableScale(column, field, value)
+                                : super.converter(column, field);
         if (delegate == null) {
             return null;
         }
@@ -142,6 +141,37 @@ public final class DamengValueConverters extends JdbcValueConverters {
 
     private static boolean hasVariableScale(Column column) {
         return (column.jdbcType() == Types.NUMERIC || column.jdbcType() == Types.DECIMAL) && column.length() <= 0;
+    }
+
+    private static boolean isLocalTimeZone(Column column) {
+        return column.jdbcType() == Types.TIMESTAMP && column.typeName() != null
+                && column.typeName().toUpperCase(Locale.ROOT).replaceAll("\\s+", " ").contains("WITH LOCAL TIME ZONE");
+    }
+
+    private boolean useWideTimestampIsoString(Column column) {
+        return column.jdbcType() == Types.TIMESTAMP && getTimePrecision(column) > 6
+                && (column.typeName() == null || !column.typeName().toUpperCase(Locale.ROOT).replaceAll("\\s+", " ").contains("TIME ZONE"))
+                && (temporalPrecisionMode == TemporalPrecisionMode.ADAPTIVE
+                        || temporalPrecisionMode == TemporalPrecisionMode.ADAPTIVE_TIME_MICROSECONDS);
+    }
+
+    private static Object convertLocalTimeZoneAsUtc(Object value, Column column) {
+        if (value == null) {
+            return null;
+        }
+        final LocalDateTime timestamp;
+        if (value instanceof LocalDateTime localDateTime) {
+            timestamp = localDateTime;
+        }
+        else if (value instanceof String text) {
+            timestamp = parseTimestamp(text);
+        }
+        else {
+            throw new DataException("Unsupported Dameng TIMESTAMP WITH LOCAL TIME ZONE value for column " + column.name()
+                    + ": " + value.getClass().getName());
+        }
+        // LogMiner omits the writer's zone. Treat its local calendar as UTC by policy.
+        return timestamp.atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
     }
 
     /** Converts LogMiner literals using the same mapping as snapshot JDBC values. */

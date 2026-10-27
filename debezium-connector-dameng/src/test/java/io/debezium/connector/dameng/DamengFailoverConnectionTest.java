@@ -22,6 +22,7 @@ import static org.mockito.Mockito.when;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
@@ -83,9 +84,12 @@ class DamengFailoverConnectionTest {
         final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
                 .with("database.standby.hosts", "a:5236,b:5237").build());
         final var jdbc = mock(Connection.class);
+        final var statement = mock(Statement.class);
+        when(jdbc.createStatement()).thenReturn(statement);
         try (var drivers = mockConstruction(DmDriver.class, (driver, context) -> when(driver.connect(anyString(), any())).thenReturn(jdbc));
                 var connection = new DamengConnection(config.getJdbcConfig())) {
             assertThat(connection.connection()).isSameAs(jdbc);
+            verify(statement).execute("SET TIME ZONE '+00:00'");
             final var properties = ArgumentCaptor.forClass(Properties.class);
             verify(drivers.constructed().get(0)).connect(eq("jdbc:dm://debezium?debezium=(a:5236,b:5237)"), properties.capture());
             assertThat(properties.getValue()).containsEntry("loginMode", "2").containsEntry("loginStatus", "4")
@@ -113,9 +117,12 @@ class DamengFailoverConnectionTest {
         final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
                 .with("database.failover.hosts", "primary:5236,standby:5237").build());
         final var jdbc = mock(Connection.class);
+        final var statement = mock(Statement.class);
+        when(jdbc.createStatement()).thenReturn(statement);
         try (var drivers = mockConstruction(DmDriver.class, (driver, context) -> when(driver.connect(anyString(), any())).thenReturn(jdbc));
                 var connection = new DamengConnection(config.getJdbcConfig())) {
             assertThat(connection.connection()).isSameAs(jdbc);
+            verify(statement).execute("SET TIME ZONE '+00:00'");
             final var properties = ArgumentCaptor.forClass(Properties.class);
             verify(drivers.constructed().get(0)).connect(eq("jdbc:dm://debezium?debezium=(primary:5236,standby:5237)"), properties.capture());
             assertThat(properties.getValue()).doesNotContainKeys("hostname", "host", "port", "failover.hosts")
@@ -129,9 +136,12 @@ class DamengFailoverConnectionTest {
     void shouldPreserveSingleEndpointUrlsWithoutTransparentReconnection() throws Exception {
         final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().with("database.port", 5327).build());
         final var jdbc = mock(Connection.class);
+        final var statement = mock(Statement.class);
+        when(jdbc.createStatement()).thenReturn(statement);
         try (var drivers = mockConstruction(DmDriver.class, (driver, context) -> when(driver.connect(anyString(), any())).thenReturn(jdbc));
                 var connection = new DamengConnection(config.getJdbcConfig())) {
             assertThat(connection.connection()).isSameAs(jdbc);
+            verify(statement).execute("SET TIME ZONE '+00:00'");
             final var properties = ArgumentCaptor.forClass(Properties.class);
             verify(drivers.constructed().get(0)).connect(eq("jdbc:dm://localhost:5327"), properties.capture());
             assertThat(properties.getValue()).containsEntry("autoReconnect", "0").containsEntry("rwSeparate", "0")

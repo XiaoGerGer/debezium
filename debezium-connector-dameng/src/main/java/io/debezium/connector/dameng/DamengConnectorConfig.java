@@ -30,6 +30,7 @@ import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.connector.SourceInfoStructMaker;
 import io.debezium.document.Document;
 import io.debezium.jdbc.JdbcConfiguration;
+import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.ColumnFilterMode;
 import io.debezium.relational.HistorizedRelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
@@ -54,6 +55,11 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
                     + "The connector connects only to an OPEN PRIMARY and owns reconnects so offsets and schema history are restored together.");
     public static final Field DATABASE_NAME = RelationalDatabaseConnectorConfig.DATABASE_NAME
             .withDefault("DAMENG");
+    public static final Field TIME_PRECISION_MODE = RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE
+            .withDefault(TemporalPrecisionMode.SQLSTRING.getValue())
+            .withDescription("Dameng defaults to SQL-style strings without T or Z for DATE, TIME and ordinary TIMESTAMP values. "
+                    + "Explicit isostring, adaptive, adaptive_time_microseconds, connect, microseconds and nanoseconds modes remain available. "
+                    + "Changing this setting changes Kafka Connect field schemas and requires downstream consumers to adapt.");
     public static final Field STANDBY_HOSTS = Field.create("database.standby.hosts")
             .withDisplayName("Standby capture hosts").withType(Type.STRING).withDefault("")
             .withWidth(Width.LONG).withImportance(Importance.HIGH)
@@ -167,6 +173,7 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
     private static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .excluding(CommonConnectorConfig.QUERY_FETCH_SIZE)
             .excluding(RelationalDatabaseConnectorConfig.QUERY_TIMEOUT_MS)
+            .excluding(RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE)
             .name("Dameng")
             .type(HOSTNAME, PORT, FAILOVER_HOSTS, STANDBY_HOSTS, STANDBY_REPLAY_TIMEOUT_MS, DATABASE_NAME, SOCKET_TIMEOUT_MS, QUERY_TIMEOUT_MS,
                     RelationalDatabaseConnectorConfig.USER,
@@ -177,7 +184,7 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
                     LOG_MINING_BUFFER_MAX_BYTES,
                     LOG_MINING_BUFFER_MAX_RECORDS, LOG_MINING_BUFFER_MAX_SQL_BYTES, LOG_MINING_BUFFER_MAX_TRANSACTIONS, LOG_MINING_BUFFER_MEMORY_BYTES,
                     LOG_MINING_BUFFER_SPILL_PATH, LOG_MINING_BUFFER_SPILL_MAX_BYTES,
-                    QUERY_FETCH_SIZE, UNAVAILABLE_VALUE_PLACEHOLDER)
+                    QUERY_FETCH_SIZE, TIME_PRECISION_MODE, UNAVAILABLE_VALUE_PLACEHOLDER)
             .events(SOURCE_INFO_STRUCT_MAKER)
             .create();
     public static final Field.Set ALL_FIELDS = Field.setOf(CONFIG_DEFINITION.all());
@@ -228,7 +235,8 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
     }
 
     public DamengConnectorConfig(Configuration config) {
-        super(DamengConnector.class, config, new SystemTablesFilter(), table -> table.schema() + "." + table.table(), false, ColumnFilterMode.SCHEMA, false);
+        super(DamengConnector.class, withDefaultTimePrecision(config), new SystemTablesFilter(), table -> table.schema() + "." + table.table(), false,
+                ColumnFilterMode.SCHEMA, false);
         snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE), SnapshotMode.NO_DATA);
         if (validateRecoveryNonce(config, RECOVERY_RESTART_NONCE, (field, value, problem) -> {
         }) != 0) {
@@ -300,6 +308,11 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             validateHostValue(hostname);
         }
         validateDriverProperties(config);
+    }
+
+    private static Configuration withDefaultTimePrecision(Configuration config) {
+        return config.hasKey(TIME_PRECISION_MODE) ? config
+                : config.edit().with(TIME_PRECISION_MODE.name(), TemporalPrecisionMode.SQLSTRING.getValue()).build();
     }
 
     public static ConfigDef configDef() {

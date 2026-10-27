@@ -72,6 +72,21 @@ class DamengDdlParserTest {
     }
 
     @Test
+    void preservesLocalTimezoneAsDistinctHistoricalTimestampType() {
+        final var tables = new Tables();
+        final var parser = new DamengDdlParser();
+        final var id = new TableId(null, "APP", "T");
+        parser.parse("CREATE TABLE APP.T (ID INT PRIMARY KEY, LTZ TIMESTAMP(6) WITH LOCAL TIME ZONE, "
+                + "PLAIN TIMESTAMP(6), TZ TIMESTAMP(6) WITH TIME ZONE)", tables, "APP");
+        assertThat(tables.forTable(id).columnWithName("LTZ").jdbcType()).isEqualTo(Types.TIMESTAMP);
+        assertThat(tables.forTable(id).columnWithName("LTZ").typeName()).isEqualTo("TIMESTAMP WITH LOCAL TIME ZONE");
+        assertThat(tables.forTable(id).columnWithName("PLAIN").typeName()).isEqualTo("TIMESTAMP");
+        assertThat(tables.forTable(id).columnWithName("TZ").jdbcType()).isEqualTo(Types.TIMESTAMP_WITH_TIMEZONE);
+        parser.parse("ALTER TABLE APP.T ADD SECOND_LTZ TIMESTAMP(3) WITH LOCAL TIME ZONE", tables, "APP");
+        assertThat(tables.forTable(id).columnWithName("SECOND_LTZ").typeName()).isEqualTo("TIMESTAMP WITH LOCAL TIME ZONE");
+    }
+
+    @Test
     void preservesQuotedIdentifiersAndDelimitersInsideStringDefaults() {
         final var tables = new Tables();
         final var id = new TableId(null, "Mixed.Schema", "Order\"Detail");
@@ -386,7 +401,6 @@ class DamengDdlParserTest {
             "CREATE TABLE APP.T (ID INT, PRIMARY KEY(MISSING))",
             "CREATE TABLE APP.T (ID INT PRIMARY KEY, OTHER INT PRIMARY KEY)",
             "CREATE TABLE APP.T (VALUE UNKNOWN_TYPE)",
-            "CREATE TABLE APP.T (VALUE TIMESTAMP(6) WITH LOCAL TIME ZONE)",
             "CREATE TABLE APP.T (VALUE VARCHAR(20) DEFAULT 'unfinished)",
             "CREATE TABLE APP.T (VALUE DECIMAL(20,6)",
             "CREATE TABLE APP.T (VALUE)",

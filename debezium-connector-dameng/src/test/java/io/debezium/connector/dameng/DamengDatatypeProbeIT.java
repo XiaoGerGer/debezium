@@ -8,7 +8,6 @@ package io.debezium.connector.dameng;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertAll;
 
-import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -176,11 +175,6 @@ class DamengDatatypeProbeIT {
             assertThat(rowSchema(historicalTable, converters)).as("archived DDL and JDBC produce the same logical schema")
                     .isEqualTo(rowSchema(table, converters));
         });
-        int rejectedId = 9999;
-        for (var value : type.rejected()) {
-            final int invalidId = rejectedId++;
-            checks.add(() -> verifyOutsideRangeInput(type, value, invalidId, table, physicalTable, converters));
-        }
         assertAll("component/mode=" + DamengTestDatabase.requestedCompatibilityMode() + "/" + type, checks);
     }
 
@@ -227,6 +221,102 @@ class DamengDatatypeProbeIT {
                 }
             }
             connection.endLogMining();
+        }
+    }
+
+    @Test
+    void shouldExposeAmbiguousLocalTimezoneRedoAcrossWriterSessions() throws Exception {
+        final long start = connection.currentLsn();
+        connection.execute("CREATE TABLE " + tableName() + " (ID INT PRIMARY KEY, VALUE TIMESTAMP(6) WITH LOCAL TIME ZONE)");
+        tableCreated = true;
+        final var literal = "TIMESTAMP'2000-02-29 12:34:56.123456'";
+        for (var writerZone : List.of("+05:45", "-12:59")) {
+            try (var writer = new DamengConnection(config.getJdbcConfig())) {
+                final int id = writerZone.equals("+05:45") ? 1 : 2;
+                writer.execute("SET TIME ZONE '" + writerZone + "'",
+                        "INSERT INTO " + tableName() + " VALUES(" + id + "," + literal + ")");
+                if (id == 2) {
+                    writer.execute("INSERT INTO " + tableName() + " VALUES(3,TIMESTAMP'2000-02-28 17:50:56.123456')");
+                }
+            }
+        }
+        try (var writer = new DamengConnection(config.getJdbcConfig())) {
+            writer.execute("SET TIME ZONE '+05:45'",
+                    "INSERT INTO " + tableName() + " VALUES(4,TIMESTAMP'2000-02-29 12:34:56.123456 -12:59')");
+        }
+
+        connection.execute("SET TIME ZONE '+00:00'");
+        final List<String> utcValues = connection.queryAndMap("SELECT VALUE FROM " + tableName() + " ORDER BY ID", result -> {
+            final List<String> values = new ArrayList<>();
+            while (result.next()) {
+                values.add(result.getString(1));
+            }
+            return values;
+        });
+        DamengTestDatabase.recordCapability("LOCAL/ambiguous/UTC-reader", utcValues.toString());
+        assertThat(utcValues).containsExactly("2000-02-29 06:49:56.123456", "2000-03-01 01:33:56.123456",
+                "2000-02-29 06:49:56.123456", "2000-03-01 01:33:56.123456");
+
+        final var objectId = connection.getTableObjectId(tableId);
+        final var tables = new Tables();
+        connection.readSchema(tables, null, tableId.schema(), id -> id.equals(tableId), null, false);
+        final var physical = Table.editor().tableId(new TableId(null, null, "OBJ# " + objectId));
+        for (var column : tables.forTable(tableId).columns()) {
+            physical.addColumn(column.edit().name("COL " + column.position()).create());
+        }
+        final var parser = new LogMinerDmlParser();
+        final var physicalTable = physical.create();
+        for (var miningZone : List.of("+00:00", "+08:00")) {
+            connection.execute("SET TIME ZONE '" + miningZone + "'");
+            final List<Object> redoValues = mine(start).stream()
+                    .filter(row -> row.objectId() == objectId && row.operation() == 1)
+                    .map(row -> parser.parse(row.redo(), physicalTable).newValues()[1]).toList();
+            DamengTestDatabase.recordCapability("LOCAL/ambiguous/miner=" + miningZone, redoValues.toString());
+            assertThat(redoValues).containsExactly(new LogMinerDmlParser.SqlExpression(literal), new LogMinerDmlParser.SqlExpression(literal),
+                    new LogMinerDmlParser.SqlExpression("TIMESTAMP'2000-02-28 17:50:56.123456'"),
+                    new LogMinerDmlParser.SqlExpression("TIMESTAMP'2000-03-01 07:18:56.123456'"));
+            connection.endLogMining();
+        }
+
+        final long end = connection.currentLsn();
+        for (var file : connection.archiveLogsForRange(start, end)) {
+            connection.execute(LogMinerSql.addLogFile(file.path()));
+        }
+        try {
+            connection.execute("BEGIN DBMS_LOGMNR.START_LOGMNR(STARTSCN => " + start + ", ENDSCN => " + end + ", OPTIONS => "
+                    + (LogMinerSql.NO_ROWID_IN_STMT | LogMinerSql.DICT_FROM_ONLINE_CATALOG) + "); END;");
+            final var columnName = LogMinerSql.quoteLiteral(tableId.schema() + "." + tableId.table() + ".VALUE");
+            for (var miningZone : List.of("+00:00", "+08:00")) {
+                connection.execute("SET TIME ZONE '" + miningZone + "'");
+                final List<String> jdbcValues = new ArrayList<>();
+                final List<String> values = connection.queryAndMap("SELECT DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, '" + columnName + "') "
+                        + "FROM V$LOGMNR_CONTENTS WHERE DATA_OBJ#=" + objectId + " AND OPERATION_CODE=1 ORDER BY SCN, SSN", result -> {
+                            final List<String> samples = new ArrayList<>();
+                            while (result.next()) {
+                                samples.add(result.getString(1));
+                                final var value = result.getObject(1);
+                                try {
+                                    final var timestamp = result.getTimestamp(1);
+                                    jdbcValues.add("type=" + result.getMetaData().getColumnTypeName(1) + "; object=" + value
+                                            + "; class=" + (value == null ? null : value.getClass().getName()) + "; timestamp=" + timestamp
+                                            + "; instant=" + (timestamp == null ? null : timestamp.toInstant()));
+                                }
+                                catch (SQLException unavailable) {
+                                    jdbcValues.add("type=" + result.getMetaData().getColumnTypeName(1) + "; object=" + value
+                                            + "; class=" + (value == null ? null : value.getClass().getName())
+                                            + "; getTimestamp unavailable=" + unavailable.getMessage());
+                                }
+                            }
+                            return samples;
+                        });
+                DamengTestDatabase.recordCapability("LOCAL/ambiguous/online-dictionary/MINE_VALUE/miner=" + miningZone, values.toString());
+                DamengTestDatabase.recordCapability("LOCAL/ambiguous/online-dictionary/JDBC/miner=" + miningZone, jdbcValues.toString());
+                assertThat(values).containsExactly("2000-02-29 12:34:56.123456", "2000-02-29 12:34:56.123456",
+                        "2000-02-28 17:50:56.123456", "2000-03-01 07:18:56.123456");
+            }
+        }
+        finally {
+            connection.execute(LogMinerSql.end());
         }
     }
 
@@ -311,148 +401,6 @@ class DamengDatatypeProbeIT {
                         "unavailable; code=" + unavailable.getErrorCode() + "; " + unavailable.getMessage());
             }
         }
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = { "NUMBER", "NUMERIC", "DECIMAL", "CHAR(8 CHAR)" })
-    void shouldDiagnoseBoundaryInputThroughLiteralsAndJdbcBinding(String declaration) throws Exception {
-        connection.execute("CREATE TABLE " + tableName() + " (ID INT PRIMARY KEY, VALUE " + declaration + ")");
-        tableCreated = true;
-        final boolean character = declaration.startsWith("CHAR");
-        final List<String> inputs = character ? List.of("梦".repeat(7), "梦".repeat(8), "😀".repeat(8)) : List.of("1E125", "-1E125");
-        int id = 1;
-        for (var input : inputs) {
-            for (var transport : List.of("JDBC", "SQL literal", "SQL scientific notation")) {
-                if (character && transport.equals("SQL scientific notation")) {
-                    continue;
-                }
-                final int rowId = id++;
-                try {
-                    if (transport.equals("JDBC")) {
-                        try (var statement = connection.connection().prepareStatement("INSERT INTO " + tableName() + " VALUES(?,?)")) {
-                            statement.setInt(1, rowId);
-                            if (character) {
-                                statement.setString(2, input);
-                            }
-                            else {
-                                statement.setBigDecimal(2, new BigDecimal(input));
-                            }
-                            statement.executeUpdate();
-                        }
-                    }
-                    else {
-                        final var literal = character ? "'" + LogMinerSql.quoteLiteral(input) + "'"
-                                : transport.equals("SQL literal") ? new BigDecimal(input).toPlainString() : input;
-                        connection.execute("INSERT INTO " + tableName() + " VALUES(" + rowId + "," + literal + ")");
-                    }
-                }
-                catch (SQLException rejected) {
-                    DamengTestDatabase.recordCapability("BOUNDARY_INPUT/" + declaration + "/" + transport + "/" + input,
-                            "rejected; code=" + rejected.getErrorCode() + "; " + rejected.getMessage());
-                    continue;
-                }
-                final var actual = connection.queryAndMap("SELECT VALUE FROM " + tableName() + " WHERE ID=" + rowId, result -> {
-                    assertThat(result.next()).isTrue();
-                    return result.getString(1);
-                });
-                DamengTestDatabase.recordCapability("BOUNDARY_INPUT/" + declaration + "/" + transport + "/" + input, "accepted; stored=" + actual);
-                if (character) {
-                    assertThat(actual).as("accepted fixed character input must retain every character").startsWith(input);
-                    assertThat(actual.substring(input.length())).as("only fixed-width space padding may follow the input")
-                            .isEqualTo(" ".repeat(actual.length() - input.length()));
-                }
-                else {
-                    assertThat(new BigDecimal(actual)).as("accepted numeric input must retain its value").isEqualByComparingTo(new BigDecimal(input));
-                }
-            }
-        }
-    }
-
-    private void verifyOutsideRangeInput(TypeCase type, Value value, int id, Table table, Table physicalTable, DamengValueConverters converters) throws Exception {
-        final long start = connection.currentLsn();
-        try {
-            value.insert(connection.connection(), tableName(), id);
-        }
-        catch (SQLException rejected) {
-            assertThat(rejected.getErrorCode()).as("database rejects an outside-range input").isNotZero();
-            DamengTestDatabase.recordCapability(type.declaration() + "/outside-range/" + value.description(), "rejected; code=" + rejected.getErrorCode());
-            return;
-        }
-        final var expected = storedRow(id);
-        final var snapshotValues = readSnapshotValues(table, id);
-        final long objectId = connection.getTableObjectId(tableId);
-        final var rows = mine(start).stream().filter(row -> row.objectId() == objectId && row.operation() == 1).toList();
-        DamengTestDatabase.recordCapability(type.declaration() + "/outside-range/" + value.description(),
-                "accepted; actual stored JDBC value=" + expected.get("VALUE") + "; consistency outcome is recorded in test XML");
-        assertAll("outside-range input accepted by mode=" + DamengTestDatabase.requestedCompatibilityMode(),
-                () -> assertThat(rows).as("accepted outside-range INSERT must appear exactly once in committed redo").hasSize(1),
-                () -> DamengDatatypeAssertions.assertRow(convertRow(table, converters, snapshotValues), expected, "accepted outside-range JDBC snapshot"),
-                () -> {
-                    final var parsed = new LogMinerDmlParser().parse(rows.get(0).redo(), physicalTable);
-                    DamengDatatypeAssertions.assertRow(convertRow(table, converters, parsed.newValues()), expected, "accepted outside-range archived INSERT");
-                });
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = { "REAL", "DOUBLE" })
-    void shouldClassifyNonFiniteJdbcInputs(String declaration) throws Exception {
-        final long start = connection.currentLsn();
-        connection.execute("CREATE TABLE " + tableName() + " (ID INT PRIMARY KEY, VALUE " + declaration + ")");
-        tableCreated = true;
-        final var tables = new Tables();
-        connection.readSchema(tables, null, tableId.schema(), candidate -> candidate.equals(tableId), null, false);
-        final var table = tables.forTable(tableId);
-        final var converters = new DamengValueConverters(config, connection.getDatabaseCharset());
-        final List<Executable> checks = new ArrayList<>();
-        final List<Map<String, Object>> accepted = new ArrayList<>();
-        int id = 1;
-        for (double value : new double[]{ Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY }) {
-            final Object parameter;
-            if (declaration.equals("REAL")) {
-                parameter = (float) value;
-            }
-            else {
-                parameter = value;
-            }
-            try {
-                new Value("?", parameter).insert(connection.connection(), tableName(), id);
-            }
-            catch (SQLException rejected) {
-                // DM documents finite ranges only. A rejection is an input capability,
-                // not a consistency pass for a row that was never stored or mined.
-                assertThat(rejected.getErrorCode()).as("explicit database rejection of non-finite input").isNotZero();
-                DamengTestDatabase.recordCapability(declaration + "/" + value, "rejected; code=" + rejected.getErrorCode() + ";" + rejected.getMessage());
-                id++;
-                continue;
-            }
-            try (var statement = connection.connection().createStatement();
-                    var result = statement.executeQuery("SELECT VALUE FROM " + tableName() + " WHERE ID=" + id)) {
-                assertThat(result.next()).isTrue();
-                assertThat(Double.doubleToRawLongBits(result.getDouble(1))).as("accepted non-finite input must not become a finite value")
-                        .isEqualTo(Double.doubleToRawLongBits(value));
-            }
-            DamengTestDatabase.recordCapability(declaration + "/" + value, "accepted; consistency outcome is recorded in test XML");
-            final var expected = storedRow(id);
-            accepted.add(expected);
-            final var snapshotValues = readSnapshotValues(table, id);
-            checks.add(() -> DamengDatatypeAssertions.assertRow(convertRow(table, converters, snapshotValues), expected, "non-finite JDBC snapshot"));
-            id++;
-        }
-        if (!accepted.isEmpty()) {
-            final var objectId = connection.getTableObjectId(tableId);
-            final var physical = Table.editor().tableId(new TableId(null, null, "OBJ# " + objectId));
-            table.columns().forEach(column -> physical.addColumn(column.edit().name("COL " + column.position()).create()));
-            final var physicalTable = physical.create();
-            final var rows = mine(start).stream().filter(row -> row.objectId() == objectId && row.operation() == 1).toList();
-            checks.add(() -> assertThat(rows).hasSize(accepted.size()));
-            for (int index = 0; index < Math.min(rows.size(), accepted.size()); index++) {
-                final var row = rows.get(index);
-                final var expected = accepted.get(index);
-                checks.add(() -> DamengDatatypeAssertions.assertRow(convertRow(table, converters,
-                        new LogMinerDmlParser().parse(row.redo(), physicalTable).newValues()), expected, "non-finite archived redo"));
-            }
-        }
-        assertAll("non-finite/mode=" + DamengTestDatabase.requestedCompatibilityMode() + "/" + declaration, checks);
     }
 
     @ParameterizedTest

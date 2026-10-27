@@ -152,7 +152,7 @@ DM JDBC 的 `compatibleMode` 驱动选项也不等同于服务器参数，不能
 `latest` 是可变标签；记录实际镜像身份、服务器构建和驱动，才能复核测试环境。
 先前标为 `2026` 的另一镜像不纳入当前验收基线，不能把它当作较新数据库版本的验证证据。
 
-旧基线的已知限制包括 REAL/FLOAT/DOUBLE 的 LogMiner 文本精度损失、带时区 TIME 的小数秒缺失，以及不支持 `TIMESTAMP WITH LOCAL TIME ZONE` 的安全历史解码；新构建是否改善以本轮严格断言结果为准。
+旧基线的已知限制包括 REAL/FLOAT/DOUBLE 的 LogMiner 文本精度损失、带时区 TIME 的小数秒缺失，以及无法无损还原 `TIMESTAMP WITH LOCAL TIME ZONE` 的历史时间点；当前有损映射见 <<dameng-local-time-zone-policy,当前策略>>。
 完整行外 BLOB/CLOB 流式采集也未支持；占位值不代表完整 LOB 内容。
 部分 DDL 语法只有解析器单测或仍不支持。
 这些限制不因版本被列为“已测试”而消失；具体字段与 DDL 行为见 <<dameng-connector,Connector 使用说明>>。
@@ -683,26 +683,24 @@ JSON 中 bytes 常呈 Base64；Decimal 的 JSON 表示还取决于 Converter 设
 |未限定精度的 NUMBER/NUMERIC/DECIMAL |STRUCT |物理 DECIMAL/NUMERIC 元数据长度非正时，precise 下为 `io.debezium.data.VariableScaleDecimal`，包含 scale 和非标度 value；不将不同 scale 强行统一。
 |CHAR、NCHAR、VARCHAR、VARCHAR2、NVARCHAR 等字符列 |STRING |CHAR/NCHAR 保留定长空格；按历史字节长度和字符集补齐 LogMiner 省略的 padding。
 |BINARY、VARBINARY、RAW |BYTES |或按 binary.handling.mode 输出 Base64、URL-safe Base64、hex 字符串。仅二进制列将日志 `'0x'` 解为空数组，文本列仍为文字。
-|DATE |INT32 |adaptive 下 `io.debezium.time.Date`，距 1970-01-01 的天数；保留公元前年份语义。
-|TIME(p)，p ≤ 3 |INT32 |`io.debezium.time.Time`，午夜起毫秒；原生 TIME 未声明精度时 p=0。
-|TIME(p)，4 ≤ p ≤ 6 |INT64 |`io.debezium.time.MicroTime`，午夜起微秒。
-|TIMESTAMP/DATETIME，p ≤ 3 |INT64 |`io.debezium.time.Timestamp`，以毫秒编码无时区日历时间，不代表已获知写入会话时区。
-|TIMESTAMP/DATETIME，4 ≤ p ≤ 6 |INT64 |`io.debezium.time.MicroTimestamp`，微秒精度。
-|TIMESTAMP，7 ≤ p ≤ 9 |INT64 |8.1.3.162 可接受声明，默认映射 `io.debezium.time.NanoTimestamp`。仅约 1677 至 2262 年可用 INT64 纳秒表示；0001/9999 年的 snapshot 和 streaming 实测告警后输出 null，不能宣称完整数据库时间范围无损。
+|DATE |STRING |默认无逻辑类型名称，例如 `1965-02-03`；显式选择 isostring 时使用 `io.debezium.time.IsoDate` 和末尾 `Z`，adaptive 时输出距 1970-01-01 的 INT32 天数。
+|TIME(p) |STRING |默认无逻辑类型名称，例如 `12:34:56.123456`；小数秒以实际存储值为准。显式 isostring 使用 `io.debezium.time.IsoTime`。
+|TIMESTAMP/DATETIME |STRING |默认无逻辑类型名称，例如 `2026-09-24 12:34:56.123456`。普通 TIMESTAMP 没有源时区，输出不附加时区。显式 isostring 使用 `io.debezium.time.IsoTimestamp` 的 `T`/`Z` 形式。达梦在显式 adaptive 与 adaptive_time_microseconds 模式下，对声明精度 7～9 的普通 TIMESTAMP 也固定使用 IsoTimestamp，以避开 INT64 纳秒范围限制。
 |TIME WITH TIME ZONE |STRING |`io.debezium.time.ZonedTime`，归一到 UTC 时刻，跨午夜不附加日期；旧 8.1.2.128 小数秒受限，8.1.3.162 的 TIME(1..6) WITH TIME ZONE 严格矩阵已通过。
 |TIMESTAMP WITH TIME ZONE |STRING |`io.debezium.time.ZonedTimestamp`，保留瞬时和小数秒，归一 UTC，不保留最初写入的偏移格式。
 |INTERVAL |STRING |`io.debezium.time.Interval` version 1，保留年/月或日/时间单位及精确十进制秒。
 |CLOB / BLOB |STRING / BYTES |快照可读取完整内容；流式行外值不完整时输出不可用占位值，非完整 LOB CDC。
-|TIMESTAMP WITH LOCAL TIME ZONE |不支持 |JDBC 依赖读取时区、无字典日志缺失写入时区，不能安全统一解释。
+|TIMESTAMP WITH LOCAL TIME ZONE |STRING |仅此类型输出 `io.debezium.time.ZonedTimestamp` 的 UTC 格式字符串。初始及增量快照使用 UTC 读取会话；流式归档 LogMiner 的本地时间文本直接按 UTC 解释，不保证还原真实 instant。
 |复杂对象、集合及无已验证映射的类型 |不支持 |明确报 schema 错误，不静默丢列。公共转换器中出现 XML/ROWID 等分支不代表达梦已完成其 CDC 验收。
 |===
 
 === Decimal、时间和默认值
 
 decimal.handling.mode=precise 保留固定 scale 或 VariableScaleDecimal；string 避免下游十进制类型限制；double 可能损失有效位。
+达梦默认 `time.precision.mode=sqlstring`，DATE、TIME、普通 TIMESTAMP 使用无 `T`/`Z` 的 SQL 风格字符串；字符串不表示 UTC 时间点，也没有 Kafka Connect 时间逻辑类型名称。带时区类型与 LOCAL TIME ZONE 的独立语义见上表。显式 `isostring` 保留以前的 ISO 8601 `T`/`Z` 格式；显式选择 adaptive、adaptive_time_microseconds、microseconds 或 nanoseconds 时，普通时间字段按该模式的数字单位输出；显式纳秒仍受 INT64 范围限制。
 `time.precision.mode=connect` 使用 Kafka Connect Date/Time/Timestamp，只保证毫秒；其他公共模式的单位见参数说明。
 TIMESTAMP(7..9) 等高精度声明、超大 NUMBER 和中文 CHAR 长度边界在旧构建上存在声明或驱动/存储限制。
-8.1.3.162 复测后，中文 CHAR 边界、ROWID 普通列用例及部分高精度时间通过；超大 NUMBER 和纳秒时间的极端年份仍失败。版本差异和具体用例见 <<dameng-regression-813162,新版本回归>>，不能把某些边界通过扩大为整个类型全范围无损。
+8.1.3.162 复测后，中文 CHAR 边界、ROWID 普通列用例及部分高精度时间通过；超大 NUMBER 和默认纳秒时间映射的极端年份在修改前仍失败。当前 `TIMESTAMP(7..9)` 默认使用字符串映射；版本差异和历史结果见 <<dameng-regression-813162,新版本回归>>。
 日期按原始日历文本解析，避免旧 JDBC java.sql.Date/Timestamp 丢失 BCE 年代；接受日志中不补零的年份，不使用 JVM locale 猜测格式。
 LogMiner TO_DATE/TO_TIMESTAMP/TO_TIMESTAMP_TZ 仅解析已支持的 ISO 格式，例如 YYYY-MM-DD、YYYY-MM-DD HH24:MI:SS.FF6 和带 TZH:TZM 的形式。
 不支持表达式或格式会失败，CURRENT_TIMESTAMP 等表达式默认值不会在 Connector 中当场求值来伪造历史值。
@@ -721,11 +719,11 @@ INTERVAL 覆盖 13 种 year/month 和 day/time qualifier，leading precision 1�
 日志已缺失的信息无法从文本推回，也不能用当前表行修复旧更新或已删除行。
 精确一致性要求涉及这些字段时，必须验证能保留原值的数据库构建和接口。
 
-原始 Connect 浮点值保留负零；旧 8.1.2.128 可写入的 NaN 也有原始事件回归，但 8.1.3.162 配合当前 JDBC 驱动会在 NaN 写入时返回 Data overflow。
+原始 Connect 浮点值保留负零；历史测试观察到旧 8.1.2.128 可写入 NaN，但 8.1.3.162 配合当前 JDBC 驱动会在 NaN 写入时返回 Data overflow。当前数据库 CDC 一致性用例已移除 NaN 写入输入。
 已验证的 Kafka 4.3.0 schema-enabled JsonConverter 在往返解码中可能丢失负零；旧版本 NaN 编成字符串后数值解码为零的问题，不能用新版拒绝写入来宣称修复。
 这是序列化往返问题，不是原始 Connector 值相同；其他 Converter/Worker 版本须分别验收。
-LOCAL TIME ZONE 不能通过“统一假设 UTC，再转换到用户时区”修复，因为 snapshot 与 redo 的原始时间基准不同且历史写入时区缺失。
-排除现有列可以避免其值映射，但不保证声明该类型的历史 DDL 可以重放。
+LOCAL TIME ZONE 采用显式有损的 UTC 假设：快照在 UTC 读取会话下得到数据库换算后的时间，归档 LogMiner 则暴露写入会话的本地时间并直接标为 UTC。写入会话不是 UTC 时，二者可能表示不同时间；该字段不适合直接用于跨阶段去重或真实时间点计算。Connector 不提供原写入会话时区；下游必须从外部掌握相关时区才能尝试恢复，不能仅凭消息中的 `Z`。UPDATE/DELETE 的历史 before 值是否能用当前操作会话时区修正也未验证。
+历史 DDL 保留该列的独立类型身份；普通 TIMESTAMP 与 TIMESTAMP WITH TIME ZONE 不采用这项假设。
 
 流式 `OUT_CLOB` / `OUT_BLOB` 或被省略的 LOB before-image 使用 unavailable.value.placeholder，BLOB 标记经过 UTF-8 和所选二进制模式编码。
 显式 SQL NULL 保持 null；消费者应区分缺失值、NULL 和真实字段内容。
@@ -1195,7 +1193,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |===
 |参数 |默认值 |用途与限制
 |`decimal.handling.mode` |`precise` |precise 保留 Decimal/VariableScaleDecimal；string 输出文本；double 使用浮点，可能损失精度。
-|`time.precision.mode` |`adaptive` |按声明精度选择逻辑类型；另有 connect、adaptive_time_microseconds、isostring、microseconds、nanoseconds 公共映射。connect 只保留毫秒，非默认组合需核验边界。
+|`time.precision.mode` |`sqlstring` |DATE、TIME 和普通 TIMESTAMP 默认输出无时区的 SQL 风格 STRING，例如 `2026-09-24 12:34:56.123456`，无时间逻辑类型名称。显式配置 isostring、adaptive、adaptive_time_microseconds、connect、microseconds 或 nanoseconds 可选择其他映射；达梦对高精度普通 TIMESTAMP 的 adaptive 映射仍固定使用 IsoTimestamp。connect 只保留毫秒，显式 nanoseconds 受 INT64 范围限制。
 |`binary.handling.mode` |`bytes` |bytes、base64、base64-url-safe、hex；改变二进制字段的 schema/表示。
 |`unavailable.value.placeholder` |`__debezium_unavailable_value` |日志没有完整 LOB 内容时的标记；BLOB 标记先按 UTF-8 编码，再应用 binary.handling.mode。不是 SQL NULL。
 |`schema.name.adjustment.mode` |`none` |调整事件 schema 名称，可用 avro/avro_unicode 等公共规则；不改变数据库标识符。
@@ -1980,7 +1978,7 @@ DamengDatatypesIT 的 769 个调用执行完成：703 通过，42 个断言失�
 |NaN 写入拒绝 |6 |4 个原始 Connect 场景为新增失败，另 2 个矩阵用例原已因 JSON 失败。本轮均在 JDBC INSERT 阶段报 Data overflow，尚未进入 CDC，不能算 NaN 的 JSON 问题已经修复。
 |NUMBER/DECIMAL/NUMERIC 的 ±1E125 |18 |当前数据库/驱动组合仍拒绝这些输入，未进入 Connector。
 |TIMESTAMP(7..9) 的 0001/9999 年 |6 |新版允许声明及写入，但默认 NanoTimestamp 的 INT64 epoch 纳秒范围不足。日志显示 long overflow，snapshot 和 streaming 的对应非空值变成 null；这是输出一致性缺陷，不能仅描述为测试断言空指针。
-|TIMESTAMP WITH LOCAL TIME ZONE |1 |现有实现仍主动拒绝缺少可恢复时区语义的列。
+|TIMESTAMP WITH LOCAL TIME ZONE |1 |当轮实现仍主动拒绝缺少可恢复时区语义的列；后续已改为显式有损 UTC 映射，见 <<dameng-local-time-zone-policy,当前策略>>。
 |===
 
 除此之外，词法组合新增 2 个失败：BACKSLASH_ESCAPE=1、NESTED_C_STYLE_COMMENT=0/1 时，普通字面量 `'A\0B'` 返回 `A0B`，不再满足旧版保留反斜杠的规则。
@@ -2010,6 +2008,27 @@ ROWID 的 JDBC 结构加 CRUD 可以通过，`CREATE TABLE ... VALUE ROWID` 的�
 66 个失败调用的测试名称、失败类别和错误消息与上一轮逐项一致，没有新增或消失的字段失败；上表的六类原因仍适用。
 原始 XML 位于 `debezium-connector-dameng/target/official-pack1-20261023-datatypes/reports/`。
 
+后续测试分类调整：字段一致性目录只保留数据库已接受的输入，移除了 `3.5E38`、`1E309`、NaN、当前构建拒绝的 `±1E125` 以及其他专门验证数据库拒绝的输入。
+对当前 LogMiner 已知有损的严格浮点检查仍保留，但日常数据库回归跳过；显式传入 `-Ddameng.datatype.floating.diagnostics=true` 可重新执行并观察失败。
+正负零按数值相等比较。以上 66 项是调整前的历史复测数据，不代表调整后整套回归已经通过。
+
+2026-10-26 使用同一官方 pack1 镜像重跑调整后的完整 `DamengDatatypesIT`：708 项中 691 项通过、7 项断言失败、0 项错误、10 项跳过。
+数据库拒绝写入的用例已不在当轮字段一致性目录中；保留的 7 项失败均发生在数据库接受输入之后，其中 6 项为 `TIMESTAMP(7..9)` 的 0001/9999 年值超出 Connector 默认纳秒时间表示范围，1 项为当轮明确拒绝的 `TIMESTAMP WITH LOCAL TIME ZONE`。这些是修改前的历史结果。
+跳过的 10 项是 9 个浮点字段矩阵和 1 个聚焦浮点方法；严格浮点诊断仍可通过 `-Ddameng.datatype.floating.diagnostics=true` 显式执行。
+
+针对其中 6 项年份越界，在官方 pack1 镜像上以 `time.precision.mode=isostring` 运行 `TIMESTAMP(7)`、`TIMESTAMP(8)`、`TIMESTAMP(9)` 定向回归，3 项全部通过。
+每种精度覆盖 0001 年、9999 年和两个中间值，逐一对照 JDBC 回读的实际存储值，检查快照、增量 INSERT/UPDATE/DELETE 前后镜像及 JSON 往返；事件逻辑类型为 `io.debezium.time.IsoTimestamp`。
+这验证了字符串映射避开 `INT64` 纳秒范围限制，并不证明数据库保留了输入字面量的 7 至 9 位小数秒。当时 `TIMESTAMP WITH LOCAL TIME ZONE` 仍被拒绝；后续策略见 <<dameng-local-time-zone-policy,当前策略>>。
+切换现有任务的 `time.precision.mode` 会改变时间字段的 Kafka Connect schema，消费者必须按新类型适配。
+
+2026-10-27 先将达梦普通 `TIMESTAMP(7..9)` 在当时默认的 adaptive 模式下改为固定 `IsoTimestamp` schema，而不是逐条记录在纳秒溢出时切换到微秒单位。一个字段的 Kafka Connect schema 必须对每条记录保持相同的单位和逻辑类型。
+官方 pack1 镜像的 12 个定向边界用例全部通过，覆盖三个精度各自的 0001、1969、2000 和 9999 年，逐一核对 snapshot、流式 CRUD 与 JSON 往返。历史的六项纳秒溢出失败不再适用于这一映射；该定向结果不代表完整字段矩阵或其他数据库集成测试已在此次修改后重新执行。
+升级已有任务时，这些字段从 `NanoTimestamp` INT64 变为 `IsoTimestamp` STRING，下游必须按新 schema 解析。显式配置 `time.precision.mode=nanoseconds` 仍选择原来的纳秒映射及其范围限制。
+
+随后将达梦 Connector 的默认 `time.precision.mode` 从 adaptive 改为 isostring，DATE、TIME、普通 TIMESTAMP 的所有声明精度都默认输出 ISO 字符串。显式配置 adaptive 的任务仍按原模式工作，但普通 `TIMESTAMP(7..9)` 保留上述 IsoTimestamp 安全映射。未显式设置该参数的已有任务升级后，日期和时间字段的 Kafka Connect schema 与值表示都会改变；消费者必须先适配。
+
+之后默认值从 isostring 改为 sqlstring。普通 DATE、TIME、TIMESTAMP 改为无 `T`/`Z` 的字符串，Connect schema 为无逻辑类型名称的 STRING；带时区类型和 LOCAL TIME ZONE 保持各自原有的 UTC 字符串表示。已有任务若依赖旧格式，应显式配置 `time.precision.mode=isostring`；默认值变更会再次改变普通时间列的 Kafka Connect schema 与字段值。
+
 另外 16 个数据库集成测试类执行 154 项，首轮 148 通过、5 个断言失败、1 个错误。
 其中 2 项是已知的 BACKSLASH_ESCAPE=1 字面量差异；2 项主备手动切换失败暴露了仅在备库挖掘模式创建的 `primaryConnection` 被手动切换模式解引用的问题，修复后 `DamengPrimaryStandbyIT` 3/3 通过。
 备库事件等待首轮失败，独立复测 `DamengStandbyIT` 5/5 通过，未稳定复现。
@@ -2038,7 +2057,7 @@ Kafka Connect 进程级测试使用本地 `hub.badxiao.top/library/eclipse-temur
 |边界 |用例数 |本轮表现
 |普通浮点及 JSON 负零/NaN |37 |包括 26 个聚焦浮点用例和 11 个矩阵用例；原始 LogMiner 精度限制及标准 JsonConverter 往返差异。
 |TIME(1..6) WITH TIME ZONE |6 |小数秒不能完整保留。
-|TIMESTAMP WITH LOCAL TIME ZONE |1 |当前 Connector 明确拒绝未经验证的类型映射。
+|TIMESTAMP WITH LOCAL TIME ZONE |1 |当轮 Connector 明确拒绝未经验证的类型映射；这是修改前的历史结果。
 |无约束 NUMBER / DECIMAL / NUMERIC |18 |正负 1E125 在三个 decimal 模式下被基线数据库拒绝。
 |TIMESTAMP(7..9)，含 WITH TIME ZONE |15 |基线数据库拒绝高精度声明。
 |CHAR(8 CHAR) 多字节边界 |3 |基线数据库拒绝对应中文/emoji 输入。
@@ -2076,7 +2095,7 @@ Kafka Connect 进程级测试使用本地 `hub.badxiao.top/library/eclipse-temur
 |A |REAL / FLOAT / DOUBLE 普通值 |30 |流式原始 Connect 值已不一致；21 项聚焦用例和 9 项矩阵用例 |数值可被舍入或归零，影响 INSERT after、UPDATE before/after、DELETE before。9 项矩阵同时存在负零 JSON 问题，仍只计一次。
 |B |负零、NaN，仅 JSON 失败 |7 |原始 Connect 值通过；snapshot 和 streaming 的 JSON 解码结果不一致 |5 项负零、2 项 NaN。影响使用此解码路径的下游；不等于原始事件或 Broker 丢值。
 |C |TIME(1..6) WITH TIME ZONE |6 |流式原始 Connect 值丢小数秒；snapshot 检查通过 |时区时间的秒内精度丢失，前后镜像均受影响。
-|D |TIMESTAMP(6) WITH LOCAL TIME ZONE |1 |snapshot 建立输出 schema 时主动抛 DataException |任务明确失败，尚未支持该类型的可靠历史时间解释。
+|D |TIMESTAMP(6) WITH LOCAL TIME ZONE |1 |当轮 snapshot 建立输出 schema 时主动抛 DataException |当轮任务明确失败；后续改为有损 UTC 映射，不代表已恢复真实时间点。
 |E |NUMBER / DECIMAL / NUMERIC，正负 1E125 |18 |初始化测试数据 INSERT，Data overflow |数据库没有接受输入；Connector 尚未启动，无法判定这些值的 CDC 一致性。
 |F |TIMESTAMP(7..9)，含 WITH TIME ZONE |15 |CREATE TABLE，Precision is out of range |该构建未接受精度声明，尚未到数据写入或 CDC 阶段。
 |G |CHAR(8 CHAR)，7/8 个中文字符及 8 个 emoji |3 |初始化测试数据 JDBC INSERT，Param incompatible |输入没有成功存入，不能描述为 Connector 采集后截断中文。
@@ -2123,15 +2142,22 @@ TIME(0) WITH TIME ZONE、无时区 TIME 与带时区 TIMESTAMP 必须分别看�
 这是可以单独评估修复的转换/消费协议问题：在 Kafka 依赖版本保持不变的条件下，验证自定义 Converter 或下游显式解码协议，并检查 schema、存量消息和消费者兼容性。
 本次未实现或验证替代 Converter，不能宣称换一种格式就已解决。
 
-==== D：LOCAL TIME ZONE 的安全拒绝
+[[dameng-local-time-zone-policy]]
+==== D：LOCAL TIME ZONE 的当前策略与历史验证
 
-本轮 CREATE/INSERT 已成功，失败发生在 `DamengValueConverters.schemaBuilder()`，通过 schema change 分发回传为 `Dameng connector failed`。
-底层原因明确为 `Unsupported Dameng TIMESTAMP WITH LOCAL TIME ZONE`；并非等待消息超时或数据库不支持建列。
+旧版 CREATE/INSERT 已成功，但 snapshot 在 `DamengValueConverters.schemaBuilder()` 主动拒绝 LTZ，底层原因为 `Unsupported Dameng TIMESTAMP WITH LOCAL TIME ZONE`。这是实现修改前的历史结果。
 历史跨会话诊断发现：快照随读取会话时区变化，而日志文本没有携带足够的原始写入时区信息，无法唯一恢复 instant。
-仅给 Task 设置一个默认 UTC 的参数，不能保证所有写入会话的历史时间都可以正确解释。
+2026-10-26 在官方 8.1.3.162 pack1 构建 `03134284194-20240703-234060-20108` 上重新验证：两个写入会话分别设置 `+05:45` 和 `-12:59`，写入同一无偏移字面量 `2000-02-29 12:34:56.123456`。
+UTC 读取会话分别得到 `2000-02-29 06:49:56.123456` 与 `2000-03-01 01:33:56.123456`，即两个不同 instant；对应归档 `SQL_REDO` 均为同一个 `TIMESTAMP'2000-02-29 12:34:56.123456'`。
+挖掘会话设为 UTC 或 `+08:00` 时，两条 redo 的表达式都保持相同；另一组测试也确认同一行的 JDBC 读值会随读取会话时区变化。
+在线字典模式下，`DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, 'schema.table.VALUE')` 对这两条历史 INSERT 也都返回 `2000-02-29 12:34:56.123456`；挖掘会话设为 UTC 或 `+08:00` 结果相同。因此在已验证的 `SQL_REDO` 和 `MINE_VALUE` 路径中，都没有得到可区分这两个 instant 的列值。
+后续对照加入第三条：在 `-12:59` 写入会话用 `2000-02-28 17:50:56.123456` 表示第一条的同一个 UTC 时间点。归档 `SQL_REDO` 和 `MINE_VALUE` 仍返回这个不同的本地时间文本，说明已测输出不是统一的 UTC 时间。第四条在 `+05:45` 会话写入带显式 `-12:59` 偏移的 `2000-02-29 12:34:56.123456`；挖掘结果为 `2000-03-01 07:18:56.123456`，说明输出也不是简单复制 INSERT 原文，而是呈现写入会话的本地时间。
+`MINE_VALUE` 的 JDBC 元数据为 `VARCHAR`，`getObject()` 返回 `String`。将该字符串再读成 `Timestamp` 只会引入客户端时区解释，不会恢复写入时区。上述实验确定的是公开 LogMiner 查询的时间基准，未直接解码归档文件的原始二进制编码；不能断言物理 redo 内部一定按写入会话时区存储。
+`DamengDatatypeProbeIT.shouldExposeAmbiguousLocalTimezoneRedoAcrossWriterSessions` 将这种歧义作为回归断言。结论限于本构建已测的归档 `SQL_REDO` 和在线字典 `MINE_VALUE` 路径，不排除未来数据库版本或其他接口提供可恢复的原始时间点。
+当前实现按用户选择接受这种语义损失：只对 `TIMESTAMP WITH LOCAL TIME ZONE` 将流式本地时间文本当作 UTC，并将 Connector 的 JDBC 会话设为 UTC 以固定 snapshot 读取基准。输出是带 `Z` 的 `io.debezium.time.ZonedTimestamp` 字符串，不声明流式输出是真实 instant。普通 `TIMESTAMP` 和 `TIMESTAMP WITH TIME ZONE` 维持原有映射。
+在官方 8.1.3.162 pack1 上，完整引擎定向测试覆盖同表三种时间类型的 snapshot、INSERT、UPDATE、DELETE：`+05:45` 写入的 LTZ 在快照为 `2000-02-29T06:49:56.123456Z`，流式为 `2000-02-29T12:34:56.123456Z`；另外两列未被套用 LTZ 规则。下游恢复需要每条写入对应的会话时区，任务配置一个固定默认时区不能保证所有历史记录正确。
 
-恢复支持需要先验证共同的时间基准或提供可恢复原始 instant 的接口，再覆盖不同写入会话、显式偏移、夏令时及重启回放。
-暂时应按不支持能力管理，保留明确拒绝；排除已有列可避开值映射，但不保证历史 DDL 声明此类型时能重放。
+若未来要求无损支持，仍需验证能取得每条历史记录原始 instant 或写入会话时区的数据库接口，并覆盖不同写入会话、显式偏移、夏令时及重启回放。
 
 ==== E/F/G/H：数据库未接受测试声明或输入
 

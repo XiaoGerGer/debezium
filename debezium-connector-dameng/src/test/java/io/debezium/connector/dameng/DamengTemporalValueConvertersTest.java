@@ -61,7 +61,7 @@ class DamengTemporalValueConvertersTest {
 
     @Test
     void shouldConvertNativeTimeLiteral() {
-        assertThat(convert(Types.TIME, new SqlExpression("TIME'12:34:56.123456'"))).isEqualTo(45_296_123_456L);
+        assertThat(convert(Types.TIME, new SqlExpression("TIME'12:34:56.123456'"))).isEqualTo("12:34:56.123456");
     }
 
     @ParameterizedTest

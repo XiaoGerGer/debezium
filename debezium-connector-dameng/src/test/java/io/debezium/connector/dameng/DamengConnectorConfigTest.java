@@ -14,6 +14,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.Configuration;
+import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.TableId;
 
@@ -177,6 +178,9 @@ class DamengConnectorConfigTest {
     void shouldUseDamengDefaults() {
         final var config = new DamengConnectorConfig(configuration().build());
 
+        assertThat(config.getTemporalPrecisionMode()).isEqualTo(TemporalPrecisionMode.SQLSTRING);
+        assertThat(config.getConfig().getString(DamengConnectorConfig.TIME_PRECISION_MODE)).isEqualTo("sqlstring");
+        assertThat(DamengConnectorConfig.configDef().configKeys().get("time.precision.mode").defaultValue).isEqualTo("sqlstring");
         assertThat(config.getDatabaseName()).isEqualTo("DAMENG");
         assertThat(config.getConfig().getInteger(DamengConnectorConfig.PORT)).isEqualTo(5236);
         assertThat(config.getSnapshotMode()).isEqualTo(DamengConnectorConfig.SnapshotMode.NO_DATA);
@@ -198,6 +202,13 @@ class DamengConnectorConfigTest {
         assertThat(config.isFailoverEnabled()).isFalse();
         assertThat(config.getJdbcConfig().getInteger("autoReconnect")).isZero();
         assertThat(config.getJdbcConfig().getInteger("rwSeparate")).isZero();
+    }
+
+    @Test
+    void shouldHonorExplicitTimePrecisionMode() {
+        final var config = new DamengConnectorConfig(configuration().with("time.precision.mode", "adaptive").build());
+        assertThat(config.getTemporalPrecisionMode()).isEqualTo(TemporalPrecisionMode.ADAPTIVE);
+        assertThat(config.getConfig().getString(DamengConnectorConfig.TIME_PRECISION_MODE)).isEqualTo("adaptive");
     }
 
     @Test

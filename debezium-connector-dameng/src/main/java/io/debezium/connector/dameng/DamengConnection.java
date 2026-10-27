@@ -97,7 +97,20 @@ public class DamengConnection extends JdbcConnection {
                 // port properties must not change the driver's service resolution.
                 driverConfig.without("hostname").without("port");
             }
-            return factory.connect(driverConfig.build());
+            final var connection = factory.connect(driverConfig.build());
+            try (var statement = connection.createStatement()) {
+                statement.execute("SET TIME ZONE '+00:00'");
+                return connection;
+            }
+            catch (SQLException e) {
+                try {
+                    connection.close();
+                }
+                catch (SQLException closeFailure) {
+                    e.addSuppressed(closeFailure);
+                }
+                throw e;
+            }
         };
     }
 
