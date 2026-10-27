@@ -119,6 +119,28 @@ public class JdbcValueConvertersTemporalPrecisionTest {
     }
 
     @Test
+    public void testSqlStringTemporalValues() {
+        final JdbcValueConverters sqlConverters = new JdbcValueConverters(null, TemporalPrecisionMode.SQLSTRING, ZoneOffset.UTC, null, null, null);
+        final Field sqlDate = new Field("date", -1, sqlConverters.schemaBuilder(dateCol).build());
+        final Field sqlTime = new Field("time", -1, sqlConverters.schemaBuilder(timeCol).build());
+        final Field sqlTimestamp = new Field("timestamp", -1, sqlConverters.schemaBuilder(timestampCol).build());
+
+        for (Field field : new Field[]{ sqlDate, sqlTime, sqlTimestamp }) {
+            assertThat(field.schema().type()).isEqualTo(Schema.Type.STRING);
+            assertThat(field.schema().name()).isNull();
+        }
+        assertThat(sqlConverters.converter(dateCol, sqlDate).convert(null)).isEqualTo("1970-01-01");
+        assertThat(sqlConverters.converter(timeCol, sqlTime).convert(null)).isEqualTo("00:00:00");
+        assertThat(sqlConverters.converter(timestampCol, sqlTimestamp).convert(null)).isEqualTo("1970-01-01 00:00:00");
+        assertThat(sqlConverters.converter(dateCol, sqlDate).convert(LocalDate.of(1, 1, 1))).isEqualTo("0001-01-01");
+        assertThat(sqlConverters.converter(timeCol, sqlTime).convert(LocalTime.of(12, 34, 56, 123_456_789)))
+                .isEqualTo("12:34:56.123456789");
+        assertThat(sqlConverters.converter(timestampCol, sqlTimestamp).convert(LocalDateTime.of(9999, 12, 31, 23, 59, 59, 999_999_999)))
+                .isEqualTo("9999-12-31 23:59:59.999999999");
+        assertThat(TemporalPrecisionMode.parse("sqlstring")).isEqualTo(TemporalPrecisionMode.SQLSTRING);
+    }
+
+    @Test
     public void testMicroseconds() {
         JdbcValueConverters convertersMicro = new JdbcValueConverters(null, TemporalPrecisionMode.MICROSECONDS, ZoneOffset.UTC, null, null, null);
         JdbcValueConverters convertersNano = new JdbcValueConverters(null, TemporalPrecisionMode.NANOSECONDS, ZoneOffset.UTC, null, null, null);

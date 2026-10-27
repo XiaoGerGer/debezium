@@ -396,6 +396,8 @@ public class JdbcValueConverters implements ValueConverterProvider {
         switch (temporalPrecisionMode) {
             case ISOSTRING:
                 return convertDateToUtcIsoString(column, fieldDefn, data);
+            case SQLSTRING:
+                return toSqlString(convertDateToUtcIsoString(column, fieldDefn, data));
             case ADAPTIVE_TIME_MICROSECONDS:
             case NANOSECONDS:
             case MICROSECONDS:
@@ -410,6 +412,8 @@ public class JdbcValueConverters implements ValueConverterProvider {
         switch (temporalPrecisionMode) {
             case ISOSTRING:
                 return convertTimeToUtcIsoString(column, fieldDefn, data);
+            case SQLSTRING:
+                return toSqlString(convertTimeToUtcIsoString(column, fieldDefn, data));
             case MICROSECONDS:
                 return convertTimeToMicrosPastMidnight(column, fieldDefn, data);
             case NANOSECONDS:
@@ -442,6 +446,9 @@ public class JdbcValueConverters implements ValueConverterProvider {
                 return convertTimestampToEpochNanos(column, fieldDefn, data);
             case ISOSTRING:
                 return convertTimestampToUtcIsoString(column, fieldDefn, data);
+            case SQLSTRING:
+                final Object isoTimestamp = convertTimestampToUtcIsoString(column, fieldDefn, data);
+                return isoTimestamp == null ? null : toSqlString(isoTimestamp).replace('T', ' ');
             case MICROSECONDS:
                 return convertTimestampToEpochMicros(column, fieldDefn, data);
             case NANOSECONDS:
@@ -449,6 +456,14 @@ public class JdbcValueConverters implements ValueConverterProvider {
             default:
                 return convertTimestampToEpochMillisAsDate(column, fieldDefn, data);
         }
+    }
+
+    private static String toSqlString(Object isoValue) {
+        if (isoValue == null) {
+            return null;
+        }
+        final String text = (String) isoValue;
+        return text.substring(0, text.length() - 1);
     }
 
     /**

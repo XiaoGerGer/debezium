@@ -50,6 +50,12 @@ public enum TemporalPrecisionMode implements EnumeratedValue {
     ISOSTRING("isostring", IsoDate::builder, x -> IsoTime.builder(), x -> IsoTimestamp.builder()),
 
     /**
+     * Represent date, time and timestamp values as SQL-style strings without a UTC suffix or a date/time separator.
+     * These values have no time zone; the schema is a plain Kafka Connect string.
+     */
+    SQLSTRING("sqlstring", SchemaBuilder::string, x -> SchemaBuilder.string(), x -> SchemaBuilder.string()),
+
+    /**
      * Represent time and date values using Kafka Connect {@link org.apache.kafka.connect.data} logical types, which always
      * have millisecond precision.
      */
