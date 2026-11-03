@@ -12,6 +12,7 @@ import java.sql.Types;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.OffsetTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -361,10 +362,14 @@ class DamengConnectionIT {
         assertThat(table.columnWithName("TTZ").jdbcType()).isEqualTo(Types.TIME_WITH_TIMEZONE);
         connection.query("SELECT TZ, TTZ, C, B FROM " + tableName(), result -> {
             assertThat(result.next()).isTrue();
-            assertThat(connection.getColumnValue(result, 1, table.columnWithName("TZ"), table))
-                    .isEqualTo(OffsetDateTime.parse("2026-09-24T12:34:56.123456+08:00"));
-            assertThat(connection.getColumnValue(result, 2, table.columnWithName("TTZ"), table))
-                    .isEqualTo(OffsetTime.parse("12:34:56.123+08:00"));
+            final var timestamp = (OffsetDateTime) connection.getColumnValue(result, 1, table.columnWithName("TZ"), table);
+            final var time = (OffsetTime) connection.getColumnValue(result, 2, table.columnWithName("TTZ"), table);
+            assertThat(timestamp).isEqualTo(result.getObject(1, OffsetDateTime.class));
+            assertThat(time).isEqualTo(result.getObject(2, OffsetTime.class));
+            // JDBC may return the session offset; the stored instant and every fractional digit must remain exact.
+            assertThat(timestamp.toInstant()).isEqualTo(OffsetDateTime.parse("2026-09-24T12:34:56.123456+08:00").toInstant());
+            assertThat(time.withOffsetSameInstant(ZoneOffset.UTC))
+                    .isEqualTo(OffsetTime.parse("12:34:56.123+08:00").withOffsetSameInstant(ZoneOffset.UTC));
             assertThat(connection.getColumnValue(result, 3, table.columnWithName("C"), table)).isEqualTo(text);
             assertThat((byte[]) connection.getColumnValue(result, 4, table.columnWithName("B"), table)).isEqualTo(binary);
         });

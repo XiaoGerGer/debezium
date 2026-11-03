@@ -28,7 +28,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
 import io.debezium.config.Configuration;
-import io.debezium.connector.dameng.ddl.DamengSqlLexer;
+import io.debezium.connector.dameng.antlr.DamengAntlrSqlLexer;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.storage.file.history.FileSchemaHistory;
 
@@ -159,7 +159,7 @@ class DamengLexicalSettingsIT extends AbstractAsyncEngineConnectorTest {
     }
 
     private void verifyLiteralSemantics(int nested) throws Exception {
-        final var lexer = new DamengSqlLexer(nested == 1);
+        final var lexer = new DamengAntlrSqlLexer(nested == 1);
         for (var prefix : List.of("'", "N'", "q'!")) {
             for (char escaped : "0abfnrtvzZ1234789xu\"\\%_中".toCharArray()) {
                 final var literal = prefix + "A\\" + escaped + "B" + (prefix.startsWith("q") ? "!'" : "'");

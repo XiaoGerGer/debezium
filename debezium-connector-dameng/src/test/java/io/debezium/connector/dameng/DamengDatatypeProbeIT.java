@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 
 import java.nio.file.Path;
 import java.sql.SQLException;
+import java.sql.Types;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -36,6 +37,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import io.debezium.config.Configuration;
 import io.debezium.connector.dameng.DamengDatatypeCases.TypeCase;
 import io.debezium.connector.dameng.DamengDatatypeCases.Value;
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.connector.dameng.logminer.LogMinerRow;
 import io.debezium.connector.dameng.logminer.LogMinerSql;
 import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer;
@@ -96,6 +98,34 @@ class DamengDatatypeProbeIT {
 
     static Stream<TypeCase> boundaryTypes() {
         return DamengDatatypesIT.boundaryTypes();
+    }
+
+    @Test
+    void shouldExposeDateTimeComponentsInDateColumn() throws Exception {
+        final long start = connection.currentLsn();
+        connection.execute("CREATE TABLE " + tableName() + " (ID INT PRIMARY KEY, VALUE DATE)");
+        tableCreated = true;
+        connection.execute("INSERT INTO " + tableName()
+                + " VALUES(1, TO_DATE('2000-02-29 12:34:56', 'YYYY-MM-DD HH24:MI:SS'))");
+        final var tables = new Tables();
+        connection.readSchema(tables, null, tableId.schema(), id -> id.equals(tableId), null, false);
+        final var column = tables.forTable(tableId).columns().get(1);
+        final var stored = connection.queryAndMap("SELECT VALUE FROM " + tableName(), result -> {
+            assertThat(result.next()).isTrue();
+            return new String[]{ result.getString(1), String.valueOf(result.getTimestamp(1)), String.valueOf(result.getObject(1)) };
+        });
+        final var objectId = connection.getTableObjectId(tableId);
+        final var redo = mine(start).stream()
+                .filter(row -> row.operation() == 1 && row.objectId() == objectId)
+                .map(LogMinerRow::redo).findFirst().orElseThrow();
+        DamengTestDatabase.recordCapability("DATE/time-component",
+                "jdbcType=" + column.jdbcType() + "; type=" + column.typeName() + "; getString=" + stored[0]
+                        + "; getTimestamp=" + stored[1] + "; getObject=" + stored[2] + "; redo=" + redo);
+        if (DamengTestDatabase.requestedCompatibilityMode() == 2) {
+            assertThat(column.jdbcType()).isEqualTo(Types.TIMESTAMP);
+            assertThat(stored[1]).contains("12:34:56");
+            assertThat(redo).contains("12:34:56");
+        }
     }
 
     @ParameterizedTest(name = "{0}")

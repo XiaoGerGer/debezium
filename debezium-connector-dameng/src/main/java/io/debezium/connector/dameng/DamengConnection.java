@@ -32,6 +32,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.DebeziumException;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.connector.dameng.compatibility.DamengCompatibilityEnvironment;
 import io.debezium.connector.dameng.compatibility.DamengCompatibilityMode;
 import io.debezium.connector.dameng.compatibility.DamengCompatibilityRegistry;
@@ -274,15 +275,33 @@ public class DamengConnection extends JdbcConnection {
                         throw new SQLException("Invalid Dameng table object identity for " + tableId);
                     }
                     // DM's system dictionary defines INFO3 byte 0 as the table kind.
-                    // The verified image uses 0 for ordinary row tables and 6 for
-                    // partition roots. HUGE/temporary/external kinds are not row CDC.
+                    // Verified row-store kinds: ordinary=0, RANGE/interval=6,
+                    // HASH=8 and LIST=11. Subpartitions are not capture roots.
                     final long tableKind = result.getLong(2) & 255;
-                    if (result.wasNull() || (tableKind != 0 && tableKind != 6)) {
+                    if (result.wasNull() || (tableKind != 0 && tableKind != 6 && tableKind != 8 && tableKind != 11)) {
                         throw new ConnectException("Captured Dameng table " + tableId + " has unsupported storage kind " + tableKind
                                 + "; only ordinary row tables and partition roots have verified complete LogMiner images. "
                                 + "Temporary, external and HUGE tables must be excluded");
                     }
                     return objectId;
+                });
+    }
+
+    /** Reads tables without captured row schemas for a new baseline, never for historical redo. */
+    public Map<TableId, DamengTableType.Identity> readNonRowTableIds() throws SQLException {
+        return queryAndMap("SELECT S.NAME, T.NAME, T.ID, BITAND(T.INFO3,255) FROM SYS.SYSOBJECTS T JOIN SYS.SYSOBJECTS S ON T.SCHID=S.ID "
+                + "WHERE S.TYPE$='SCH' AND T.TYPE$='SCHOBJ' AND T.SUBTYPE$='UTAB' AND BITAND(T.INFO3,255) IN (13,64)", result -> {
+                    final Map<TableId, DamengTableType.Identity> identities = new HashMap<>();
+                    while (result.next()) {
+                        final var id = createTableId(null, result.getString(1), result.getString(2));
+                        final long objectId = result.getLong(3);
+                        if (result.wasNull() || objectId <= 0) {
+                            throw new SQLException("Invalid Dameng non-row table object identity for " + id);
+                        }
+                        final var type = result.getInt(4) == 64 ? DamengTableType.TEMPORARY : DamengTableType.EXTERNAL;
+                        identities.put(id, new DamengTableType.Identity(type, objectId));
+                    }
+                    return Map.copyOf(identities);
                 });
     }
 

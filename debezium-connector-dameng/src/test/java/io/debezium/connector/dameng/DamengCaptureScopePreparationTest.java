@@ -27,6 +27,7 @@ import java.sql.SQLException;
 import java.sql.Types;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -36,6 +37,7 @@ import org.apache.kafka.connect.errors.ConnectException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.Configuration;
@@ -61,6 +63,32 @@ class DamengCaptureScopePreparationTest {
         when(reader.quotedTableIdString(any())).thenAnswer(invocation -> quoting.quotedTableIdString(invocation.getArgument(0)));
         when(reader.getTableObjectId(any())).thenReturn(81L);
         metadata(reader, List.of(table(FIRST), table(SECOND)));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
+    void shouldIncludeNonRowIdentityInScopeBaselineWithoutLockingOrConvertingColumns(DamengTableType kind) throws Exception {
+        final var identity = new DamengTableType.Identity(kind, 91);
+        when(reader.readNonRowTableIds()).thenReturn(Map.of(FIRST, identity));
+        final var baseline = preparation(configuration(), null).prepare(List.of(FIRST, SECOND));
+        assertThat(baseline.tables().get(0)).isEqualTo(identity.table(FIRST));
+        assertThat(baseline.tables().get(0).attributeWithName(DamengTableType.ATTRIBUTE_NAME).value()).isEqualTo(kind.name());
+        assertThat(baseline.tables().get(1).columns()).hasSize(2);
+        verify(reader, never()).executeWithoutCommitting("LOCK TABLE \"APP\".\"ADDED_A\" IN SHARE MODE");
+        verify(reader, never()).getTableObjectId(FIRST);
+        verify(reader).executeWithoutCommitting("LOCK TABLE \"APP\".\"ADDED_B\" IN SHARE MODE");
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
+    void shouldNotPersistNonRowScopeBaselineIfIdentityChangedAcrossBoundary(DamengTableType kind) throws Exception {
+        when(reader.readNonRowTableIds()).thenReturn(Map.of(FIRST, new DamengTableType.Identity(kind, 91)),
+                Map.of(FIRST, new DamengTableType.Identity(kind, 92)));
+        final var persisted = new AtomicBoolean();
+        assertThatThrownBy(() -> preparation(configuration(), null).prepare(List.of(FIRST), baseline -> persisted.set(true)))
+                .isInstanceOf(SQLException.class).hasMessageContaining("Non-row table identity changed");
+        assertThat(persisted).isFalse();
+        verify(jdbc, times(2)).rollback();
     }
 
     @Test

@@ -16,6 +16,8 @@ import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.connector.dameng.logminer.events.EventType;
+
 /**
  * Retains provisional transactions across mining windows. A boundary for an earlier
  * transaction requires reconstruction: DM can change old rows' rollback flags when
@@ -149,7 +151,8 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     }
 
     private void accept(LogMinerRow row) {
-        if (row.operation() == 37) {
+        final var eventType = row.eventType();
+        if (eventType == EventType.SEQUENCE_MODIFY) {
             return;
         }
         if (row.transactionId() == null) {
@@ -157,15 +160,15 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         }
         Transaction tx = transactions.get(row.transactionId());
         if (tx == null) {
-            if (recoveryBaselineLsn > 0 && row.startLsn() == 0 && (row.operation() == 7 || row.operation() == 38 ||
-                    (row.operation() == 36 && row.rollback() == 1 && "-1".equals(row.recordSetId())))) {
+            if (recoveryBaselineLsn > 0 && row.startLsn() == 0 && (eventType == EventType.COMMIT || eventType == EventType.XA_COMMIT ||
+                    (eventType == EventType.ROLLBACK && row.rollback() == 1 && "-1".equals(row.recordSetId())))) {
                 // A terminal marker without any post-cut row has no captured
                 // data to publish. Writers of captured tables were drained by
                 // the recovery locks before the baseline was selected.
                 return;
             }
             // A mid-transaction row without a remembered start cannot be safely committed.
-            if (!initialWindow && recoveryBaselineLsn == 0 && row.startLsn() == 0 && row.operation() != 6) {
+            if (!initialWindow && recoveryBaselineLsn == 0 && row.startLsn() == 0 && eventType != EventType.START) {
                 throw new IllegalStateException("Missing cached Dameng transaction " + row.transactionId() + " at LSN " + row.lsn()
                         + "; retain archives and restart from a complete transaction boundary");
             }
@@ -183,18 +186,18 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
             // even when LogMiner omits its pre-cut START. Archive continuity is still
             // validated on every read. V$TRX cannot be used as an allow-list here:
             // it races with commits between choosing the LSN and reading metadata.
-            tx.recoverySuffix = recoveryBaselineLsn > 0 && row.operation() != 6 && row.startLsn() < recoveryBaselineLsn;
+            tx.recoverySuffix = recoveryBaselineLsn > 0 && eventType != EventType.START && row.startLsn() < recoveryBaselineLsn;
             transactions.put(tx.id, tx);
             memoryBytes += metadata;
         }
-        if (tx.carried && (row.operation() == 7 || row.operation() == 38 || row.operation() == 36 || row.rollback() != 0)) {
+        if (tx.carried && (eventType == EventType.COMMIT || eventType == EventType.XA_COMMIT || eventType == EventType.ROLLBACK || row.rollback() != 0)) {
             reconstructionRequired = true;
         }
         tx.startLsn = Math.min(tx.startLsn, row.startLsn() > 0 ? row.startLsn() : row.lsn());
         tx.startLsn = Math.max(tx.startLsn, recoveryBaselineLsn);
-        switch (row.operation()) {
-            case 7, 38 -> tx.commitLsn = row.lsn();
-            case 36 -> {
+        switch (eventType) {
+            case COMMIT, XA_COMMIT -> tx.commitLsn = row.lsn();
+            case ROLLBACK -> {
                 // Tested DM versions use RS_ID=-1 for the terminal full rollback.
                 // START itself can be marked rolled back by ROLLBACK TO an early
                 // savepoint, so neither START nor operation 36 alone ends a tx.
@@ -204,12 +207,12 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
                     tx.startRolledBack = true;
                 }
             }
-            case 6 -> {
+            case START -> {
                 // Use only together with the terminal full rollback marker and
                 // an empty final image, never as a standalone completion signal.
                 tx.startRolledBack = row.rollback() != 0;
             }
-            case 15 -> {
+            case PRE_COMMIT -> {
                 // PRE_COMMIT alone does not complete a transaction.
             }
             default -> {

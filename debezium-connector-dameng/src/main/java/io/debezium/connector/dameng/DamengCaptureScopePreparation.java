@@ -87,23 +87,37 @@ final class DamengCaptureScopePreparation {
             }
             final var before = config.requiresDatabaseLineage() ? reader.readPrimaryStandbyIdentity() : null;
             final long magic = before == null ? reader.databaseMagic() : before.databaseMagic();
+            final var nonRow = reader.readNonRowTableIds();
             for (TableId table : tables) {
                 checkInterrupted();
+                if (nonRow.containsKey(table)) {
+                    continue;
+                }
                 // SHARE locks drain existing writers and prevent conflicting DDL.
                 // Existing captured tables remain unlocked and continue accumulating redo.
                 LOGGER.info("Dameng capture scope acquiring shared lock on added table {}", table);
                 primary.executeWithoutCommitting("LOCK TABLE " + primary.quotedTableIdString(table) + " IN SHARE MODE");
             }
             final long boundary = standby == null ? reader.currentLsn() : standby.snapshotBoundary(reader);
+            final var currentNonRow = reader.readNonRowTableIds();
+            for (TableId table : tables) {
+                if (!Objects.equals(nonRow.get(table), currentNonRow.get(table))) {
+                    throw new SQLException("Non-row table identity changed across the Dameng capture scope boundary for " + table);
+                }
+            }
             final var structures = new Tables();
             for (String schema : tables.stream().map(TableId::schema).distinct().toList()) {
                 checkInterrupted();
                 // Preserve excluded physical columns: dictionary-free redo uses their ordinals.
-                reader.readSchema(structures, null, schema, tables::contains, null, false);
+                reader.readSchema(structures, null, schema, id -> tables.contains(id) && !nonRow.containsKey(id), null, false);
             }
             final List<Table> baselineTables = new ArrayList<>();
             for (TableId table : tables) {
                 checkInterrupted();
+                if (nonRow.containsKey(table)) {
+                    baselineTables.add(nonRow.get(table).table(table));
+                    continue;
+                }
                 final var structure = structures.forTable(table);
                 if (structure == null || structure.columns().isEmpty()) {
                     throw new SQLException("Missing complete JDBC table metadata for added Dameng table " + table

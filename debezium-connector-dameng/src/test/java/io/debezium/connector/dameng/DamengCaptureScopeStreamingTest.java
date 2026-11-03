@@ -34,6 +34,7 @@ import org.junit.jupiter.api.Test;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.base.ChangeEventQueueMetrics;
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
@@ -160,22 +161,44 @@ class DamengCaptureScopeStreamingTest {
     }
 
     @Test
-    void shouldSkipUnsupportedSingleTableDdlBeforeTheCutWithoutPlanningIt() throws Exception {
+    void shouldRejectIncompleteTableDdlBeforeCaptureScopeFiltering() throws Exception {
         tables.overwriteTable(table(ADDED, 8));
+        final var original = tables.forTable(ADDED);
+        final var offset = new DamengOffsetContext(config, 90);
+        offset.validateDatabaseMagic(0);
+        final var before = offset.getOffset();
         records(List.of(ddl(101, 8, "ALTER TABLE APP.B MOVE"), dml(102, 7, 90, 120, 1), commit(120, 90, 1)));
-        execute();
-        assertThat(failure.get()).isNull();
-        assertThat(deliveredTables).containsExactly(RETAINED);
-        assertThat(delivered).singleElement().satisfies(offset -> assertThat(offset).containsEntry("event_serial_no", 1L));
+
+        source.execute(context, new DamengPartition("dm"), offset);
+
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("LSN 101", "not changed");
+        assertThat(tables.forTable(ADDED)).isSameAs(original);
+        assertThat(offset.getOffset()).isEqualTo(before);
+        assertThat(deliveredTables).isEmpty();
+        assertThat(delivered).isEmpty();
+        verify(dispatcher, never()).dispatchDataChangeEvent(any(), any(), any());
         verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(TableId.class), any());
+        verify(scope, never()).excludes(any(), anyLong(), anyLong());
+        verify(scope, never()).scannedThrough(any(), anyLong());
     }
 
     @Test
     void shouldNotUseOneObjectNumberToDiscardAnUnsupportedCompoundDdl() throws Exception {
+        final var original = tables.forTable(RETAINED);
+        final var offset = new DamengOffsetContext(config, 90);
+        offset.validateDatabaseMagic(0);
+        final var before = offset.getOffset();
         records(List.of(ddl(101, 8, "CREATE SCHEMA APP CREATE TABLE B (ID INT) CREATE TABLE A (ID INT)"), commit(120, 90, 1)));
-        execute();
-        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("compound scope");
+
+        source.execute(context, new DamengPartition("dm"), offset);
+
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("LSN 101", "SCHEMA", "not changed");
+        assertThat(tables.forTable(RETAINED)).isSameAs(original);
+        assertThat(offset.getOffset()).isEqualTo(before);
+        assertThat(deliveredTables).isEmpty();
         assertThat(delivered).isEmpty();
+        verify(dispatcher, never()).dispatchDataChangeEvent(any(), any(), any());
+        verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(TableId.class), any());
         verify(scope, never()).excludes(any(), anyLong(), anyLong());
         verify(scope, never()).scannedThrough(any(), anyLong());
     }

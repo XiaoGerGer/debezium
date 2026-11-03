@@ -18,14 +18,14 @@ import io.debezium.relational.Column;
 import io.debezium.time.Interval;
 
 /** Exact native interval decoding shared by snapshot, redo and constant defaults. */
-final class DamengInterval {
+public final class DamengInterval {
     private static final String UNIT = "YEAR|MONTH|DAY|HOUR|MINUTE|SECOND";
     private static final Pattern TYPE = Pattern.compile("^INTERVAL\\s+(" + UNIT + ")"
             + "(?:\\s*\\(\\s*(\\d+)\\s*(?:,\\s*(\\d+)\\s*)?\\))?"
             + "(?:\\s+TO\\s+(" + UNIT + ")(?:\\s*\\(\\s*(\\d+)\\s*\\))?)?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern LITERAL = Pattern.compile("^INTERVAL\\s*([+-]?)\\s*'([+-]?[^']*)'\\s*(.+)$", Pattern.CASE_INSENSITIVE);
 
-    enum Unit {
+    public enum Unit {
         YEAR,
         MONTH,
         DAY,
@@ -34,8 +34,8 @@ final class DamengInterval {
         SECOND
     }
 
-    record Type(Unit first, Unit last, int leadingPrecision, int fractionalPrecision) {
-        String typeName() {
+    public record Type(Unit first, Unit last, int leadingPrecision, int fractionalPrecision) {
+        public String typeName() {
             return "INTERVAL " + first + (first == last ? "" : " TO " + last);
         }
     }
@@ -51,7 +51,7 @@ final class DamengInterval {
         return typeName != null && typeName.strip().toUpperCase(Locale.ROOT).startsWith("INTERVAL ");
     }
 
-    static Type type(String declaration) {
+    public static Type type(String declaration) {
         return type(declaration, 2);
     }
 

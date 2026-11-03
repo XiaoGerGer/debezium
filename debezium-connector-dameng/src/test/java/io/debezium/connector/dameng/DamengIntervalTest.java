@@ -28,6 +28,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser;
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser.SqlExpression;
 import io.debezium.jdbc.JdbcConfiguration;

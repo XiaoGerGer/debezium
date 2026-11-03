@@ -55,8 +55,15 @@ final class DamengTestDatabase {
     }
 
     static synchronized void start(int backslashEscape, int nestedComments, int caseSensitive) throws Exception {
+        start(backslashEscape, nestedComments, caseSensitive, 1);
+    }
+
+    static synchronized void start(int backslashEscape, int nestedComments, int caseSensitive, int ignoreTableSet) throws Exception {
         if (caseSensitive != 0 && caseSensitive != 1) {
             throw new IllegalArgumentException("CASE_SENSITIVE must be 0 or 1");
+        }
+        if (ignoreTableSet != 0 && ignoreTableSet != 1) {
+            throw new IllegalArgumentException("RLOG_IGNORE_TABLE_SET must be 0 or 1");
         }
         if (users++ > 0) {
             return;
@@ -82,12 +89,19 @@ final class DamengTestDatabase {
                         .atMost(Duration.ofMinutes(5))
                         .pollInterval(Duration.ofSeconds(2))
                         .until(DamengTestDatabase::canConnect);
-                prepareContainerForCdc(mode, backslashEscape, nestedComments);
+                prepareContainerForCdc(mode, backslashEscape, nestedComments, ignoreTableSet);
             }
             jdbcUrl = "jdbc:dm://" + hostname + ":" + port;
             verifyCompatibilityMode(mode);
+            for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE")) {
+                final var value = System.getProperty("dameng.test.ini." + name);
+                if (value != null) {
+                    verifyLexicalParameter(name, Integer.parseInt(value));
+                }
+            }
             verifyLexicalParameter("BACKSLASH_ESCAPE", backslashEscape);
             verifyLexicalParameter("NESTED_C_STYLE_COMMENT", nestedComments);
+            verifyLexicalParameter("RLOG_IGNORE_TABLE_SET", ignoreTableSet);
             try (var admin = DriverManager.getConnection(jdbcUrl, USER, PASSWORD);
                     var statement = admin.createStatement();
                     var result = statement.executeQuery("SELECT SF_GET_CASE_SENSITIVE_FLAG()")) {
@@ -123,6 +137,46 @@ final class DamengTestDatabase {
                 USER + "/" + PASSWORD + "@127.0.0.1:5236", "`" + path);
         assertThat(result.getExitCode()).as("DISQL exit: %s", result.getStderr()).isZero();
         return result.getStdout() + result.getStderr();
+    }
+
+    /** A fixed scratch directory in the test-owned container, never an external backup location. */
+    static String createOfficialBackupDirectory() throws Exception {
+        if (container == null) {
+            throw new IllegalStateException("Official backup tests require a test-owned database container");
+        }
+        final String directory = "/opt/dmdbms/data/DAMENG/dbz_official_backup";
+        assertThat(container.execInContainer("mkdir", "-p", directory).getExitCode()).isZero();
+        assertThat(container.execInContainer("chown", "--reference=/opt/dmdbms/data/DAMENG", directory).getExitCode()).isZero();
+        return directory;
+    }
+
+    /** A local archive destination owned exclusively by the disposable state-transition fixture. */
+    static String createOfficialStateArchiveDirectory() throws Exception {
+        if (container == null) {
+            throw new IllegalStateException("Database state tests require a test-owned database container");
+        }
+        final String directory = "/opt/dmdbms/data/DAMENG/dbz_state_archive";
+        assertThat(container.execInContainer("mkdir", "-p", directory).getExitCode()).isZero();
+        assertThat(container.execInContainer("chown", "--reference=/opt/dmdbms/data/DAMENG", directory).getExitCode()).isZero();
+        return directory;
+    }
+
+    static long officialBackupDirectoryBytes() throws Exception {
+        if (container == null) {
+            throw new IllegalStateException("Official backup tests require a test-owned database container");
+        }
+        final var size = container.execInContainer("du", "-sb", "/opt/dmdbms/data/DAMENG/dbz_official_backup");
+        assertThat(size.getExitCode()).as("test backup directory size: %s", size.getStderr()).isZero();
+        return Long.parseLong(size.getStdout().trim().split("\\s+")[0]);
+    }
+
+    static void removeOfficialBackupDirectory() throws Exception {
+        if (container == null) {
+            throw new IllegalStateException("Official backup tests require a test-owned database container");
+        }
+        final String directory = "/opt/dmdbms/data/DAMENG/dbz_official_backup";
+        assertThat(container.execInContainer("rm", "-rf", "--", directory).getExitCode()).isZero();
+        assertThat(container.execInContainer("test", "!", "-e", directory).getExitCode()).as("test backup directory was removed").isZero();
     }
 
     /** Freeze inputs for paired miner benchmarks; never operates on an external database. */
@@ -164,17 +218,26 @@ final class DamengTestDatabase {
      * The published DM image starts in native mode without archive logging. Configure only the
      * container created by this test class. An explicitly supplied hostname is never changed.
      */
-    private static void prepareContainerForCdc(int mode, int backslashEscape, int nestedComments) throws Exception {
+    private static void prepareContainerForCdc(int mode, int backslashEscape, int nestedComments, int ignoreTableSet) throws Exception {
         try {
             executeAdmin("SP_SET_PARA_VALUE(2, 'COMPATIBLE_MODE', " + mode + ")");
         }
         catch (SQLException rejected) {
             throw new SQLException("Fixture cannot set COMPATIBLE_MODE=" + mode + " on this database image", rejected);
         }
+        for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE")) {
+            final var value = System.getProperty("dameng.test.ini." + name);
+            if (value != null) {
+                if (!hasIniParameter(name)) {
+                    throw new SQLException("Fixture cannot set missing parameter " + name);
+                }
+                executeAdmin("SP_SET_PARA_VALUE(2, '" + name + "', " + Integer.parseInt(value) + ")");
+            }
+        }
         executeAdmin("SP_SET_PARA_VALUE(2, 'RLOG_APPEND_LOGIC', 2)");
         executeAdmin("SP_SET_PARA_VALUE(2, 'BACKSLASH_ESCAPE', " + backslashEscape + ")");
         executeAdmin("SP_SET_PARA_VALUE(2, 'NESTED_C_STYLE_COMMENT', " + nestedComments + ")");
-        executeAdmin("SP_SET_PARA_VALUE(2, 'RLOG_IGNORE_TABLE_SET', 1)");
+        executeAdmin("SP_SET_PARA_VALUE(2, 'RLOG_IGNORE_TABLE_SET', " + ignoreTableSet + ")");
         if (hasIniParameter("RLOG_LLOG_COMPRESS")) {
             executeAdmin("SP_SET_PARA_VALUE(2, 'RLOG_LLOG_COMPRESS', 0)");
         }

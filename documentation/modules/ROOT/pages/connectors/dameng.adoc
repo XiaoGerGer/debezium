@@ -363,6 +363,11 @@ ROLL_BACK 表示这条记录已被回滚，不表示它本身是一条回滚命�
 === LogMiner 记录完整性与诊断
 
 `V$LOGMNR_CONTENTS.SCN` 表示达梦日志的 LSN。
+`OPERATION_CODE` 按照 https://eco.dameng.com/document/dm/zh-cn/pm/dm8-admin-manual-appendix2.html[达梦官方动态视图手册] 中 `V$LOGMNR_CONTENTS` 的定义映射为 `EventType`：
+`1=INSERT`、`2=DELETE`、`3=UPDATE`、`4=BATCH_UPDATE`、`5=DDL`、`6=START`、`7=COMMIT`、
+`13=LOB_NEW`、`14=LOB_DATA`、`15=PRE_COMMIT`、`36=ROLLBACK`、`37=SEQ MODIFY`、`38=XA_COMMIT`、`255=UNSUPPORTED`。
+识别操作类型不表示已经支持处理该类型；捕获范围内未处理的操作仍会报错。
+未列出的操作码映射为 `UNSUPPORTED`，日志记录和临时事务文件保留原始编号，用于分片校验和错误诊断。
 读取时显式检查必需数值字段 `SCN`、`OPERATION_CODE`、`ROLL_BACK`、`SSN`、`CSF` 的 SQL NULL，避免 JDBC 将缺失值解释为 0。
 `ROLL_BACK` 和 `CSF` 只接受 0、1。DML 首片必须具有有效 `DATA_OBJ#`；事务标记的对象 ID 可以为空。
 窗口从事务中途开始时 `START_SCN` 可为空；未提交或已回滚记录的 `COMMIT_SCN` 可为空，不据此误判事务已完成。
@@ -469,7 +474,11 @@ JMX 暴露预算、所选文件总 LEN 和文件数；启动 INFO 打印策略�
 [id="dameng-ddl"]
 == DDL、结构演进与支持边界
 
-DDL 流程分为词法识别、语句影响范围分析和历史表模型解析。
+DDL 由 ANTLR 词法和语法解析器生成解析树，再据此分析语句影响范围、构建历史表模型变更。
+表定义、列及约束变更、重命名和 CTAS/LIKE 均从解析树读取，不再使用手写的 DDL token 游标解析。DML 仍使用原有 LogMiner DML 解析器。
+字符串和 `0x` 二进制默认值也使用 ANTLR 分词，手写的 DDL 词法解析器已移除。
+ANTLR 对影响行结构的表 DDL 解析列、约束和相关子句；对已知不改变行结构的索引、普通视图、序列、同义词、权限和注释，识别对象类型及完整语句边界即可，不充当数据库的 SQL 合法性检查器。
+因此普通视图中的分析函数、JSON/XML 查询和分页等内容不依赖 Connector 的查询语法覆盖度。CTAS 需要推导列结构，仍使用受限查询解析。程序定义检查声明头和程序体边界，不完整验证 SPL。
 词法保留原始位置和字面值，识别双引号转义、N 字符串、Q 引用、`--`、`//`、`/* ... */` 注释和 hint；删注释不合并两侧单词。
 `NESTED_C_STYLE_COMMENT=0` 在第一个结束标记结束，=1 迭代平衡嵌套层数。
 旧 8.1.2.128 原生构建在 BACKSLASH_ESCAPE 的两种值下都保留普通/N/Q 字符串反斜杠，现有实现据此不进行 MySQL 式转义。
@@ -477,28 +486,124 @@ DDL 流程分为词法识别、语句影响范围分析和历史表模型解析�
 未加引号名转大写；引用名在 IDENTIFIER_MODE=0 或旧库缺失该参数时保留大小写，=1 按已实现规则转大写，但显式模式仍需目标版本验收。
 
 先验证完整输入再应用捕获过滤，不能让前面的 GRANT、索引或过程掩盖后面的表 DDL。
-已知索引、序列、视图、同义词、权限、COMMENT 和可识别的平衡 BEGIN/END 程序体可按不改变行结构处理；未知语句或残余语法不静默忽略。
+已知索引、序列、视图、同义词、权限、COMMENT 和可识别的平衡 BEGIN/END 程序体可按不改变行结构处理。非表 DDL 的内部选项和表达式不逐项验证，但不能吞掉分号后的语句、未配对括号或缺少分隔符的后续表 DDL；未知对象类型仍拒绝。
+新增的非表对象分类包括用户、目录、上下文、外部函数库、域、PROFILE、空模式和独立 `STAT` 统计语句。
+`ARRAY INDEX`、`CREATE/DROP [PUBLIC] LINK`、`CREATE/DROP OPERATOR`、`CREATE/ALTER/DROP CONTEXT INDEX`、`ALTER DATABASE/SYSTEM/SESSION`、`CREATE/ALTER/DROP TABLESPACE` 和 `SET` 也按已知语句家族识别。
+全文索引使用独立语法分支，识别索引名及 `ON` 目标表，支持创建时的 `IF NOT EXISTS` 和删除时的 `IF EXISTS`；不把 `INDEX` 当成应用上下文名称。
+OPERATOR 名称允许官网定义的符号形式；LINK 连接串中的分号仍属于字符串。上下文、LIBRARY、DOMAIN 和 PROFILE 创建语句的尾部不校验类型或选项的完整合法性，名称和语句边界仍必须可识别。
+目录支持 `CREATE [OR REPLACE] DIRECTORY [IF NOT EXISTS] <目录名> AS '<路径>'` 和 `DROP DIRECTORY [IF EXISTS] <目录名>`，目录名不带模式限定。
+CREATE 必须包含完整的 `AS` 和路径字符串；支持绝对路径和相对路径，但不检查操作系统路径是否存在。字符串内的分号或 DDL 文本属于路径，真实的后续表 DDL 不能被一起跳过。
+`DROP TABLESPACE` 依据官网只能删除未使用表空间的限制处理；`DROP DATAFILE` 属于 `ALTER TABLESPACE` 子句，不能作为独立语句跳过。
+TABLESPACE 按官网《数据定义语句》3.4.1～3.4.3 显式解析：CREATE 支持 `IF NOT EXISTS`、多数据文件、`MIRROR`、`AUTOEXTEND`、`CACHE`、加密、ASM 条带与副本选项、HUGE 路径、`FILE LIMIT` 和 `STORAGE(ON ...)`；ALTER 支持状态切换、表空间及数据文件重命名、添加/删除文件、调整大小和自动扩展、缓存、`OPTIMIZE`、HUGE 路径及文件数限制；DROP 支持 `IF EXISTS`。
+缺失必需子句、未知尾部、追加 DML 或执行语句不能被当作 TABLESPACE 操作一起跳过；`INCLUDING CONTENTS`、`CASCADE` 等非达梦表空间删除子句仍拒绝。文件大小、算法可用性及部署条件由数据库校验。
+当前官网的裸 `UNLIMITED`、`CACHE = KEEP`、`FILE LIMIT` 纳入语法测试；8.1.3.162 实测拒绝这些写法，但接受 `MAXSIZE UNLIMITED` 和 `CACHE = "KEEP"`。ASM/DSC/DPC 选项的语法覆盖不代表已在相应集群环境完成验收。
+这些分类只表示不更新历史行结构，不表示数据库角色切换、归档配置或系统参数调整不会影响 CDC 运行。
+8.1.3.162 原生模式实测 `CREATE/DROP OPERATOR @^` 会生成 DDL redo，在线采集、停机重放及历史恢复均通过；含有表的表空间删除返回 -3412，原表数据保留，删除表后可正常删除表空间。
+同版本的 `SET SCHEMA`、`ALTER SESSION SET NLS_DATE_FORMAT` 和 `SET TIME ZONE` 样本执行成功但没有新增 redo；这些语句的分类单测不能等同于实际 DDL 日志验收。
+语法依据为达梦官网 https://eco.dameng.com/document/dm/zh-cn/pm/definition-statement.html[数据定义语句]、https://eco.dameng.com/document/dm/zh-cn/pm/package.html[包]、https://eco.dameng.com/document/dm/zh-cn/pm/class-type.html[类类型]、https://eco.dameng.com/document/dm/zh-cn/pm/custom-type.html[自定义类型]及 https://eco.dameng.com/document/dm/zh-cn/pm/external-function.html[外部函数]章节。
+这些语句分类为 `NO_TABLE_CHANGE`：不修改采集表模型，不为它们创建表结构 history 记录，继续处理后续 CDC。
+`CREATE SCHEMA` 只接受不含内嵌对象定义的形式；`DROP USER`、`DROP SCHEMA` 和 `DROP DOMAIN` 只接受默认删除行为或显式 `RESTRICT`。
+达梦成功执行的 RESTRICT 删除不能级联移除依赖对象，因此重放 redo 时不查询当前在线目录来推断历史时点是否安全；后来的同名对象状态也不会改变这条历史语句的含义。
+`DROP ... CASCADE` 在这些对象上仍拒绝。PROFILE 的 CASCADE 只解除用户与 profile 的关联，可按非表对象操作处理，不代表放开其他对象的 CASCADE。
+`STAT` 覆盖表、列、索引以及采样率、SIZE、GLOBAL 和前置 hint 的已实现形式；它更新优化器统计信息，不重建行结构。
+SQL 编写的 PACKAGE、CLASS、TYPE 声明及其定义体、受支持的 COMPILE 和 DROP 只检查声明头、配对结构和完整输入边界，不在 Connector 中执行其程序内容。
+TYPE/CLASS 及其 BODY 的默认删除和显式 `RESTRICT` 删除按非表操作处理。
+`DROP TYPE BODY ... CASCADE` 也按非表操作处理，因为它只删除实现并保留类型、依赖表及其数据；删除必需的方法实现后，对象列读取可能报错，需重建类型体后恢复。
+TYPE/CLASS 自身的 `CASCADE` 删除及 `DROP CLASS BODY ... CASCADE` 仍拒绝。
+依据官网《类类型》12.3，被表列或其他类成员引用的类必须指定 CASCADE 才能删除；《自定义类型》13.5.1 对对象类型采用相同规则。
+DM 8.1.3.162、原生兼容模式下实测：被表列引用的 OBJECT、VARRAY、TABLE OF 类型的替换、默认删除和 `RESTRICT` 删除被数据库拒绝，`DROP TYPE ... CASCADE` 则会删除依赖表；删除类型体后重建实现，依赖表和原有记录仍在。
+因此不需要查询当前目录来判断历史默认删除是否安全。识别域、类型或类的定义不等于支持使用这些对象作为采集列类型。
+过程、函数参数支持 `IN`、`OUT`、`IN OUT`、`OUT IN` 和 `INOUT`。`AFTER TIMER ON DATABASE` 定时触发器识别调度段与声明、程序体边界，调度选项的合法性由数据库检查；未配对括号、缺少程序体结束标记以及尾随表 DDL 仍拒绝。定义触发器本身不执行程序体，其日后执行产生的行或表 DDL 日志仍按各自记录处理。
+Java CLASS 增加 `CREATE [OR REPLACE] JAVA [PUBLIC] [ABSTRACT] [FINAL] CLASS` 和 `ALTER JAVA CLASS ... COMPILE [DEBUG]` 分类，定义体按花括号确定内部和外部的分号边界。源文本仍受当前词法支持范围限制，不代表完整 Java 语言兼容。
+权限、注释和程序定义统一进入 `nonTableStatement`；分类成功后仍执行预建表物化视图等表影响检查。
+COMMENT 按官网《SQL 语言手册》3.15 识别 `COMMENT ON TABLE/VIEW/SEQUENCE [模式名.]对象名 IS '注释'` 及 `COMMENT ON COLUMN [模式名.]表或视图名.列名 IS '注释'`。新增、覆盖注释使用同一语句，没有独立的 CREATE/ALTER/DROP COMMENT；DM 8.1.3.162 原生模式已验证表、视图及其列使用 `IS ''` 清空注释。该构建不支持官网列出的 COMMENT ON SEQUENCE，也不接受 IS NULL 和 N 字符串；解析器保留 SEQUENCE 官网语法及既有 NULL/N 字符串兼容，不表示数据库各版本均可执行。对象名层级、必需的 IS 和注释值、语句尾部均有结构校验；COMMENT 解析后跳过，不更新历史列结构或事件 schema 的描述，也不会吞掉尾随的表 DDL/DML。
+`GRANT/REVOKE` 区分数据库或角色权限、对象权限和模式权限，解析权限列表、对象类型、接收者及各自的转授权选项。对象权限覆盖 `ALL [PRIVILEGES]`、`OFF`、`SELECT FOR DUMP`，GRANT 支持 SELECT/INSERT/UPDATE/REFERENCES 的列清单；REVOKE 不支持按列回收。
+数据库或角色权限使用 `WITH ADMIN OPTION` 和 `ADMIN OPTION FOR`；对象权限使用 `WITH GRANT OPTION` 和 `GRANT OPTION FOR`，回收可带 `RESTRICT/CASCADE`。数据库或角色权限的 REVOKE 不接受这两个回收选项。权限名称是否存在、是否适用于目标对象以及授权者是否有权操作仍由数据库检查。
+模式权限测试遵循官网《自主访问控制》3.3.4，包括原文的 `GRANT ADMIN FOR`；模式授权要求开启 `GRANT_SCHEMA`，本次未完成启用该参数后的实库验收，这部分用例表示官网语法覆盖。DM 8.1.3.162 实测 `REVOKE REFERENCES ... CASCADE` 保留依赖表、外键和数据，CASCADE 回收的是权限。此类语句不更新采集表结构，但回收 CDC 账号所需权限仍可能影响采集运行。
+位图连接索引的创建和删除按 `NO_TABLE_CHANGE` 处理，自动生成的 `BMJ$_` 辅助表由默认内置过滤排除，不建立其表结构 history。
+独立 `CHECK` 工具命令、`CONSTRUCTOR` 成员片段、PostgreSQL `CREATE/DROP EXTENSION` 和独立 `DROP PARTITION/SUBPARTITION` 不当作达梦非表 SQL。`CALL/EXEC/DECLARE`、`RESTORE` 也不因前缀就被认定无表影响；数据库执行这些命令产生的实际行或表 DDL 日志按各自记录处理。
+普通视图的 `CREATE [OR REPLACE] [FORCE] VIEW [IF NOT EXISTS]` 可识别为不改变表结构；物化视图仍受后述支持边界约束。
+普通物化视图的 `CREATE/ALTER/DROP MATERIALIZED VIEW`、`REFRESH MATERIALIZED VIEW` 和 `CREATE/DROP MATERIALIZED VIEW LOG` 识别类型及完整语句边界后跳过，不解析其结果列，也不建立辅助表结构 history。
+物化视图按官网《物化视图》7.1～7.4、7.9 识别列名清单、`BUILD IMMEDIATE/DEFERRED`、分区/表空间/STORAGE、`REFRESH` 或 `NEVER REFRESH`、`ENABLE/DISABLE QUERY REWRITE`，以及 ALTER 的 `COMPILE`。刷新定义覆盖 `FAST/COMPLETE/FORCE`、`ON DEMAND/COMMIT`、`START WITH/NEXT`、`WITH PRIMARY KEY/ROWID`、`USING DEFAULT/TRUNCATE/DELETE`；独立 REFRESH 的 USING 仅跟随 COMPLETE 或 FORCE，DROP 支持 `IF EXISTS`。
+CREATE 必须有 AS 和查询，ALTER 必须有修改选项，缺失子句或尾随业务表 DDL/DML 不会被整体跳过。查询、分区和 STORAGE 的内部内容保留括号与语句边界检查，由数据库校验完整语义和选项合法性；不在 Connector 中执行查询或刷新。`OR REPLACE`、创建时的 `IF NOT EXISTS`、DROP 的 `CASCADE/RESTRICT` 不属于该官网物化视图语法。
+默认内置过滤排除 `MTAB$_`、`MLOG$_` 表的快照和增量数据；内部 `TRUNCATE TABLE MTAB$_...` 同样跳过，同事务中的业务表变更继续处理。该行为不需要开启 `schema.history.internal.skip.unparseable.ddl`。
+这项过滤覆盖达梦自动命名的内部表，不覆盖使用已有普通表的预建表物化视图。`FOR ... ON PREBUILT TABLE` 仍明确拒绝；已存在的预建表应由业务表过滤配置显式排除。
+物化视图 DDL 后附普通表 DDL 仍按复合语句拒绝，不通过前缀匹配直接跳过整个输入。
 MySQL 可执行注释拒绝，PostgreSQL dollar string 和 MySQL # 注释不作为原生语法处理。
-受支持的 CREATE/ALTER/DROP/TRUNCATE/RENAME 在历史模型副本上先验证，成功后通过 history 管道应用；失败不应用该语句、不越过该位置。
+受支持的 CREATE/ALTER/DROP/TRUNCATE/RENAME 在历史模型副本上先验证，成功后通过 history 管道应用；`CREATE TABLE IF NOT EXISTS` 和 `DROP TABLE IF EXISTS` 会按实际表名解析。默认解析失败不应用该语句、不越过该位置。
+直接解析多语句脚本时，ANTLR 按程序定义边界处理内部的分号，整段脚本成功后才应用表模型变更；流式 LogMiner 单条记录仍遵循单表语句及程序定义独占记录的限制。
+实测 8.1.3.162 在 `COMPATIBLE_MODE=0` 和 `2` 下，`CREATE TABLE IF NOT EXISTS` 首次建表会生成一条保留该子句的 DDL `SQL_REDO`；对已存在的表重复执行成功，但 `CUR_LSN` 不变、没有新增 DDL 记录，表对象编号也不变。此结论尚未扩展到其他模式或数据库版本。
 错误提供 LSN、对象身份及可用的字符/行/列位置。捕获 DDL 缺失或使用非正 DATA_OBJ# 会失败。
+DDL 语法分析、历史结构规划或 DML SQL 解析失败并终止 task 时，额外输出包含完整 `LogMinerRow` 和异常堆栈的 ERROR 日志，包括 SQL_REDO、事务号、LSN、表及用户、分片标记、时间戳、对象版本和归档物理位置。SQL_REDO 使用分片拼接后实际送入解析器的完整内容，不截断；内存缓冲和落盘回读使用同一诊断路径。配置为忽略的 DDL 仍按原有 WARN 路径处理。
+
+普通 TABLE 按官网《SQL 语言手册》3.5.1.1、3.5.2.1、3.5.3、3.5.4 处理，不能统一跳过。CREATE、列增删改、表及列重命名、DROP 更新历史表结构；主键增删还会改变事件键。ADD/DROP COLUMN 支持可选 COLUMN、IF NOT EXISTS/IF EXISTS 和加列分组；条件加列保留已存在列的定义，只添加缺失列。MODIFY 保留未指定的列属性。列重命名支持 RENAME COLUMN 和 ALTER [COLUMN] ... RENAME TO，两者都更新主键列名。
+约束支持 PRIMARY KEY、[NOT] CLUSTER PRIMARY KEY、UNIQUE、CLUSTER UNIQUE KEY，以及已解析的 USING INDEX TABLESPACE、GLOBAL、ENABLE、VALIDATE/NOVALIDATE 选项。外键的 MATCH、PENDANT、WITH INDEX、ON UPDATE/DELETE 等选项不改变列模型；由这些约束实际触发的行变化仍处理各自的 DML 日志。UNIQUE、外键和 CHECK 不直接改变 CDC 行结构，但保留约束名称用于后续 RENAME/DROP CONSTRAINT；非唯一 CLUSTER KEY 仅为物理索引，不记作唯一约束或事件主键。
+DM 8.1.3.162 原生模式实测，DROP PRIMARY KEY / DROP CONSTRAINT 删除主键后，原主键列恢复可空，包括曾显式指定 NOT NULL 的列。删除复合主键中的一列则移除整个主键，剩余列保留非空属性；历史模型按这些结果更新，同时清除主键约束名称。DROP CONSTRAINT 的 INDEX、DROP INDEX、KEEP INDEX 组合纳入官网语法覆盖，其中该旧构建只执行 DROP INDEX，拒绝裸 INDEX 和 KEEP INDEX；语法覆盖不等于所有版本可执行。
+整表 TRUNCATE 保留列和约束，并输出 TRUNCATE 数据事件；DROP/REUSE STORAGE 和 UPDATE/IGNORE GLOBAL INDEXES 不改变此行为。TRUNCATE CASCADE 可能同时清空引用表，当前明确拒绝，不能只输出目标表的清空事件。DISABLE 约束及启停约束的状态转换仍不支持，避免把失效主键继续作为有效事件键；未知或未实现的 TABLE 子句同样拒绝。
+
+行存储分区表按官网《SQL 语言手册》3.5.1.4、3.5.2.2 解析。支持单层 HASH/RANGE/LIST、数值/日期 interval、多级子分区及模板，以及空间限制、逻辑日志和 `AUTO_INCREMENT [=] 起始值` 尾部选项；CTAS 仍受历史源表推导限制，临时表不采集行数据，HUGE 和分布式表不因分区语法支持而自动获得支持。分区界限及物理布局不写入列模型，列、约束和整表 CREATE/ALTER/DROP 沿用普通表的历史结构处理。
+DM 8.1.3.162 原生模式实测，分区 DML 的 `DATA_OBJ#` 指向根表，跨分区行迁移仍表现为 UPDATE。合并、拆分分区的 DDL 跳过，其后的搬迁 INSERT/DELETE 不过滤、不去重，按普通行事件发送。
+`DROP PARTITION/SUBPARTITION` 和 `TRUNCATE PARTITION/SUBPARTITION` 默认明确报错，因为这些操作可能移除数据而没有逐行 DELETE redo。公开配置 `partition.drop.ignore` 默认为 `false`；设为 `true` 时忽略完整解析的分区删除、分区清空语句，包括 `TRUNCATE TABLE ... PARTITION ...`。ERROR 日志包含具体操作类型、LSN、对象编号、完整 `SQL_REDO`，并提示设置 `partition.drop.ignore=true` 可以忽略该语句继续 CDC。开启后以 WARN 记录被忽略的 SQL 和原因，保留根表模型并继续处理后续 DML。它不补发下游删除事件，被删除或清空分区的旧数据需要下游自行处理。
+专用开关关闭时，即使 `schema.history.internal.skip.unparseable.ddl=true`，已识别的分区删除、清空也不会被跳过。该开关不允许残缺或复合语句，也不授权 `EXCHANGE PARTITION/SUBPARTITION`；忽略分区清空不会输出整表 TRUNCATE 事件。DM 8.1.3.162 实测分区清空 DDL 的 `DATA_OBJ#` 可以指向子分区对象，策略判断按 SQL 在对象过滤前完成。切换开关后可以从尚未越过的错误位置重启继续，已持久化越过的分区删除、清空不会自动补发。
+
+`schema.history.internal.skip.unparseable.ddl` 默认为 `false`。显式设为 `true` 时，流式处理会跳过 DDL 语句分析或历史表模型规划阶段的解析/不支持错误，并以 WARN 记录 LSN、DATA_OBJ#、原始 SQL 和失败原因。
+跳过时保留原历史表模型，不为该语句写入 schema history，不从当前 JDBC 元数据补齐结构；后续记录继续处理，offset 按正常确认机制推进。仅跳过语句不保证 offset 已立即持久化。
+该参数不跳过 SQL 缺失、已识别捕获表 DDL 的无效对象编号、归档读取失败、DML 解析错误，也不绕过捕获范围或身份边界校验。未知对象的 DDL 不一定有合法表对象编号，仍可能在语句分析阶段被显式跳过。重启仍从结构化 `TableChanges` 恢复历史模型，不重新解析被跳过的 DDL，也不会补回它造成的结构变化；offset 已持久化越过该位置后，再设回 `false` 也不会自动重放该语句。
+
+[WARNING]
+====
+跳过 DDL 可能丢失真实表结构变化，使后续行日志无法解析，或按旧列位置/类型输出错误数据。
+该参数用于运维明确接受上述风险后的继续采集，不代表支持被跳过的语法，也不保证数据一致性；确认语句确实不影响采集表结构后再启用。
+====
 
 [cols="3,5",options="header"]
 |===
 |类别 |当前边界
 |普通表结构变化 |支持解析器已实现的列、主键和约束变化；未知子句失败。快照保存命名主键、UNIQUE、外键、CHECK 元数据供后续 DROP CONSTRAINT 历史重放。
-|物理选项 |逐项识别常见 STORAGE、TABLESPACE、USING LONG ROW，以及单层 HASH/RANGE/LIST 分区声明；不任意丢弃未知 SQL 尾部。
+|物理选项 |逐项识别常见 STORAGE、TABLESPACE、USING LONG ROW，以及 HASH/RANGE/LIST、interval 和多级子分区声明、模板及 ROW MOVEMENT；不任意丢弃未知 SQL 尾部。
 |CTAS / LIKE |从历史位置的已知源表推导结构。CTAS 支持单源、星号/列投影、别名、CAST(column AS type) AS name 和简单过滤。实测两者复制行均产生 INSERT 日志。
 |CTAS 限制 |拒绝 JOIN、子查询、聚合、算术类型推断和显式列定义列表；源表必须已在 history。复制列不继承主键、默认值、identity 或注释，直接投影保留来源可空性。
-|多表复合 DDL |单条 LogMiner DDL 最多一个受支持表语句。CREATE SCHEMA、DROP SCHEMA/USER 及 CASCADE 未支持，不能保留陈旧结构假装成功。
-|特殊表与列 |临时、HUGE、外部表及虚拟/生成列不支持；快照和捕获 CREATE 都有校验。实测部分特殊表不产出所需行日志、虚拟列 redo 值为 NULL，不能靠快照可查判断支持。
-|分区维护 |不支持子分区、interval partitioning 和任意分区维护操作，创建分区根表支持不代表这些操作支持。
+|非表对象 |已识别的用户、目录、上下文、LIBRARY、DOMAIN、PROFILE、空 SCHEMA、STAT、LINK、OPERATOR、表空间和程序对象可分类为不改变采集表结构。具体语法边界和删除限制见上文；数据库拒绝的语法不能算作 Connector 已验证支持。
+|多表复合 DDL |单条 LogMiner DDL 最多一个受支持表语句。CREATE SCHEMA 内嵌 CREATE TABLE/VIEW/GRANT，以及 USER/SCHEMA/DOMAIN 的级联删除仍不支持，不能保留陈旧结构假装成功。
+|特殊表与列 |临时表和外部表仅保留类型、对象编号及生命周期元数据，自动跳过数据快照、增量快照及行事件，不发布它们的 schema 事件；不需要设置 skip.unparseable.ddl。临时表已识别的 CREATE/ALTER/TRUNCATE/DROP/RENAME 不阻断业务表 CDC，删除后同名重建的普通表恢复正常采集。HUGE 表及虚拟/生成列仍拒绝。DM 8.1.3.162 原生模式实测两种 ON COMMIT 策略的临时表只有 CREATE/ALTER/DROP DDL，没有 INSERT/UPDATE/DELETE SQL_REDO，提交或会话关闭清空也不产生逐行 DELETE；虚拟列 redo 值为 NULL。
+|分区维护 |分区根表按普通表保存列结构和对象编号。合并、拆分、增加分区、修改模板/列表值、分区改名/移动和 ROW MOVEMENT 解析后跳过 DDL；其后 INSERT/UPDATE/DELETE 照常输出，包括搬迁产生的重复 INSERT。删除或清空分区默认拒绝，可用 `partition.drop.ignore=true` 显式忽略。分区 EXCHANGE 仍不支持。
 |DEFAULT ON NULL |解析器有支持和单测，但基线旧数据库拒绝该语法，尚非目标数据库端到端验收结论。
+|JSON CHECK |支持字符串列的 `IS [NOT] JSON`，可带 `STRICT` / `LAX`（也可加括号）及 `WITH/WITHOUT UNIQUE KEYS`；不代表新增 JSON/JSONB 物理类型映射。
+|隐式辅助表 |高级日志的 `WITH/WITHOUT/TRUNCATE ADVANCED LOG` 仍明确拒绝，不能按普通单表 ALTER 跳过。位图连接索引 DDL 跳过，其 `BMJ$_` 辅助表默认排除。
 |===
 
+`CREATE [GLOBAL] TEMPORARY TABLE` 保存 `dameng.table.kind=TEMPORARY` 和对象编号，跳过行采集。
+历史中的临时表标记用于识别后续 ALTER、TRUNCATE、RENAME 和 DROP；重启时从 schema history 恢复，不能用当前目录替代旧表身份。同名重建为普通表后，按新对象和新列结构采集。语法仍完整解析，未知子句或混入业务表 DDL 的复合记录不会因临时表而被跳过。
+
+外部表依据官网《数据定义语句》3.5.1.2、3.5.3 解析 `CREATE EXTERNAL TABLE [IF NOT EXISTS]`、控制文件或 `DATAFILE` 两种 `FROM` 子句，以及列注释、`LOCATION`、`PARMS` 选项。
+`CHARACTER_CODE` 接受字符串，例如 `'GBK'`、`'UTF-8'`、`'SINGLE_BYTE'`、`'EUC-KR'`。外部表只读，不允许 INSERT/UPDATE/DELETE 或 TRUNCATE；外部文件内容变化不是数据库行 CDC。
+外部表的创建和删除保留 `TABLE` 分类及表标识，由采集过滤器排除且没有历史模型时跳过。
+命中采集范围的外部表只保存 `dameng.table.kind=EXTERNAL` 和 `dameng.object.id`，不读取外部文件、不生成行事件 schema，也不发布其 schema change 事件。
+初始快照及扩大采集范围时通过 `SYS.SYSOBJECTS.INFO3` 的低 8 位值 `13` 识别外部表；边界前后校验对象身份，发生变化则终止并要求重试。
+标记持久化到 schema history，重启后直接恢复。流式 CREATE、表重命名和 DROP 更新这份历史，处理历史 DROP 不查询当前字典；DROP 后同名重建的普通表按新的对象 ID 正常采集。
+外部表除重命名外的 ALTER、TRUNCATE，以及从仅保留身份的外部表推导普通表列结构的 CTAS/LIKE，仍明确拒绝。
+DM 8.1.3.162 实测拒绝外部表重命名；上述重命名历史维护由解析器和流处理单测覆盖，不代表该数据库版本支持执行。
+删除语法是 `DROP TABLE [IF EXISTS] [<模式名>.]<表名>`，SQL_REDO 没有 `EXTERNAL` 标记，不能统一分类为 `NO_TABLE_CHANGE`，否则会漏掉普通采集表的删除。
+DM 8.1.3.162 原生模式实测控制文件、数据文件建表和上述四种字符集均成功并生成 DDL redo；当前官网的 `ON <RAFT组名>`、`MISSING FIELD VALUES ARE NULL` 和分隔符拼接表达式被该版本拒绝，相关单测只验证官网语法解析边界。
+
 常量默认值按历史列类型转换；复合默认表达式不在 Connector 中执行。
+二进制列的 `0x` 常量支持大小写、前导零和奇数位数字；奇数位按达梦行为在左侧补 `0`，定长 `BINARY(n)` 默认值在右侧补零到列长度，转换结果继续遵循 `binary.handling.mode`。
 存入默认表达式前，将已识别注释替换为空格，保留其他字面内容；原始 DDL 仍保存在结构记录中。
 流式 COMMENT 不更新事件 schema 的注释描述。
-没有用当前 JDBC 表结构或 Flashback 自动兜底的生产路径。解析失败后的 restart 会再次遇到同一位置，处理方法见故障章节。
+
+2026-10-29 在 8.1.3.162 原生模式的官方语料实测中，`STAT ... ON` 的表、索引和 hint 形式均生成 DDL redo，审计时的解析器拒绝了这三种样本。当前已为独立 STAT 语句增加非表分类；这不放开表定义中未实现的 STORAGE/STAT 子句。
+`REVOKE ... CASCADE` 的表、列、视图、过程/函数/包、序列、域、同义词和目录授权回收也生成 DDL redo；审计时有 13 个样本因尾部语法被拒绝，后续 CLASS、TYPE 专项又验证了两条同类回收语句。非表 DDL 分类现已接受权限词汇及 `REVOKE ... CASCADE`，这些旧审计数字保留为当时的结果。
+同一历史审计源码还拒绝了 CLASS/TYPE 的创建、定义体、编译和删除共十条实际 DDL，以及 ROWID、LONG、BFILE 列的三条建表 DDL。当前为 SQL 程序对象增加的分类不能反推这十条历史样本已经通过重测；特殊列类型映射也未因此扩展。LIBRARY 语句和 JSON 类型声明在该次数据库测试中被数据库拒绝，尚不能据此判断 Connector 支持情况。
+默认配置下，未识别的对象类型即使不修改采集表的列结构，也仍可能使任务在相应日志位置停止。
+同版本的 `RESTORE TABLE` 实测还发现：目标数据已被备份数据替换，但恢复语句的 LSN 区间没有目标表的 DML redo，独立 marker INSERT 可以正常挖掘。不能依赖 LogMiner CDC 将这类表恢复产生的数据变化同步到下游；解析器未报错不代表恢复数据已被采集。
+物化视图专项的 15 个代表语句中，13 个被该数据库版本接受，`COMPILE` 和 `DROP MATERIALIZED VIEW LOG IF EXISTS` 被数据库拒绝。FAST 和完全刷新会产生后台表 DML；当时的分析器拒绝其中 13 条 MATERIALIZED/REFRESH DDL 记录。另三条内部表 TRUNCATE 仅在空历史模型探针中规划失败。后续默认过滤和语句分类用于跳过物化视图内部数据，不代表支持物化视图 CDC；旧审计结果保留为当时的证据。
+单实例状态专项验证了 34 条角色、状态、参数和本地归档代表语句，其中 27 条接受、7 条因状态前提被拒绝。新增第二个 LOCAL 归档目的地后，当前生产挖掘连接会重复注册同一日志的副本，报 `-2848 cannot add duplicate logfile`。限定原归档目录的独立 SQL LogMiner 诊断成功，不能据此认为 Connector 已支持多 LOCAL 归档；该问题尚未修复。
+`FORALL` 专项通过完整引擎验证了异常处理器提交后再抛错的情形：两个官网示例虽返回 JDBC 错误，已提交的 2 行和 3 行更新仍全部发出 CDC。另一个官网示例绑定错误码 `-25000`，该版本实际返回 `-24381`，因未进入预期处理分支而全部回滚，CDC 为 0；单独适配错误码的代表样本提交及发出 3 行更新。不能仅根据客户端收到错误判断事务全部回滚；原样示例和适配样本的证据分别保留。
+可回归测试和逐条证据索引见模块 `src/test/testing.adoc` 的官方 SQL 语料章节。历史审计结果不代表所有缺口均已修复。
+2026-10-30，`DamengNonTableDdlIT` 在指定 8.1.3.162 镜像、`COMPATIBLE_MODE=0` 下通过用户、目录、空 SCHEMA、STAT、TYPE、DOMAIN、CONTEXT、PACKAGE、SQL CLASS、PROFILE 十族回归。在线和停机阶段各执行 33 条语句，共读到 66 条实际 DDL redo，全部分类为 `NO_TABLE_CHANGE`；66 个后续 CDC marker、停机重放、两次历史恢复及恢复后的 UPDATE 均通过。范围不包含 Java CLASS 或级联删除。相关定向单元回归为 1,913 项，格式和 5 个相关 Java 测试文件的 Checkstyle 检查通过；这不是全部 SQL 或整个 Connector 的验收。运行方法和证据文件见模块测试手册。
+LIBRARY 的官网语法有分类单测，数据库可执行性独立诊断，不计入上述 CDC 回归。本次 8.1.3.162 原生模式同时拒绝带模式限定名的 `CREATE OR REPLACE LIBRARY` 和不带模式名的最小 `CREATE LIBRARY`，均返回 `-2007` 语法错误。结果保存在 `target/non-table-ddl-library-probe.json`，不执行目标函数库，也不据此宣称已验证 CDC。
+`COMPATIBLE_MODE=2` 的补充运行在初始化阶段被现有兼容配置注册表拒绝，未进入这套 DDL/CDC 回归；本轮没有改变兼容模式支持矩阵。
+没有用当前 JDBC 表结构或 Flashback 自动兜底的生产路径。默认配置下，解析失败后的 restart 会再次遇到同一位置；显式跳过的风险和限制见上文，处理方法见故障章节。
 词法依据为 https://eco.dameng.com/document/dm/zh-cn/pm/dm_sql-introduction.html[SQL 介绍]、https://eco.dameng.com/document/dm/zh-cn/sql-dev/practice-strings.html[字符串]和 https://eco.dameng.com/document/dm/zh-cn/pm/definition-statement.html[DDL 文档]。
 
 [id="dameng-topics"]
@@ -767,6 +872,13 @@ Connector 不会自动修改数据库参数或启用归档。
 
 `RLOG_APPEND_LOGIC` 与 `RLOG_LLOG_COMPRESS` 的 LogMiner 行为见 https://eco.dameng.com/document/dm/zh-cn/pm/dbms_logmnr-package.html[达梦 DBMS_LOGMNR 文档]。
 `RLOG_IGNORE_TABLE_SET=0` 时，任务配置者必须在采集开始前按当前达梦版本的官方操作方法，为每张实际捕获的表开启表级逻辑日志；配置了信号表时，信号表及后续新增的采集表也必须分别处理。
+达梦官方 https://eco.dameng.com/document/dm/zh-cn/pm/definition-statement.html[数据定义语句]列出了既有表的 `ALTER TABLE <模式>.<表> ADD LOGIC LOG`，以及 `CREATE TABLE` 定义末尾的可选 `ADD LOGIC LOG` 子句。例如：
+
+[source,sql]
+----
+ALTER TABLE BIZ.ORDERS ADD LOGIC LOG;
+----
+
 Connector 只打印启动警告，不查询或验证各表的日志设置，也不会代替 DBA 开启日志。缺失表级日志时，任务可能继续运行却静默漏掉变更；事后启用日志无法补回之前未写入的变更。
 使用自动创建信号表时，应在该表创建后、发送信号前启用其表级逻辑日志。
 `COMPATIBLE_MODE` 和 `LENGTH_IN_CHAR` 的目标值仍是 Connector 的启动条件，见 <<dameng-connector,Connector 说明>>。
@@ -851,7 +963,9 @@ Connector 通过 `database.failover.hosts` 配置两个 JDBC 地址，无需 VIP
 
 === 内置过滤和表存储类型
 
-默认 table.ignore.builtin=true，代码内置排除 SYS、SYSTEM 和名称以 V$ 开头的 schema；这不是所有系统对象的完整清单。
+默认 `table.ignore.builtin=true`，代码内置排除 SYS、SYSTEM 和名称以 V$ 开头的 schema，以及任意 schema 下名称以 `MTAB$_`、`MLOG$_` 开头的物化视图内部表和以 `BMJ$_` 开头的位图连接索引辅助表。内部表前缀比较不区分大小写，匹配 `table.include.list` 也不会覆盖默认内置排除。
+内置过滤同时用于快照和增量处理。旧 history 中残留的这些内部表也不输出数据，其对象编号不参与业务表的历史身份匹配，避免已删除内部表的编号复用后干扰业务表。
+`table.ignore.builtin=false` 关闭这组内置过滤，但不会启用内部表 CDC，也不补齐隐式辅助表结构历史。这些内部表不能作为 `signal.data.collection`。
 SYSDBA 下某表或其他 schema 的系统用途表不一定被这一规则自动排除，生产应显式指定业务表过滤器并核对启动清单。
 普通行表和已验证分区根表可以采集，临时/HUGE/外部表和生成列限制见 DDL 章节。
 信号表自动创建及额外写权限见 <<dameng-signals,信号表>>。
@@ -1094,7 +1208,8 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`schema.exclude.list` |未指定 |排除的 schema 正则列表。
 |`table.include.list` |未指定 |允许捕获的完整 schema.table 正则列表；未指定时仍受 schema 和内置表规则约束。
 |`table.exclude.list` |未指定 |排除的 schema.table 正则列表，不与 include 同用。
-|`table.ignore.builtin` |`true` |应用内置系统表过滤；false 不会自动授予目录权限或使特殊表具备可靠 REDO。
+|`table.ignore.builtin` |`true` |应用内置系统表过滤，包括 `MTAB$_`、`MLOG$_`、`BMJ$_` 内部表；false 不会自动授予目录权限或启用内部表 CDC。
+|`partition.drop.ignore` |`false` |显式忽略 DROP PARTITION/SUBPARTITION、TRUNCATE PARTITION/SUBPARTITION（含 TRUNCATE TABLE ... PARTITION）并继续后续 DML，不补发逐行删除或整表清空事件；被移除的旧数据可能留在下游。默认报错并打印 SQL 和开启此参数的提示，通用 skip.unparseable.ddl 不绕过此限制；不允许分区 EXCHANGE。
 |`database.include.list`、`database.exclude.list` |未指定 |公共过滤输入，也计入 capture_scope；达梦表标识无 catalog，不用它们代替 schema/table 过滤或选择数据库。
 |`column.include.list` |未指定 |保留的 schema.table.column 正则列表；不要排除事件 Key 必需的列。
 |`column.exclude.list` |未指定 |排除的列正则列表，不与 column.include.list 同用；不能保证绕过包含不支持类型的历史 DDL。
@@ -1223,7 +1338,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`schema.history.internal.kafka.query.timeout.ms` |`3000` |Kafka 管理查询超时。
 |`schema.history.internal.kafka.create.timeout.ms` |`30000` |创建 history Topic 超时；Kafka 2.0 应提前创建，不靠延长超时修复协议差异。
 |`schema.history.internal.kafka.buffer.batch.size` |`1024` |history 启用批量缓冲期间的记录数阈值，不是业务事件 batch。
-|`schema.history.internal.skip.unparseable.ddl` |`false` |继承字段；不是达梦跳过未知实时 DDL 的开关。达梦实时解析不使用它放行不支持语法。
+|`schema.history.internal.skip.unparseable.ddl` |`false` |显式设为 true 时跳过实时 DDL 分析/历史模型规划的解析或不支持错误，WARN 记录 LSN、DATA_OBJ#、SQL 和原因。保留旧模型且不写该语句的 history；可能造成后续数据错误。不跳过缺失 SQL、已识别捕获表 DDL 的无效对象编号、归档、DML 或捕获范围/身份校验错误。详见 <<dameng-ddl,DDL 支持边界>>。
 |`schema.history.internal.store.only.captured.tables.ddl` |`false` |当前达梦初始 history 仍仅记录采集表；false 不增加未捕获表结构。
 |`schema.history.internal.store.only.captured.databases.ddl` |`false` |公共 history 字段，不提供达梦跨数据库捕获能力。
 |`schema.history.internal.producer.*` |客户端默认及 history 固定设置 |history producer 参数透传，如安全协议、SASL/SSL 配置；不影响 Worker 业务 producer。
@@ -1672,7 +1787,7 @@ docker run --rm --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules \
 |持续追不上归档 |前进/重建/dispatch 时间、入队等待、producer buffer wait |按瓶颈调窗口、fetch、batch/压缩/资源；不要只增加 max.queue.size。
 |持锁久或快照超时 |加锁日志、持锁指标、活跃写事务、快照数据量、下游队列 |结束不必要的长事务或调整维护窗口/预算。no_data 仍有结构锁；增量快照避免全程共享锁但需先建立结构基线。
 |旧 LSN 归档缺失 |最老 replay LSN 到当前的完整归档范围 |补回正确来源的归档后恢复，或采用新身份初始快照；接受历史损失时才显式 nonce。重复 restart 和 no_data 不会修复。
-|不支持 DDL，重启后再次失败 |错误 LSN、对象编号、SQL 位置、原始语句、兼容参数 |需要支持该历史语句的修复或明确重建基线；skip.unparseable.ddl 不会放行达梦解析。不要拿当前表结构替换旧定义。
+|不支持 DDL，重启后再次失败 |错误 LSN、对象编号、SQL 位置、原始语句、兼容参数 |优先支持该历史语句或重建基线。明确接受结构丢失和错误数据风险时，可显式设 schema.history.internal.skip.unparseable.ddl=true 跳过实时解析/规划错误；查看 WARN 并核对后续数据。该设置不恢复被跳过的结构，不跳过后续 DML 错误。不要拿当前表结构替换旧定义。
 |capture_scope differs / 范围调整被拒绝 |旧范围描述、初始快照状态、数据库选择、信号表、table.ignore.builtin |普通表扩缩按范围调整机制处理；快照未完成或不支持的身份变更不能直接恢复。保留原配置排查，不填造签名或删除 history。
 |compatibility_signature 不匹配/缺失 |旧插件 offset、模式/词法/大小写参数、主备参数一致性 |不要填造签名。只有确认临时设置期间没生成受影响历史，才可还原设置恢复，否则新基线。
 |内存/事务数/单 SQL 上限或磁盘失败 |具体错误字段、SQL 连续片段、并发事务、落盘可用容量/权限 |调整对应资源或负载后重启；队列、事务缓存、单 SQL 是不同预算。不能跳过超限事务。

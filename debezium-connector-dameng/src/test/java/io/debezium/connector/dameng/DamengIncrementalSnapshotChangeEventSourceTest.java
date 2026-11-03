@@ -38,6 +38,8 @@ import java.util.regex.Pattern;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.base.ChangeEventQueueMetrics;
@@ -88,6 +90,30 @@ class DamengIncrementalSnapshotChangeEventSourceTest {
         when(reader.quotedTableIdString(any())).thenReturn("\"APP\".\"SIGNAL\"");
         when(reader.isValid()).thenReturn(true);
         source.setStandbySupport(standby);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
+    @SuppressWarnings("unchecked")
+    void shouldSkipHistoricalNonRowTableWithoutReadingItsRowsOrRefreshingItsSchema(DamengTableType kind) throws Exception {
+        final var external = new DamengTableType.Identity(kind, 71).table(new TableId(null, "APP", "EXTERNAL_DATA"));
+        when(databaseSchema.tableFor(external.id())).thenReturn(external);
+        when(reader.chunkQueryBuilder(config)).thenCallRealMethod();
+        source = new DamengIncrementalSnapshotChangeEventSource(config, reader, mock(EventDispatcher.class), databaseSchema,
+                Clock.SYSTEM, metrics, mock(DataChangeEventListener.class), notifications);
+        source.init(partition, offset);
+        final var context = offset.getIncrementalSnapshotContext();
+        context.addDataCollectionNamesToSnapshot("request", List.of(external.id().identifier()), List.of(), "");
+
+        source.readChunk(partition, offset);
+
+        assertThat(context.snapshotRunning()).isFalse();
+        assertThat(metrics.getIncrementalSnapshotRowsScanned()).isZero();
+        assertThat(metrics.getIncrementalSnapshotRowsEnqueued()).isZero();
+        verify(reader, never()).readTablePreparedStatement(any(), anyString(), any());
+        verify(reader, never()).queryAndMap(anyString(), any());
+        verify(reader, never()).getTableObjectId(any());
+        verify(databaseSchema, never()).refresh(any());
     }
 
     @Test

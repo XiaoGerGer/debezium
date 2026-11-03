@@ -20,6 +20,8 @@ import java.util.function.Consumer;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import io.debezium.relational.Attribute;
 import io.debezium.relational.Column;
@@ -37,6 +39,42 @@ class DamengCaptureScopeHistoryTest {
     private static final Table B_RECREATED = table("B", 202);
     @TempDir
     Path directory;
+
+    @ParameterizedTest
+    @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
+    void shouldRecoverANonRowTableFromThePersistedScopeExpansion(DamengTableType kind) throws Exception {
+        final Path file = directory.resolve("external-baseline-history.json");
+        final var original = config(file, "APP\\.A");
+        final var expanded = config(file, "APP\\.(A|B)");
+        final var external = new DamengTableType.Identity(kind, 102).table(B_FIRST.id());
+        DamengOffsetContext checkpoint;
+        final var writer = history(expanded);
+        try {
+            record(writer, original, 10, new TableChanges().create(A));
+            final var change = new DamengCaptureScopeChange(expanded, PARTITION, writer);
+            checkpoint = change.resolve(new DamengOffsetContext.Loader(expanded, true).load(offset(original, 40).getOffset()));
+            change.prepare(checkpoint, List.of(A.id(), external.id()), preparation(100, external));
+        }
+        finally {
+            writer.stop();
+        }
+        final var reader = history(expanded);
+        try {
+            final var change = new DamengCaptureScopeChange(expanded, PARTITION, reader);
+            final var resumed = change.resolve(new DamengOffsetContext.Loader(expanded, true).load(checkpoint.getOffset()));
+            resumed.setCommitLsn(100);
+            final var recovered = new Tables();
+            reader.recover(Map.of(PARTITION.getSourcePartition(), resumed.getOffset()), recovered, null);
+            assertThat(recovered.forTable(external.id())).isEqualTo(external);
+            assertThat(recovered.forTable(external.id()).attributeWithName(DamengTableType.ATTRIBUTE_NAME).value()).isEqualTo(kind.name());
+            assertThat(recovered.forTable(A.id())).isEqualTo(A);
+            assertThat(change.excludes(external.id(), 102, 99)).isTrue();
+            assertThat(change.excludes(external.id(), 102, 101)).isFalse();
+        }
+        finally {
+            reader.stop();
+        }
+    }
 
     @Test
     void shouldRecoverInterleavedTableEpochsFromARealHistoryFileAtEveryCommitFrontier() throws Exception {

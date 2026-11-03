@@ -35,6 +35,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.slf4j.LoggerFactory;
@@ -87,6 +89,88 @@ class DamengSnapshotChangeEventSourceTest {
         when(connection.currentLsn()).thenReturn(100L, 200L, 300L);
         when(connection.databaseMagic()).thenReturn(42L);
         when(running.isRunning()).thenReturn(true);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
+    void shouldKeepNonRowIdentityInHistoryWithoutLockingOrScanningRows(DamengTableType kind) throws Exception {
+        final var source = source(DamengConnectorConfigTest.configuration().build());
+        final var context = context();
+        context.capturedTables.add(ADDED);
+        final var identity = new DamengTableType.Identity(kind, 71);
+        when(connection.readNonRowTableIds()).thenReturn(Map.of(ADDED, identity));
+        when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING, ADDED));
+
+        source.getAllTableIds(context);
+        source.lockTablesForSchemaSnapshot(running, context);
+        source.determineSnapshotOffset(context, null);
+        source.readTableStructure(running, context, null, new SnapshottingTask(true, true, List.of(), Map.of(), false));
+
+        verify(connection, never()).executeWithoutCommitting("LOCK TABLE \"APP\".\"ADDED\" IN SHARE MODE");
+        verify(connection, never()).getTableObjectId(ADDED);
+        final ArgumentCaptor<TableFilter> filter = ArgumentCaptor.forClass(TableFilter.class);
+        verify(connection).readSchema(any(), isNull(), eq("APP"), filter.capture(), isNull(), eq(false));
+        assertThat(filter.getValue().isIncluded(ADDED)).isFalse();
+        assertThat(filter.getValue().isIncluded(EXISTING)).isTrue();
+        assertThat(context.capturedTables).containsExactly(EXISTING);
+        assertThat(context.capturedSchemaTables).containsExactlyInAnyOrder(EXISTING, ADDED);
+        assertThat(context.tables.forTable(ADDED)).isEqualTo(identity.table(ADDED));
+        assertThat(context.tables.forTable(ADDED).attributeWithName(DamengTableType.ATTRIBUTE_NAME).value()).isEqualTo(kind.name());
+        assertThat(source.getTablesForSchemaChange(context)).containsExactly(EXISTING);
+        verify(listener).dataCollectionSnapshotCompleted(context.partition, ADDED, 0);
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "EXTERNAL,0", "EXTERNAL,72", "TEMPORARY,0", "TEMPORARY,72" })
+    void shouldRejectChangedNonRowIdentityAcrossSnapshotBoundary(DamengTableType kind, long replacement) throws Exception {
+        final var source = source(DamengConnectorConfigTest.configuration().build());
+        final var context = context();
+        when(connection.readNonRowTableIds()).thenReturn(Map.of(EXISTING, new DamengTableType.Identity(kind, 71)),
+                replacement == 0 ? Map.of() : Map.of(EXISTING, new DamengTableType.Identity(kind, replacement)));
+        source.lockTablesForSchemaSnapshot(running, context);
+        source.determineSnapshotOffset(context, null);
+        assertThatThrownBy(() -> source.readTableStructure(running, context, null, new SnapshottingTask(true, true, List.of(), Map.of(), false)))
+                .isInstanceOf(SQLException.class).hasMessageContaining("Non-row table identity changed");
+        assertThat(context.tables.tableIds()).isEmpty();
+        verify(connection, never()).readSchema(any(), any(), any(), any(), any(), eq(false));
+    }
+
+    @Test
+    void shouldRejectANonRowKindChangeEvenWhenTheObjectNumberIsUnchanged() throws Exception {
+        final var source = source(DamengConnectorConfigTest.configuration().build());
+        final var context = context();
+        when(connection.readNonRowTableIds()).thenReturn(Map.of(EXISTING, new DamengTableType.Identity(DamengTableType.EXTERNAL, 71)),
+                Map.of(EXISTING, new DamengTableType.Identity(DamengTableType.TEMPORARY, 71)));
+        source.lockTablesForSchemaSnapshot(running, context);
+        source.determineSnapshotOffset(context, null);
+        assertThatThrownBy(() -> source.readTableStructure(running, context, null, new SnapshottingTask(true, true, List.of(), Map.of(), false)))
+                .isInstanceOf(SQLException.class).hasMessageContaining("Non-row table identity changed");
+        verify(connection, never()).readSchema(any(), any(), any(), any(), any(), eq(false));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
+    @SuppressWarnings("unchecked")
+    void shouldPersistNonRowOnlySnapshotWithoutPublishingSchemaEvents(DamengTableType kind) throws Exception {
+        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
+        final var schema = mock(DamengDatabaseSchema.class);
+        final var dispatcher = mock(EventDispatcher.class);
+        final MainConnectionProvidingConnectionFactory<DamengConnection> factory = mock(MainConnectionProvidingConnectionFactory.class);
+        when(factory.mainConnection()).thenReturn(connection);
+        final var source = new DamengSnapshotChangeEventSource(config, factory, schema, dispatcher, clock, listener,
+                mock(NotificationService.class), snapshotterService);
+        final var context = context();
+        context.offset = new DamengOffsetContext(config, 100);
+        context.capturedTables.clear();
+        final var external = new DamengTableType.Identity(kind, 71).table(EXISTING);
+        context.tables.overwriteTable(external);
+
+        source.createSchemaChangeEventsForTables(running, context, new SnapshottingTask(true, false, List.of(), Map.of(), false));
+
+        final var event = ArgumentCaptor.forClass(io.debezium.schema.SchemaChangeEvent.class);
+        verify(schema).applySchemaChange(event.capture());
+        assertThat(event.getValue().getTables()).containsExactly(external);
+        org.mockito.Mockito.verifyNoInteractions(dispatcher);
     }
 
     @Test

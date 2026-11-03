@@ -8,6 +8,7 @@ package io.debezium.connector.dameng;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +46,7 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
     private final DamengDatabaseSchema damengSchema;
     private DamengStandbySupport standby;
     private Connection primarySnapshotConnection;
+    private final Map<TableId, DamengTableType.Identity> nonRowTables = new HashMap<>();
 
     void setStandbySupport(DamengStandbySupport standby) {
         this.standby = standby;
@@ -90,6 +92,17 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
                                                      SnapshottingTask snapshottingTask)
             throws Exception {
         if (recovery == null || !recovery.isRequested() || snapshottingTask.isOnDemand()) {
+            tryStartingSnapshot(context);
+            for (TableId id : schemaTables(context)) {
+                final var table = context.tables.forTable(id);
+                if (DamengTableType.isNonRow(table)) {
+                    if (!sourceContext.isRunning()) {
+                        throw new InterruptedException("Interrupted while recording non-row table " + id);
+                    }
+                    context.offset.event(id, clock.currentTimeAsInstant());
+                    damengSchema.applySchemaChange(getCreateTableEvent(context, table));
+                }
+            }
             super.createSchemaChangeEventsForTables(sourceContext, context, snapshottingTask);
             return;
         }
@@ -115,6 +128,7 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
 
     @Override
     protected SnapshotContext<DamengPartition, DamengOffsetContext> prepare(DamengPartition partition, boolean onDemand) {
+        nonRowTables.clear();
         return new DamengSnapshotContext(partition, config.getDatabaseName(), onDemand);
     }
 
@@ -150,6 +164,7 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
 
     @Override
     protected Set<TableId> getAllTableIds(RelationalSnapshotContext<DamengPartition, DamengOffsetContext> context) throws SQLException {
+        nonRowTables.putAll(connection.readNonRowTableIds());
         return connection.getAllTableIds(null);
     }
 
@@ -161,9 +176,15 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
     }
 
     private void lockTables(ChangeEventSourceContext sourceContext, Collection<TableId> tables) throws SQLException, InterruptedException {
+        final var currentNonRow = connection.readNonRowTableIds();
         for (TableId table : tables) {
             if (!sourceContext.isRunning()) {
                 throw new InterruptedException("Interrupted while locking " + table);
+            }
+            final var identity = currentNonRow.get(table);
+            if (identity != null) {
+                nonRowTables.put(table, identity);
+                continue;
             }
             // Use the configured statement timeout without committing the transaction
             // that must hold these locks until the snapshot has finished.
@@ -257,6 +278,20 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
         // Tables omitted by the snapshot row filter still need their historical
         // column layout and object identity for subsequent dictionary-free redo.
         final Set<TableId> schemaTables = schemaTables(context);
+        final var currentNonRow = connection.readNonRowTableIds();
+        for (TableId id : schemaTables) {
+            if (!java.util.Objects.equals(nonRowTables.get(id), currentNonRow.get(id))) {
+                throw new SQLException("Non-row table identity changed across the Dameng snapshot boundary for " + id + "; retry the snapshot");
+            }
+        }
+        // Non-row definitions remain in history, but never enter row scans or JDBC column conversion.
+        context.capturedSchemaTables = schemaTables;
+        if (context.capturedTables.stream().anyMatch(nonRowTables::containsKey)) {
+            context.capturedTables.stream().filter(nonRowTables::containsKey)
+                    .forEach(id -> listener.dataCollectionSnapshotCompleted(context.partition, id, 0));
+            context.capturedTables = context.capturedTables.stream().filter(id -> !nonRowTables.containsKey(id))
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+        }
         logCaptureSelection(context, schemaTables, task);
         for (String schemaName : schemaTables.stream().map(TableId::schema).distinct().toList()) {
             if (!sourceContext.isRunning()) {
@@ -264,9 +299,13 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
             }
             // Keep excluded columns in the historical model: COL n identifies the
             // physical ordinal, even when a column is omitted from emitted events.
-            connection.readSchema(context.tables, null, schemaName, schemaTables::contains, null, false);
+            connection.readSchema(context.tables, null, schemaName, id -> schemaTables.contains(id) && !nonRowTables.containsKey(id), null, false);
         }
         for (TableId tableId : schemaTables) {
+            if (nonRowTables.containsKey(tableId)) {
+                context.tables.overwriteTable(nonRowTables.get(tableId).table(tableId));
+                continue;
+            }
             final Table table = context.tables.forTable(tableId);
             if (table != null) {
                 context.tables.overwriteTable(table.edit().addAttributes(table.attributes()).addAttribute(Attribute.editor().name("dameng.object.id")
@@ -337,7 +376,7 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
 
     @Override
     protected Collection<TableId> getTablesForSchemaChange(RelationalSnapshotContext<DamengPartition, DamengOffsetContext> context) {
-        return schemaTables(context);
+        return schemaTables(context).stream().filter(id -> !DamengTableType.isNonRow(context.tables.forTable(id))).toList();
     }
 
     private Set<TableId> schemaTables(RelationalSnapshotContext<DamengPartition, DamengOffsetContext> context) {

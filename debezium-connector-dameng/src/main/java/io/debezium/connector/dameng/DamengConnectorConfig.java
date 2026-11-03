@@ -170,6 +170,14 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             .withDescription("Maximum total temporary transaction file bytes for one task run. Exceeding the limit or any local I/O failure "
                     + "stops the task without skipping history. Allow additional filesystem free space and retain archives for restart.");
 
+    public static final Field PARTITION_DROP_IGNORE = Field.create("partition.drop.ignore")
+            .withDisplayName("Ignore partition drops and truncates").withType(Type.BOOLEAN).withDefault(false)
+            .withWidth(Width.SHORT).withImportance(Importance.HIGH).withValidation(Field::isBoolean)
+            .withDescription("Ignore parsed DROP PARTITION/SUBPARTITION and TRUNCATE PARTITION/SUBPARTITION statements, "
+                    + "including TRUNCATE TABLE ... PARTITION. Defaults to false and stops on these operations, "
+                    + "even if schema.history.internal.skip.unparseable.ddl is true. DM can remove partition rows without per-row DELETE redo, "
+                    + "so enabling this option may leave removed rows downstream. Does not allow partition EXCHANGE.");
+
     private static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .excluding(CommonConnectorConfig.QUERY_FETCH_SIZE)
             .excluding(RelationalDatabaseConnectorConfig.QUERY_TIMEOUT_MS)
@@ -184,7 +192,7 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
                     LOG_MINING_BUFFER_MAX_BYTES,
                     LOG_MINING_BUFFER_MAX_RECORDS, LOG_MINING_BUFFER_MAX_SQL_BYTES, LOG_MINING_BUFFER_MAX_TRANSACTIONS, LOG_MINING_BUFFER_MEMORY_BYTES,
                     LOG_MINING_BUFFER_SPILL_PATH, LOG_MINING_BUFFER_SPILL_MAX_BYTES,
-                    QUERY_FETCH_SIZE, TIME_PRECISION_MODE, UNAVAILABLE_VALUE_PLACEHOLDER)
+                    QUERY_FETCH_SIZE, TIME_PRECISION_MODE, UNAVAILABLE_VALUE_PLACEHOLDER, PARTITION_DROP_IGNORE)
             .events(SOURCE_INFO_STRUCT_MAKER)
             .create();
     public static final Field.Set ALL_FIELDS = Field.setOf(CONFIG_DEFINITION.all());
@@ -260,6 +268,11 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
         if (getSignalingDataCollectionIds().size() > 1) {
             throw new IllegalArgumentException("Dameng signal.data.collection must identify a single schema-qualified signal table");
         }
+        for (final var tableId : getSignalingDataCollectionTableIds()) {
+            if (DamengInternalTableType.fromTableId(tableId).isPresent()) {
+                throw new IllegalArgumentException("Dameng signal.data.collection cannot use an internal table: " + tableId);
+            }
+        }
         logMiningBatchSize = config.getInteger(LOG_MINING_BATCH_SIZE);
         if (getLogMiningWindowMaxBytes() <= 0) {
             throw new IllegalArgumentException("Dameng mining window byte budget must be positive");
@@ -325,6 +338,10 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
 
     public boolean isRecoveryIncrementalSnapshotAutoStart() {
         return getConfig().getBoolean(RECOVERY_INCREMENTAL_SNAPSHOT_AUTO_START);
+    }
+
+    public boolean isPartitionDropIgnored() {
+        return getConfig().getBoolean(PARTITION_DROP_IGNORE);
     }
 
     private static int validateRecoveryNonce(Configuration config, Field field, Field.ValidationOutput problems) {
@@ -733,11 +750,16 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
         }
     }
 
+    boolean isInternalTableExcluded(TableId tableId) {
+        return DamengInternalTableType.fromTableId(tableId).isPresent() && !getTableFilters().dataCollectionFilter().isIncluded(tableId);
+    }
+
     private static final class SystemTablesFilter implements TableFilter {
         @Override
         public boolean isIncluded(TableId tableId) {
             String schema = tableId.schema();
-            return schema == null || !(schema.equalsIgnoreCase("SYS") || schema.equalsIgnoreCase("SYSTEM") || schema.startsWith("V$"));
+            return DamengInternalTableType.fromTableId(tableId).isEmpty()
+                    && (schema == null || !(schema.equalsIgnoreCase("SYS") || schema.equalsIgnoreCase("SYSTEM") || schema.startsWith("V$")));
         }
     }
 }

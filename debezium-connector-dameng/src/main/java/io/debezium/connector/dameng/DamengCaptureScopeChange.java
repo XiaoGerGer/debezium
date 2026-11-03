@@ -146,7 +146,8 @@ final class DamengCaptureScopeChange {
         final var tableIds = new HashSet<TableId>();
         for (var change : new JsonTableChangeSerializer().deserialize(record.document().getArray(HistoryRecord.Fields.TABLE_CHANGES), false)) {
             if (boundary <= 0 || change.getType() != TableChanges.TableChangeType.CREATE || change.getTable() == null
-                    || change.getTable().columns().isEmpty() || !newConfig.getTableFilters().dataCollectionFilter().isIncluded(change.getId())
+                    || (change.getTable().columns().isEmpty() && !DamengTableType.isNonRow(change.getTable()))
+                    || !newConfig.getTableFilters().dataCollectionFilter().isIncluded(change.getId())
                     || oldConfig.getTableFilters().dataCollectionFilter().isIncluded(change.getId())) {
                 throw new ConnectException("Dameng capture scope descriptor must contain complete CREATE table baselines");
             }

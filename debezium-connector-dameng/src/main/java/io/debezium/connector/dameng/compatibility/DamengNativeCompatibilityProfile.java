@@ -8,7 +8,7 @@ package io.debezium.connector.dameng.compatibility;
 import java.nio.charset.Charset;
 import java.util.Set;
 
-import io.debezium.connector.dameng.DamengDdlParser;
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 
 /** Existing native-mode rules, kept together rather than branching on mode in the pipeline. */
 final class DamengNativeCompatibilityProfile implements DamengCompatibilityProfile {

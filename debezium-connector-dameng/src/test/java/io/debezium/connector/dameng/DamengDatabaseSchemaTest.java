@@ -14,6 +14,7 @@ import java.util.List;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -50,6 +51,50 @@ class DamengDatabaseSchemaTest {
             schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, offset, "DAMENG", table));
             assertThatThrownBy(() -> schema.recover(Offsets.of(partition, offset))).isInstanceOf(ConnectException.class)
                     .hasMessageContaining("APP.CAPTURED").hasMessageContaining("snapshot");
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
+    void shouldRecoverNonRowLifecycleAndOrdinaryRecreationAtTheirHistoricalOffsets(DamengTableType kind) throws Exception {
+        final var configuration = DamengConnectorConfigTest.configuration()
+                .with("schema.history.internal", MemorySchemaHistory.class.getName()).build();
+        final var config = new DamengConnectorConfig(configuration);
+        final var partition = new DamengPartition(config.getLogicalName());
+        final var offset = new DamengOffsetContext(config, 10);
+        final var external = new DamengTableType.Identity(kind, 71).table(new TableId(null, "APP", "EXTERNAL_DATA"));
+        final var renamed = external.edit().addAttributes(external.attributes()).tableId(new TableId(null, "APP", "RENAMED")).create();
+        try (var schema = new DamengDatabaseSchema(config, new DamengValueConverters(config), config.schemaNameAdjuster(),
+                config.getTopicNamingStrategy(CommonConnectorConfig.TOPIC_NAMING_STRATEGY), new CustomConverterRegistry(List.of()),
+                new DamengTaskContext(configuration, config))) {
+            schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, offset, "DAMENG", external));
+            assertThat(schema.schemaFor(external.id())).isNull();
+            offset.setCommitLsn(20);
+            schema.applySchemaChange(SchemaChangeEvent.ofRename(partition, offset, "DAMENG", "APP",
+                    "ALTER TABLE APP.EXTERNAL_DATA RENAME TO RENAMED", renamed, external.id()));
+            offset.setCommitLsn(30);
+            schema.applySchemaChange(SchemaChangeEvent.ofDrop(partition, offset, "DAMENG", "APP", "DROP TABLE APP.RENAMED", renamed));
+            offset.setCommitLsn(40);
+            final var ordinary = table("RENAMED");
+            schema.applySchemaChange(SchemaChangeEvent.of(SchemaChangeEventType.CREATE, partition, offset, "DAMENG", "APP",
+                    "CREATE TABLE APP.RENAMED(ID INT PRIMARY KEY)", ordinary, false));
+
+            final var atSnapshot = new DamengOffsetContext(config, 10);
+            schema.recover(Offsets.of(partition, atSnapshot));
+            assertThat(schema.getTables().forTable(external.id())).isEqualTo(external);
+            assertThat(schema.getTables().forTable(external.id()).attributeWithName(DamengTableType.ATTRIBUTE_NAME).value()).isEqualTo(kind.name());
+            assertThat(schema.schemaFor(external.id())).isNull();
+            final var atRename = new Tables();
+            schema.getSchemaHistory().recover(Offsets.of(partition, new DamengOffsetContext(config, 20)), atRename, null);
+            assertThat(atRename.forTable(external.id())).isNull();
+            assertThat(atRename.forTable(renamed.id())).isEqualTo(renamed);
+            final var atDrop = new Tables();
+            schema.getSchemaHistory().recover(Offsets.of(partition, new DamengOffsetContext(config, 30)), atDrop, null);
+            assertThat(atDrop.tableIds()).isEmpty();
+            schema.recover(Offsets.of(partition, offset));
+            assertThat(schema.getTables().forTable(renamed.id())).isEqualTo(ordinary);
+            assertThat(DamengTableType.isNonRow(schema.getTables().forTable(renamed.id()))).isFalse();
+            assertThat(schema.schemaFor(renamed.id())).isNotNull();
         }
     }
 

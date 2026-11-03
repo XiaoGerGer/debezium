@@ -67,6 +67,15 @@ public final class DamengDatabaseSchema extends HistorizedRelationalDatabaseSche
     }
 
     @Override
+    protected void buildAndRegisterSchema(Table table) {
+        if (DamengTableType.isNonRow(table)) {
+            removeSchema(table.id());
+            return;
+        }
+        super.buildAndRegisterSchema(table);
+    }
+
+    @Override
     public void refresh(Table table) {
         tableVersion++;
         super.refresh(table);

@@ -31,9 +31,11 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.CommonConnectorConfig;
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
@@ -63,6 +65,7 @@ class DamengStreamingFilterBoundaryTest {
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private final List<TableId> delivered = new ArrayList<>();
+    private final List<TableId> publishedSchemas = new ArrayList<>();
     private DamengDatabaseSchema schema;
     private DamengStreamingChangeEventSource source;
     private ChangeEventSourceContext context;
@@ -108,6 +111,7 @@ class DamengStreamingFilterBoundaryTest {
             // Match EventDispatcher's store-only-captured filtering while applying
             // real schema/history changes through the supplied callback.
             if (config.getTableFilters().dataCollectionFilter().isIncluded(dispatchId)) {
+                publishedSchemas.add(dispatchId);
                 final SchemaChangeEventEmitter emitter = invocation.getArgument(3);
                 emitter.emitSchemaChangeEvent(schema::applySchemaChange);
             }
@@ -125,6 +129,49 @@ class DamengStreamingFilterBoundaryTest {
     @AfterEach
     void closeSchema() {
         schema.close();
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
+    void shouldReplayNonRowRenameDropAndOrdinaryRecreationFromRecoveredHistory(DamengTableType kind) throws Exception {
+        schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, offset, "DAMENG", new DamengTableType.Identity(kind, 7).table(INCLUDED)));
+        schema.recover(Offsets.of(partition, offset));
+        final Map<String, Object> create = new HashMap<>(ddl(104, "CREATE TABLE APP.A (ID INT PRIMARY KEY)"));
+        create.put("DATA_OBJ#", 9L);
+        final Map<String, Object> insert = new HashMap<>(dml(105));
+        insert.put("DATA_OBJ#", 9L);
+        insert.put("SQL_REDO", "INSERT INTO \"150\".\"OBJ# 9\"(\"COL 1\") VALUES(1)");
+
+        run(List.of(ddl(101, "ALTER TABLE APP.A RENAME TO B"), ddl(102, "ALTER TABLE APP.B RENAME TO A"),
+                ddl(103, "DROP TABLE APP.A CASCADE"), create, insert, commit()));
+
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(publishedSchemas).containsExactly(INCLUDED);
+        final var restored = recover().forTable(INCLUDED);
+        assertThat(DamengTableType.isNonRow(restored)).isFalse();
+        assertThat(restored.attributeWithName("dameng.object.id").asLong()).isEqualTo(9);
+        assertThat(schema.schemaFor(INCLUDED)).isNotNull();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = { true, false })
+    void shouldRejectExternalIdentityMismatchOrUnexpectedDmlBeforeAdvancingOffset(boolean rowChange) throws Exception {
+        final var external = DamengTableType.externalTable(INCLUDED, 7);
+        schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, offset, "DAMENG", external));
+        offset.validateDatabaseMagic(0);
+        final var before = offset.getOffset();
+        final Map<String, Object> change = new HashMap<>(rowChange ? dml(101) : ddl(101, "DROP TABLE APP.A"));
+        if (!rowChange) {
+            change.put("DATA_OBJ#", 9L);
+        }
+        run(List.of(change, commit()));
+        assertThat(failure.get()).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(rowChange ? "Unexpected row change" : "object identity mismatch");
+        assertThat(schema.getTables().forTable(INCLUDED)).isEqualTo(external);
+        assertThat(offset.getOffset()).isEqualTo(before);
+        assertThat(delivered).isEmpty();
+        assertThat(publishedSchemas).isEmpty();
     }
 
     @Test
@@ -180,6 +227,99 @@ class DamengStreamingFilterBoundaryTest {
         assertThat(recovered.forTable(INCLUDED)).isNull();
         assertThat(recovered.forTable(EXCLUDED)).isNotNull();
         assertThat(recovered.forTable(EXCLUDED).attributeWithName("dameng.object.id").asLong()).isEqualTo(7L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "CREATE EXTERNAL TABLE APP.B(ID INT) FROM DEFAULT DIRECTORY D LOCATION ('ext.ctl')",
+            "CREATE EXTERNAL TABLE IF NOT EXISTS APP.B(ID INT COMMENT 'key') FROM DEFAULT DIRECTORY D LOCATION ('ext.ctl')",
+            "CREATE EXTERNAL TABLE APP.B(ID INT) FROM DATAFILE DEFAULT DIRECTORY D LOCATION ('ext.csv')",
+            "CREATE EXTERNAL TABLE IF NOT EXISTS APP.B(ID INT) FROM DATAFILE DEFAULT DIRECTORY D LOCATION ('ext.csv')"
+                    + " PARMS(FIELDS DELIMITED BY '|', RECORDS DELIMITED BY 0x0a, CHARACTER_CODE 'UTF-8')",
+            "DROP TABLE APP.B",
+            "DROP TABLE IF EXISTS APP.B",
+            "DROP TABLE APP.B RESTRICT",
+            "DROP TABLE APP.B CASCADE"
+    })
+    void shouldSkipExcludedExternalTableDdlAndContinueDataCapture(String sql) throws Exception {
+        final var original = schema.getTables().forTable(INCLUDED);
+        final Map<String, Object> external = new HashMap<>(ddl(101, sql));
+        external.put("DATA_OBJ#", 99L);
+
+        run(List.of(external, dml(102), commit()));
+
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(schema.getTables().tableIds()).containsExactly(INCLUDED);
+        assertThat(schema.getTables().forTable(INCLUDED)).isSameAs(original);
+        final var recovered = recover();
+        assertThat(recovered.tableIds()).containsExactly(INCLUDED);
+        assertThat(recovered.forTable(INCLUDED).retrieveColumnNames()).containsExactly("ID");
+        assertThat(offset.getCommitLsn()).isEqualTo(120L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "CREATE GLOBAL TEMPORARY TABLE APP.A(ID INT) ON COMMIT DELETE ROWS",
+            "CREATE GLOBAL TEMPORARY TABLE APP.A(ID INT) ON COMMIT PRESERVE ROWS",
+            "CREATE EXTERNAL TABLE APP.A(ID INT) FROM DEFAULT DIRECTORY D LOCATION ('ext.ctl')",
+            "CREATE EXTERNAL TABLE APP.A(ID INT) FROM DATAFILE DEFAULT DIRECTORY D LOCATION ('ext.csv') PARMS(CHARACTER_CODE 'UTF-8')"
+    })
+    void shouldTrackNonRowTableDefinitionsWithoutPublishingDataSchema(String sql) throws Exception {
+        final Map<String, Object> create = new HashMap<>(ddl(102, sql));
+        create.put("DATA_OBJ#", 9L);
+        run(List.of(ddl(101, "DROP TABLE APP.A"), create, commit()));
+
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).isEmpty();
+        assertThat(schema.schemaFor(INCLUDED)).isNull();
+        final var external = recover().forTable(INCLUDED);
+        assertThat(DamengTableType.isNonRow(external)).isTrue();
+        assertThat(DamengTableType.isTemporary(external)).isEqualTo(sql.contains("TEMPORARY"));
+        assertThat(publishedSchemas).containsExactly(INCLUDED);
+        assertThat(external.attributeWithName("dameng.object.id").asLong()).isEqualTo(9);
+        assertThat(external.columns()).isEmpty();
+    }
+
+    @Test
+    void shouldSkipTemporaryAlterTruncateAndRowsThenCaptureOrdinaryRecreation() throws Exception {
+        final var temporary = DamengTableType.temporaryTable(INCLUDED, 7);
+        schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, offset, "DAMENG", temporary));
+        final Map<String, Object> create = new HashMap<>(ddl(107, "CREATE TABLE APP.A(ID INT PRIMARY KEY)"));
+        create.put("DATA_OBJ#", 9L);
+        final Map<String, Object> insert = new HashMap<>(dml(108));
+        insert.put("DATA_OBJ#", 9L);
+        insert.put("SQL_REDO", "INSERT INTO \"150\".\"OBJ# 9\"(\"COL 1\") VALUES(1)");
+
+        run(List.of(ddl(101, "ALTER TABLE APP.A ADD V VARCHAR(30)"), ddl(102, "ALTER TABLE APP.A RENAME COLUMN V TO VALUE"),
+                ddl(103, "TRUNCATE TABLE APP.A"), dml(104), ddl(105, "DROP TABLE APP.A"), create, insert, commit()));
+
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(publishedSchemas).containsExactly(INCLUDED);
+        assertThat(DamengTableType.isNonRow(recover().forTable(INCLUDED))).isFalse();
+        assertThat(schema.schemaFor(INCLUDED)).isNotNull();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "CREATE GLOBAL TEMPORARY TABLE APP.B(ID INT) ON COMMIT DELETE ROWS; DROP TABLE APP.A",
+            "CREATE GLOBAL TEMPORARY TABLE APP.B(ID INT) ON COMMIT PRESERVE ROWS; ALTER TABLE APP.A ADD LOST INT",
+            "CREATE EXTERNAL TABLE APP.B(ID INT) FROM DEFAULT DIRECTORY D LOCATION ('ext.ctl'); DROP TABLE APP.A",
+            "CREATE EXTERNAL TABLE APP.B(ID INT) FROM DATAFILE DEFAULT DIRECTORY D LOCATION ('ext.csv') ALTER TABLE APP.A ADD LOST INT",
+            "DROP TABLE APP.B; DROP TABLE APP.A"
+    })
+    void shouldRejectCompoundExternalTableDdlBeforeCaptureFiltering(String sql) throws Exception {
+        final var original = schema.getTables().forTable(INCLUDED);
+        offset.validateDatabaseMagic(0);
+        final var before = offset.getOffset();
+
+        run(List.of(ddl(101, sql), dml(102), commit()));
+
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("LSN 101");
+        assertThat(delivered).isEmpty();
+        assertThat(schema.getTables().forTable(INCLUDED)).isSameAs(original);
+        assertThat(offset.getOffset()).isEqualTo(before);
     }
 
     @Test

@@ -168,8 +168,12 @@ class DamengCompatibilityTest {
         assertThat(tables.forTable(previous.id()).columnWithName("W").defaultValueExpression()).contains("'a' || 'b'");
         parser.parse("ALTER TABLE APP.T ALTER COLUMN W SET DEFAULT 'c' " + expressionComment + " || 'd'", tables, "APP");
         assertThat(tables.forTable(previous.id()).columnWithName("W").defaultValueExpression()).contains("'c' || 'd'");
-        assertThatThrownBy(() -> parser.parse("ALTER TABLE APP.T ALTER COLUMN W SET DEFAULT", tables, "APP"))
-                .hasMessageContaining("Empty SQL expression");
+        final var beforeInvalidDefault = tables.forTable(previous.id());
+        final var invalidDdl = "ALTER TABLE APP.T ALTER COLUMN W SET DEFAULT";
+        assertThatThrownBy(() -> parser.parse(invalidDdl, tables, "APP"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("character " + invalidDdl.length(), "line 1, column " + (invalidDdl.length() + 1));
+        assertThat(tables.forTable(previous.id())).isSameAs(beforeInvalidDefault);
         assertThat(tables.forTable(previous.id()).columnWithName("W").defaultValueExpression()).contains("'c' || 'd'");
         parser.parse("ALTER TABLE APP.T ADD AMOUNT DECIMAL(10,2) DEFAULT -.5", tables, "APP");
         assertThat(tables.forTable(previous.id()).columnWithName("AMOUNT").defaultValueExpression()).contains("-.5");

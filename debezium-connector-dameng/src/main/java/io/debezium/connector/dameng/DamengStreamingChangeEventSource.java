@@ -21,12 +21,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.annotation.VisibleForTesting;
-import io.debezium.connector.dameng.ddl.DamengDdlStatementAnalyzer.Analysis;
-import io.debezium.connector.dameng.ddl.DamengDdlStatementAnalyzer.Impact;
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Analysis;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Impact;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.PartitionDataRemovalException;
 import io.debezium.connector.dameng.logminer.LogMinerArchiveWindow;
 import io.debezium.connector.dameng.logminer.LogMinerRow;
 import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer;
 import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer.Transaction;
+import io.debezium.connector.dameng.logminer.events.EventType;
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser;
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser.DmlEntry;
 import io.debezium.data.Envelope.Operation;
@@ -235,7 +238,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                 LOGGER.error("Dameng LogMiner streaming failed (SQLState={}, errorCode={})", sql.getSQLState(), sql.getErrorCode(), e);
             }
             else {
-                LOGGER.error("Dameng LogMiner streaming failed", e);
+                LOGGER.error("Dameng LogMiner streaming failed: {}", e.getMessage(), e);
             }
             errorHandler.setProducerThrowable(e);
         }
@@ -311,7 +314,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
         final int sequence = requiredInt(rows, "SSN", lsn);
         final int continuation = requiredInt(rows, "CSF", lsn);
         final long objectId = rows.getLong("DATA_OBJ#");
-        if (operation >= 1 && operation <= 4 && sequence == 0 && (rows.wasNull() || objectId <= 0)) {
+        if (EventType.from(operation).isDataChange() && sequence == 0 && (rows.wasNull() || objectId <= 0)) {
             throw new IllegalStateException("Missing or invalid Dameng DML DATA_OBJ# at LSN " + lsn);
         }
         final byte[] xid = rows.getBytes("XID");
@@ -364,7 +367,11 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                 if (transaction.commitLsn() == previousCommit && transaction.id().equals(previousTransaction) && ordinal <= previousSerial) {
                     continue;
                 }
-                final Analysis analysis = row.operation() == 5 ? analyzeDdl(row) : null;
+                final var eventType = row.eventType();
+                final Analysis analysis = eventType == EventType.DDL ? analyzeDdl(row) : null;
+                if (eventType == EventType.DDL && analysis == null) {
+                    continue;
+                }
                 final TableId tableId = analysis == null ? tableId(row) : analysis.tableId();
                 if (captureScopeChange != null && (analysis == null || analysis.impact() == Impact.TABLE)
                         && captureScopeChange.excludes(tableId, row.objectId(), row.lsn())) {
@@ -382,14 +389,18 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                             + "catch up through the rename, then retry the scope change; refusing to overwrite the new table baseline with pre-boundary history");
                 }
                 if (tableId == null) {
-                    if (row.operation() != 5 && (row.operation() < 1 || row.operation() > 4)) {
+                    if (eventType != EventType.DDL && !eventType.isDataChange()) {
                         throw new IllegalStateException("Unsupported Dameng LogMiner operation " + row.operation() + " with unresolved table at "
                                 + row.position() + "; cannot prove that the change is outside capture; refusing to advance the offset");
                     }
                     continue;
                 }
+                if (config.isInternalTableExcluded(tableId)) {
+                    // Also discard definitions retained in history by older connector versions.
+                    continue;
+                }
                 if (!config.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
-                    if (row.operation() != 5) {
+                    if (eventType != EventType.DDL) {
                         continue;
                     }
                     if (schema.getTables().forTable(tableId) == null) {
@@ -403,26 +414,41 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                     // A previously captured table can leave the filter after a rename.
                     // Retain its subsequent DDL so restart and rename-back stay consistent.
                 }
-                if (row.operation() < 1 || row.operation() > 5) {
+                if (!eventType.isDataChange() && eventType != EventType.DDL) {
                     throw new IllegalStateException("Unsupported Dameng LogMiner operation " + row.operation() + " for " + tableId
                             + " at " + row.position() + "; refusing to advance past an unhandled change");
                 }
-                if (row.operation() == 5 && row.objectId() <= 0) {
+                if (eventType == EventType.DDL && row.objectId() <= 0) {
                     throw new IllegalStateException("Invalid Dameng DDL DATA_OBJ# " + row.objectId() + " for " + tableId
                             + " at LSN " + row.lsn() + "; refusing to replace the historical table identity or advance the offset");
+                }
+                final var historical = schema.getTables().forTable(tableId);
+                if (DamengTableType.isNonRow(historical)) {
+                    if (eventType.isDataChange() && DamengTableType.isExternal(historical)) {
+                        throw new IllegalStateException("Unexpected row change for historical external table " + tableId + " at " + row.position());
+                    }
+                    if (historical.attributeWithName("dameng.object.id").asLong() != row.objectId()) {
+                        throw new IllegalStateException("Dameng non-row table object identity mismatch for " + tableId + " at " + row.position());
+                    }
+                    if (eventType.isDataChange()) {
+                        continue;
+                    }
                 }
                 // Validate on a copy before advancing this row's offset. The live model is
                 // changed only by DatabaseSchema when its schema event is applied.
                 final List<DamengDdlParser.SchemaChange> ddlChanges = analysis == null ? List.of() : planDdl(analysis, row);
+                if (ddlChanges == null) {
+                    continue;
+                }
                 offset.setTransactionId(transaction.id());
                 offset.setChangeLsn(row.lsn());
                 offset.setCommitLsn(transaction.commitLsn());
                 offset.setEventSerialNo(ordinal);
                 offset.event(tableId, row.timestamp());
-                if (row.operation() == 5) {
+                if (eventType == EventType.DDL) {
                     dispatchDdl(partition, row, ddlChanges);
                 }
-                else if (row.operation() >= 1 && row.operation() <= 4) {
+                else if (eventType.isDataChange()) {
                     final Table table = schema.getTables().forTable(tableId);
                     if (table == null) {
                         throw new IllegalStateException("No historical schema for captured Dameng table " + tableId + " at LSN " + row.lsn());
@@ -436,7 +462,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                     dispatcher.dispatchTransactionStartedEvent(partition, transaction.id(), offset, row.timestamp());
                     offset.setEventSerialNo(ordinal);
                     dispatcher.dispatchDataChangeEvent(partition, tableId,
-                            new DamengChangeRecordEmitter(partition, offset, parser.parse(row.redo(), physicalTable(row.objectId(), table)), clock, config, table));
+                            new DamengChangeRecordEmitter(partition, offset, parseDml(row, physicalTable(row.objectId(), table)), clock, config, table));
                 }
             }
         }
@@ -451,6 +477,10 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
         if (objectTablesVersion != version) {
             objectTables.clear();
             for (TableId id : schema.getTables().tableIds()) {
+                if (config.isInternalTableExcluded(id)) {
+                    // An old internal table's object id can already belong to a business table.
+                    continue;
+                }
                 final var objectId = schema.getTables().forTable(id).attributeWithName("dameng.object.id");
                 if (objectId != null) {
                     final var previous = objectTables.put(Long.parseLong(objectId.value()), id);
@@ -464,6 +494,20 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
         return objectTables.get(row.objectId());
     }
 
+    private DmlEntry parseDml(LogMinerRow row, Table table) {
+        try {
+            return parser.parse(row.redo(), table);
+        }
+        catch (RuntimeException failure) {
+            logSqlParsingFailure(row, failure);
+            throw failure;
+        }
+    }
+
+    private static void logSqlParsingFailure(LogMinerRow row, RuntimeException failure) {
+        LOGGER.error("Failed to parse Dameng LogMiner SQL. Full LogMinerRow: {}", row, failure);
+    }
+
     private Analysis analyzeDdl(LogMinerRow row) {
         if (row.redo() == null || row.redo().isBlank()) {
             throw new IllegalStateException("Missing Dameng DDL SQL_REDO at LSN " + row.lsn());
@@ -472,6 +516,18 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
             return ddlParser.analyze(row.redo(), row.owner() == null ? row.username() : row.owner());
         }
         catch (IllegalArgumentException failure) {
+            if (failure instanceof PartitionDataRemovalException) {
+                if (!config.isPartitionDropIgnored()) {
+                    throw ddlFailure(row, failure);
+                }
+                LOGGER.warn("Ignoring Dameng partition data removal at LSN {}, DATA_OBJ# {} because partition.drop.ignore=true. "
+                        + "Removed partition rows may remain downstream. SQL_REDO: '{}'; reason: {}",
+                        row.lsn(), row.objectId(), row.redo(), failure.getMessage());
+                return null;
+            }
+            if (skipUnparseableDdl(row, failure)) {
+                return null;
+            }
             throw ddlFailure(row, failure);
         }
     }
@@ -481,13 +537,28 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
             return ddlParser.plan(analysis, schema.getTables());
         }
         catch (IllegalArgumentException failure) {
+            if (skipUnparseableDdl(row, failure)) {
+                return null;
+            }
             throw ddlFailure(row, failure);
         }
     }
 
+    private boolean skipUnparseableDdl(LogMinerRow row, IllegalArgumentException failure) {
+        if (!config.skipUnparseableDdlStatements()) {
+            return false;
+        }
+        LOGGER.warn("Skipping unparseable Dameng DDL at LSN {}, DATA_OBJ# {} because schema.history.internal.skip.unparseable.ddl=true. "
+                + "Historical schema was not changed; subsequent events may fail or be decoded incorrectly if this DDL changed a captured table. "
+                + "SQL_REDO: '{}'; reason: {}", row.lsn(), row.objectId(), row.redo(), failure.getMessage(), failure);
+        return true;
+    }
+
     private IllegalArgumentException ddlFailure(LogMinerRow row, IllegalArgumentException failure) {
+        logSqlParsingFailure(row, failure);
         return new IllegalArgumentException("Cannot process Dameng DDL at LSN " + row.lsn() + ", DATA_OBJ# " + row.objectId()
-                + ": " + failure.getMessage() + "; historical schema and this statement's offset were not changed", failure);
+                + ": " + failure.getMessage() + "; SQL_REDO: '" + row.redo()
+                + "'; historical schema and this statement's offset were not changed", failure);
     }
 
     @VisibleForTesting
@@ -539,7 +610,11 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                 final TableId dispatchId = config.getTableFilters().dataCollectionFilter().isIncluded(change.tableId())
                         ? change.tableId()
                         : change.previousTableId();
-                if (dispatchId != null && config.getTableFilters().dataCollectionFilter().isIncluded(dispatchId)) {
+                if (DamengTableType.isNonRow(table)) {
+                    // Persist lifecycle metadata without publishing a data or schema event.
+                    schema.applySchemaChange(event);
+                }
+                else if (dispatchId != null && config.getTableFilters().dataCollectionFilter().isIncluded(dispatchId)) {
                     dispatcher.dispatchSchemaChangeEvent(partition, offset, dispatchId, receiver -> receiver.schemaChangeEvent(event));
                 }
                 else {
@@ -551,7 +626,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
             finally {
                 offset.setEventSerialNo(serial);
             }
-            if (change.type() == DamengDdlParser.Type.TRUNCATE) {
+            if (change.type() == DamengDdlParser.Type.TRUNCATE && !DamengTableType.isNonRow(table)) {
                 dispatcher.dispatchDataChangeEvent(partition, change.tableId(), new DamengChangeRecordEmitter(partition, offset,
                         new DmlEntry(Operation.TRUNCATE, null, null, new BitSet(), new BitSet()), clock, config, table));
             }

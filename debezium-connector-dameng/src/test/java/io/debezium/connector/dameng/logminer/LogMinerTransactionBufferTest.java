@@ -20,6 +20,8 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import io.debezium.connector.dameng.logminer.events.EventType;
+
 class LogMinerTransactionBufferTest {
     @TempDir
     Path directory;
@@ -53,15 +55,23 @@ class LogMinerTransactionBufferTest {
     }
 
     @Test
-    void shouldRejectMissingTransactionIdentityAndKeepUnsupportedOperationsVisible() {
+    void shouldRejectMissingTransactionIdentity() {
         try (var missingIdentity = buffer(4096)) {
             assertThatThrownBy(() -> missingIdentity.add(row(null, 10, 10, 1, 0, "INSERT")))
                     .isInstanceOf(IllegalStateException.class).hasMessageContaining("transaction id");
         }
-        try (var unsupported = buffer(4096)) {
-            unsupported.add(row("tx", 10, 10, 255, 0, "unsupported"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { Integer.MIN_VALUE, 0, 13, 14, 255, 999, Integer.MAX_VALUE })
+    void shouldPreserveUnhandledOperationCodesWhenSpilling(int code) {
+        try (var unsupported = buffer(512)) {
+            unsupported.add(row("tx", 10, 10, code, 0, "unsupported"));
             unsupported.add(row("tx", 11, 10, 7, 0, null));
-            assertThat(read(unsupported.committedTransactions().get(0))).extracting(LogMinerRow::operation).containsExactly(255);
+            assertThat(unsupported.diskBytes()).isPositive();
+            final var rows = read(unsupported.committedTransactions().get(0));
+            assertThat(rows).extracting(LogMinerRow::operation).containsExactly(code);
+            assertThat(rows).extracting(LogMinerRow::eventType).containsExactly(EventType.from(code));
         }
     }
 
@@ -433,6 +443,18 @@ class LogMinerTransactionBufferTest {
                     damage.equals("OBJECT") ? 8 : 7, damage.equals("VERSION") ? 2 : 0, 0, 123, 45);
             assertThatThrownBy(() -> buffer.add(next)).isInstanceOf(IllegalStateException.class).hasMessageContaining("LSN");
             assertThatThrownBy(buffer::committedTransactions).isInstanceOf(IllegalStateException.class);
+        }
+    }
+
+    @Test
+    void shouldRejectContinuationPiecesWithDifferentUnknownOperationCodes() {
+        try (var buffer = buffer(512)) {
+            final var first = new LogMinerRow(11, 10, 0, "a", 999, 0, null, null, null, "first", "r", 0, 1, Instant.EPOCH, 7);
+            final var next = new LogMinerRow(11, 10, 0, "a", 1000, 0, null, null, null, "last", "r", 1, 0, Instant.EPOCH, 7);
+            assertThat(first.eventType()).isEqualTo(next.eventType()).isEqualTo(EventType.UNSUPPORTED);
+            buffer.add(first);
+            assertThatThrownBy(() -> buffer.add(next)).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("Interleaved or missing Dameng SQL continuation");
         }
     }
 

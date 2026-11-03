@@ -7,6 +7,7 @@ package io.debezium.connector.dameng;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -18,12 +19,14 @@ import java.util.stream.Stream;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import io.debezium.config.Configuration;
 import io.debezium.document.Document;
 import io.debezium.document.DocumentWriter;
+import io.debezium.relational.TableId;
 
 /** Records actual server acceptance and archived SQL; this probe does not enable a compatibility profile. */
 class DamengDdlSyntaxProbeIT {
@@ -62,6 +65,78 @@ class DamengDdlSyntaxProbeIT {
                 new SyntaxCase("oracle-q-quote", "", "q'[https://host/--/*;#]'", false),
                 new SyntaxCase("postgres-dollar-quote", "", "$$https://host/--/*;#$$", false),
                 new SyntaxCase("postgres-tagged-dollar-quote", "", "$tag$https://host/--/*;#$tag$", false));
+    }
+
+    @Test
+    void shouldRecordCreateIfNotExistsWhenTheTableAlreadyExists() throws Exception {
+        final var table = "DBZ_IF_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12).toUpperCase();
+        final var qualified = '"' + DamengTestDatabase.schema() + "\".\"" + table + '"';
+        final var sql = "CREATE TABLE IF NOT EXISTS " + qualified + " (ID INT PRIMARY KEY)";
+        final var evidence = new StringBuilder();
+        evidence.append("compatibleMode=").append(DamengTestDatabase.requestedCompatibilityMode()).append('\n');
+        evidence.append("sql=").append(sql).append('\n');
+        try (var connection = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
+                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user())
+                .with("password", DamengTestDatabase.password()).build())) {
+            evidence.append("version=").append(connection.connection().getMetaData().getDatabaseProductVersion()).append('\n');
+            final long start = connection.currentLsn();
+            boolean created = false;
+            try {
+                try {
+                    connection.execute(sql);
+                    created = true;
+                    evidence.append("firstExecution=accepted\n");
+                }
+                catch (SQLException rejected) {
+                    evidence.append("firstExecution=rejected; code=").append(rejected.getErrorCode())
+                            .append("; message=").append(rejected.getMessage()).append('\n');
+                    return;
+                }
+                final long firstEnd = connection.currentLsn();
+                final long originalObjectId = connection.getTableObjectId(new TableId(null, DamengTestDatabase.schema(), table));
+                evidence.append("firstEndLsn=").append(firstEnd).append("; objectId=").append(originalObjectId).append('\n');
+                try {
+                    connection.execute(sql);
+                    evidence.append("secondExecution=accepted\n");
+                    assertThat(connection.getTableObjectId(new TableId(null, DamengTestDatabase.schema(), table)))
+                            .as("IF NOT EXISTS must not replace the existing table").isEqualTo(originalObjectId);
+                }
+                catch (SQLException rejected) {
+                    evidence.append("secondExecution=rejected; code=").append(rejected.getErrorCode())
+                            .append("; message=").append(rejected.getMessage()).append('\n');
+                }
+                final long secondEnd = connection.currentLsn();
+                evidence.append("secondEndLsn=").append(secondEnd).append('\n');
+                Awaitility.await("conditional CREATE is archived").atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
+                        .until(() -> connection.latestArchivedLsn() >= secondEnd);
+                connection.startLogMining(start, secondEnd, false);
+                final List<String> redo = connection.queryAndMap("SELECT SCN,DATA_OBJ#,SQL_REDO,CSF FROM V$LOGMNR_CONTENTS WHERE OPERATION_CODE=5 "
+                        + "AND SCN > " + start + " AND SCN <= " + secondEnd + " ORDER BY SCN,SSN", result -> {
+                            final List<String> records = new ArrayList<>();
+                            while (result.next()) {
+                                final var statement = result.getString("SQL_REDO");
+                                if (statement != null && statement.contains(table)) {
+                                    assertThat(result.getInt("CSF")).as("short conditional CREATE must not be fragmented").isZero();
+                                    records.add("lsn=" + result.getLong("SCN") + "; objectId=" + result.getLong("DATA_OBJ#")
+                                            + "; sql=" + statement);
+                                }
+                            }
+                            return records;
+                        });
+                redo.forEach(record -> evidence.append("redo=").append(record).append('\n'));
+                evidence.append("matchingDdlRecords=").append(redo.size()).append('\n');
+                assertThat(redo).as("the first CREATE must appear in archived LogMiner DDL").isNotEmpty();
+            }
+            finally {
+                connection.endLogMining();
+                if (created) {
+                    connection.execute("DROP TABLE " + qualified);
+                }
+                final var directory = Path.of(System.getProperty("dameng.evidence.directory", "target/ddl-syntax-probe"));
+                Files.createDirectories(directory);
+                Files.writeString(directory.resolve("mode-" + DamengTestDatabase.requestedCompatibilityMode() + "-create-if-not-exists.txt"), evidence);
+            }
+        }
     }
 
     @ParameterizedTest

@@ -29,20 +29,27 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.base.ChangeEventQueueMetrics;
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
+import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
@@ -53,6 +60,9 @@ import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
 import io.debezium.util.Clock;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
 
 class DamengStreamingChangeEventSourceTest {
     @org.junit.jupiter.api.io.TempDir
@@ -624,7 +634,9 @@ class DamengStreamingChangeEventSourceTest {
             "GRANT SELECT ON APP.T TO CDC_USER",
             "REVOKE SELECT ON APP.T FROM CDC_USER",
             "// 授予要采集表的 select 权限\nGRANT SELECT ON APP.T TO CDC_USER",
-            "// 回收权限\r\nREVOKE SELECT ON APP.T FROM CDC_USER"
+            "// 回收权限\r\nREVOKE SELECT ON APP.T FROM CDC_USER",
+            "CREATE FORCE VIEW APP.V AS SELECT ID FROM APP.T",
+            "CREATE OR REPLACE FORCE VIEW IF NOT EXISTS APP.V AS SELECT ID FROM APP.T"
     })
     void shouldSkipPrivilegeDdlAndContinueDeliveringCapturedChanges(String ddl) throws Exception {
         final var privilege = Map.<String, Object> of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 110L, "XID", new byte[]{ 1 },
@@ -641,6 +653,24 @@ class DamengStreamingChangeEventSourceTest {
         assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(historicalTable);
         assertThat(offset.getLsn()).isEqualTo(150);
         assertThat(offset.getCommitLsn()).isEqualTo(130);
+    }
+
+    @Test
+    void shouldRejectForceViewAndTableDdlInOneRecordWithoutAdvancingOffsets() throws Exception {
+        final var compound = Map.<String, Object> of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 110L, "XID", new byte[]{ 1 },
+                "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", "CREATE FORCE VIEW APP.V AS SELECT ID FROM APP.T; ALTER TABLE APP.T ADD V INT");
+        records(List.of(compound, commit(110, 90, 1), dml(121, 115, 130, 2), commit(130, 115, 2)));
+        final var historicalTable = schema.getTables().forTable(TABLE_ID);
+        final var offset = new DamengOffsetContext(config, 90);
+
+        source.execute(context, new DamengPartition("dm"), offset);
+
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Cannot process Dameng DDL", "LSN 101");
+        assertThat(delivered).isEmpty();
+        assertThat(schemaOffsets).isEmpty();
+        assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(historicalTable);
+        assertThat(offset.getLsn()).isEqualTo(90);
+        assertThat(offset.getCommitLsn()).isEqualTo(90);
     }
 
     @Test
@@ -930,6 +960,75 @@ class DamengStreamingChangeEventSourceTest {
     private Map<String, Object> truncate() {
         return Map.of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 120L, "XID", new byte[]{ 1 },
                 "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", "TRUNCATE TABLE APP.T");
+    }
+
+    static Stream<Arguments> sqlParsingFailures() {
+        return Stream.of(
+                Arguments.of(5, "/* unclosed"),
+                Arguments.of(5, "ALTER TABLE APP.T ADD X INT UNKNOWN"),
+                Arguments.of(5, "ALTER TABLE APP.T ADD ID INT"),
+                Arguments.of(1, "INSERT INTO \"150\".\"OBJ# 7\"(\"COL 1\") VALUES("),
+                Arguments.of(3, "UPDATE \"150\".\"OBJ# 7\" SET \"COL 1\"="),
+                Arguments.of(2, "DELETE FROM \"150\".\"OBJ# 7\" WHERE \"COL 1\"="))
+                .flatMap(statement -> Stream.of(false, true).map(spill -> Arguments.of(statement.get()[0], statement.get()[1], spill)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("sqlParsingFailures")
+    void shouldLogTheFullAssembledRowAndStackTraceOnSqlParsingFailure(int operation, String sql, boolean spill) throws Exception {
+        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", spill ? 512 : 1048576)
+                .with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
+        createSource();
+        final var prefix = "/*中文😀" + "完整日志".repeat(1500) + "*/\n";
+        final Map<String, Object> first = new HashMap<>(dml(101, 90, 120, 1));
+        first.put("OPERATION_CODE", operation);
+        first.put("SQL_REDO", prefix);
+        first.put("SEG_OWNER", "APP");
+        first.put("TABLE_NAME", "T");
+        first.put("USERNAME", "CDC_USER");
+        first.put("RS_ID", "record-101");
+        first.put("SSN", 0);
+        first.put("CSF", 1);
+        first.put("DATA_OBJV#", 8L);
+        first.put("RBASQN", 9L);
+        first.put("RBABLK", 10L);
+        first.put("RBABYTE", 11L);
+        final Map<String, Object> last = new HashMap<>(first);
+        last.put("SQL_REDO", sql);
+        last.put("SSN", 1);
+        last.put("CSF", 0);
+        records(List.of(first, last, dml(102, 90, 120, 1), commit(120, 90, 1)));
+        final var original = schema.getTables().forTable(TABLE_ID);
+        final var offset = new DamengOffsetContext(config, 90);
+        final var logs = LogInterceptor.forClass(DamengStreamingChangeEventSource.class);
+        try {
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNotNull();
+            assertThat(logs.getLoggingEvents("Full LogMinerRow:")).singleElement().satisfies(event -> {
+                assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+                assertThat(event.getFormattedMessage()).contains("LogMinerRow[lsn=101, startLsn=90, commitLsn=120, transactionId=01",
+                        "operation=" + operation, "rollback=0", "owner=APP", "tableName=T", "username=CDC_USER", "redo=" + prefix + sql,
+                        "recordSetId=record-101", "sequence=0", "continuation=0",
+                        "timestamp=" + Timestamp.valueOf("2026-09-24 12:00:00").toInstant(),
+                        "objectId=7", "objectVersion=8", "archiveSequence=9", "blockNumber=10", "byteOffset=11");
+                assertThat(event.getThrowableProxy()).isNotNull();
+                final var parsingFailure = operation == 5 ? failure.get().getCause() : failure.get();
+                assertThat(event.getThrowableProxy().getClassName()).isEqualTo(parsingFailure.getClass().getName());
+                assertThat(event.getThrowableProxy().getMessage()).isEqualTo(parsingFailure.getMessage());
+            });
+            assertThat(delivered).isEmpty();
+            assertThat(schemaOffsets).isEmpty();
+            assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(original);
+            assertThat(offset.getLsn()).isEqualTo(90);
+            if (spill) {
+                assertThat(metrics.getSpilledTransactions()).isGreaterThan(0);
+            }
+        }
+        finally {
+            logs.stop();
+            ((Logger) LoggerFactory.getLogger(DamengStreamingChangeEventSource.class)).detachAppender(logs);
+        }
     }
 
     private void records(List<Map<String, Object>> records) throws Exception {

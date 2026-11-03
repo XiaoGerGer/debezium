@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
 
@@ -83,7 +84,7 @@ class DamengDdlExtensionsTest {
             "CREATE TABLE APP.T(ID INT) PARTITION BY HASH(UNKNOWN) PARTITIONS 2", "CREATE TABLE APP.T(ID INT) UNKNOWN OPTION",
             "CREATE TABLE APP.T(ID INT) STORAGE(USING UNKNOWN ROW)", "CREATE TABLE APP.T(ID INT COMMENT)",
             "CREATE TABLE APP.T(ID INT COMMENT 42)", "CREATE TABLE APP.T(ID INT,V INT GENERATED ALWAYS AS(ID+1) VIRTUAL)",
-            "CREATE TABLE APP.T(ID INT,V AS(ID+1))", "CREATE GLOBAL TEMPORARY TABLE APP.T(ID INT) ON COMMIT PRESERVE ROWS",
+            "CREATE TABLE APP.T(ID INT,V AS(ID+1))",
             "CREATE EXTERNAL TABLE APP.T(ID INT)", "CREATE HUGE TABLE APP.T(ID INT)", "CREATE TABLE APP.\"#T\"(ID INT)" })
     void shouldRejectUnverifiableOrIncompleteDefinitionsWithoutChangingHistory(String ddl) {
         parser.parse("CREATE TABLE APP.S(ID INT,V VARCHAR(30))", tables, "APP");
@@ -95,10 +96,12 @@ class DamengDdlExtensionsTest {
 
     @Test
     void shouldResolveExcludedSpecialTableScopeButRejectCompoundOrDisguisedStatements() {
-        for (var prefix : List.of("GLOBAL TEMPORARY", "TEMPORARY", "HUGE", "EXTERNAL")) {
+        for (var prefix : List.of("GLOBAL TEMPORARY", "TEMPORARY", "HUGE")) {
             assertThat(parser.resolveTableId("CREATE " + prefix + " TABLE OTHER.T(ID INT)", "APP"))
                     .isEqualTo(new TableId(null, "OTHER", "T"));
         }
+        assertThat(parser.resolveTableId("CREATE EXTERNAL TABLE OTHER.T(ID INT) FROM DEFAULT DIRECTORY D LOCATION ('data.ctl')", "APP"))
+                .isEqualTo(new TableId(null, "OTHER", "T"));
         assertThatThrownBy(() -> parser.analyze("CREATE TABLE APP.T(ID INT) COMMENT ON TABLE APP.S IS 'x'", "APP"))
                 .hasMessageContaining("additional statement");
     }

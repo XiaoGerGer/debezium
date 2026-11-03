@@ -7,8 +7,8 @@ package io.debezium.connector.dameng.compatibility;
 
 import java.util.Locale;
 
-import io.debezium.connector.dameng.ddl.DamengSqlLexer.Kind;
-import io.debezium.connector.dameng.ddl.DamengSqlLexer.Token;
+import io.debezium.connector.dameng.antlr.DamengSqlToken;
+import io.debezium.connector.dameng.antlr.DamengSqlToken.Kind;
 
 /** Canonical identifier spelling shared by scope analysis and historical parsing. */
 public record DamengIdentifierRules(boolean uppercaseQuoted) {
@@ -16,7 +16,7 @@ public record DamengIdentifierRules(boolean uppercaseQuoted) {
         return name == null || !uppercaseQuoted ? name : name.toUpperCase(Locale.ROOT);
     }
 
-    public String identifier(Token token) {
+    public String identifier(DamengSqlToken token) {
         if (token.kind() == Kind.IDENTIFIER) {
             final var name = token.text().substring(1, token.text().length() - 1).replace("\"\"", "\"");
             return canonicalName(name);

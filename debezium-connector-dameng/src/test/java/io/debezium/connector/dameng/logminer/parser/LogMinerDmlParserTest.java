@@ -89,6 +89,27 @@ class LogMinerDmlParserTest {
     }
 
     @Test
+    void shouldParsePhysicalRedoCapturedByTheSqlGrammarIntegrationSuite() {
+        final var insertTable = table(new TableId(null, "150994945", "OBJ# 1043"), "COL 1", "COL 2");
+        final var inserted = parser.parse("INSERT INTO \"150994945\".\"OBJ# 1043\"(\"COL 1\", \"COL 2\") VALUES(2, 'plain');", insertTable);
+        assertThat(inserted.operation()).isEqualTo(Operation.CREATE);
+        assertThat(inserted.newValues()).containsExactly("2", "plain");
+
+        final var updateTable = table(new TableId(null, "150994945", "OBJ# 1046"), "COL 1", "COL 2");
+        final var updated = parser.parse("UPDATE \"150994945\".\"OBJ# 1046\" SET \"COL 2\" = 'plain' "
+                + "WHERE \"COL 1\" = 1 AND \"COL 2\" = 'baseline';", updateTable);
+        assertThat(updated.operation()).isEqualTo(Operation.UPDATE);
+        assertThat(updated.oldValues()).containsExactly("1", "baseline");
+        assertThat(updated.newValues()).containsExactly("1", "plain");
+
+        final var deleteTable = table(new TableId(null, "150994945", "OBJ# 1049"), "COL 1", "COL 2");
+        final var deleted = parser.parse("DELETE FROM \"150994945\".\"OBJ# 1049\" "
+                + "WHERE \"COL 1\" = 1 AND \"COL 2\" = 'baseline';", deleteTable);
+        assertThat(deleted.operation()).isEqualTo(Operation.DELETE);
+        assertThat(deleted.oldValues()).containsExactly("1", "baseline");
+    }
+
+    @Test
     void shouldReadDeleteBeforeImage() {
         final var entry = parser.parse(
                 "DELETE FROM APP.EVENTS WHERE (ID=7 AND (NAME='before' AND FLAG IS NULL)) AND AMOUNT=-1.2e-8;", table);

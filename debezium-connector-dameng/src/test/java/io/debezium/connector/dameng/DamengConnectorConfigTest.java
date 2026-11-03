@@ -20,6 +20,50 @@ import io.debezium.relational.TableId;
 
 class DamengConnectorConfigTest {
     @Test
+    void shouldRequireAnExplicitPartitionDropOptIn() {
+        assertThat(new DamengConnectorConfig(configuration().build()).isPartitionDropIgnored()).isFalse();
+        assertThat(new DamengConnectorConfig(configuration().with(DamengConnectorConfig.PARTITION_DROP_IGNORE, true).build())
+                .isPartitionDropIgnored()).isTrue();
+        assertThat(DamengConnectorConfig.configDef().configKeys().get("partition.drop.ignore").defaultValue).isEqualTo(false);
+        assertThat(configuration().with(DamengConnectorConfig.PARTITION_DROP_IGNORE, "invalid").build()
+                .validate(DamengConnectorConfig.ALL_FIELDS).get("partition.drop.ignore").errorMessages()).isNotEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "MTAB$_MV", "MLOG$_BASE", "mtab$_mv", "Mlog$_Base", "BMJ$_I", "bmj$_i" })
+    void shouldExcludeInternalTablesByDefault(String name) {
+        final var config = new DamengConnectorConfig(configuration().with("table.include.list", "APP\\..*").build());
+        final var id = new TableId(null, "APP", name);
+        assertThat(config.getTableFilters().dataCollectionFilter().isIncluded(id)).isFalse();
+        assertThat(config.getTableFilters().eligibleDataCollectionFilter().isIncluded(id)).isFalse();
+        assertThat(config.getTableFilters().eligibleForSchemaDataCollectionFilter().isIncluded(id)).isFalse();
+        assertThat(config.isInternalTableExcluded(id)).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "MTAB$_MV", "MLOG$_BASE", "BMJ$_I" })
+    void shouldHonorTheExistingBuiltinFilterSwitch(String name) {
+        final var config = new DamengConnectorConfig(configuration().with("table.ignore.builtin", false).build());
+        final var id = new TableId(null, "APP", name);
+        assertThat(config.getTableFilters().dataCollectionFilter().isIncluded(id)).isTrue();
+        assertThat(config.isInternalTableExcluded(id)).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "ORDERS", "MTAB$ORDERS", "MLOG_ORDERS", "MY_MTAB$_MV", "BMJ_ORDERS", "MY_BMJ$_I" })
+    void shouldRetainOrdinaryTablesWithSimilarNames(String name) {
+        final var config = new DamengConnectorConfig(configuration().build());
+        assertThat(config.getTableFilters().dataCollectionFilter().isIncluded(new TableId(null, "APP", name))).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "APP.MTAB$_MV", "APP.MLOG$_BASE", "\"App\".\"mtab$_mv\"", "APP.BMJ$_I", "\"App\".\"bmj$_i\"" })
+    void shouldRejectInternalTablesAsSignalCollections(String name) {
+        assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("signal.data.collection", name).build()))
+                .hasMessageContaining("signal.data.collection", "internal table");
+    }
+
+    @Test
     void shouldKeepStandbyReadsAndPrimaryWritesOnSeparateControlledRoutes() {
         final var raw = configuration().with("database.failover.hosts", "a:5236,b:5236")
                 .with("database.standby.hosts", " b:5236,a:5236 ").build();

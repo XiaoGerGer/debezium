@@ -309,6 +309,7 @@ JAVA_HOME=/opt/java/jdk-25.0.4+7 \
 
 By default it builds and installs reactor dependencies once, then runs both layers in a fresh Maven JVM for mode `0`.
 Use `--modes` to select the modes under implementation or investigation; identifiers are nonnegative integers without a fixed maximum of 8.
+For a disposable mode `2` database, `--ini FLOAT_MODE=1 --ini ORA_DATE_FMT=1` sets and verifies the documented Oracle-compatible parameter combination before running probes. `--ini NUMBER_MODE=1` can be used to test the separate NUMBER declaration behavior. These options never modify an external database.
 A recognized identifier does not enable its production semantics. Compatibility implementations are registered explicitly and accepted in priority order.
 Shared outside-range cases record server rejection or acceptance; accepted values are compared strictly against their actual JDBC storage baseline.
 They do not assume that only mode 4 can perform a database conversion. Mode-specific parameter contracts require their own acceptance cases.
@@ -362,6 +363,10 @@ TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.12.0 \
 ----
 
 Surefire reports unit test results in `target/surefire-reports`; Failsafe reports database integration results in `target/failsafe-reports`.
+When selecting unit tests with `-Dtest=...`, the separate Surefire `archunit`
+execution still selects `DebeziumArchitectureTest`; it does not repeat the selected
+ordinary unit tests. Count distinct test cases when comparing older reports that
+ran selected classes in both executions.
 
 === Code coverage and regression gate
 
@@ -641,12 +646,242 @@ The acceptance scope is one DM8 build and driver, one single-instance primary/st
 
 == DDL robustness regression (2026-10-14)
 
-`DamengSqlLexerTest` and `DamengDdlStatementAnalyzerTest` exercise source positions, native comments, quote escaping, Q and national strings, complete-input classification, stored-program statement boundaries and unsupported compound scope.
-`DamengStreamingFilterBoundaryTest` checks that unknown clauses, mixed statements, missing SQL and compound schema/user operations leave the failing statement's offset and historical table unchanged, including recovery from persisted history.
+`DamengAntlrSqlLexerTest` and `DamengDdlStatementAnalyzerTest` exercise source positions, native comments, quote escaping, Q and national strings, complete-input classification, stored-program statement boundaries and unsupported compound scope.
+Lexer tests assert explicit token sequences, decoded literals, UTF-16 offsets and deeply nested comments without retaining a handwritten lexer for comparison.
+`DamengDdlStatementAnalyzerTest` also contains the ANTLR scope classifier checks,
+including FORCE VIEW, token sublists, complete-input rejection and historical
+planning on a copy. The formerly separate `DamengAntlrDdlClassificationTest`
+has been merged into this class, with duplicate cases removed.
+`DamengAntlrGrammarTest` exercises table-definition syntax and classifies known non-table objects by their kind and complete statement boundary. It does not validate the query, function or option vocabulary inside an ordinary view, index, sequence or synonym definition. Balanced parentheses, actual semicolons and subsequent DDL commands still delimit those definitions.
+The grammars use object-specific DDL headers, shared table-definition rules and opaque balanced tails for known non-table objects. CTAS and table expressions still use a bounded DM SQL subset because they contribute to the historical row schema; balanced SPL bodies are not a complete procedural-language validator.
+Production DDL tokenization, scope analysis and table-definition parsing use ANTLR. The historical model mapper reads generated contexts; the handwritten DDL token cursor and statement splitting have been removed.
+String and native `0x` binary-default tokenization also use ANTLR. `DamengSqlToken` holds source locations and literal decoding, and the handwritten DDL lexer has been deleted. Corpus slicing helpers exist only in test sources.
+`DamengAntlrDdlParserTest` covers historical changes from these trees, CTAS/LIKE at each source schema version, default spelling, complete-script atomicity and programs with internal semicolons. Single-record LogMiner analysis retains its stricter statement boundaries.
+The LogMiner DML parser and its native lexer remain in place; the DDL migration does not switch DML parsing to ANTLR.
+The connector follows the Oracle package layout: `antlr` contains the `DamengDdlParser` entry point, complete-input analyzer and ANTLR runtime adapters;
+`antlr.listener` contains the dispatcher, CREATE/ALTER/table-lifecycle listeners and column-definition mapper.
+The entry point coordinates analysis and atomic commit; generated listener callbacks apply each statement to a historical working copy.
+Unlike Oracle's shared `AntlrDdlParser` integration, Dameng retains analysis before capture filtering and planning without live-model mutation.
+With the default `schema.history.internal.skip.unparseable.ddl=false`, `DamengStreamingFilterBoundaryTest` checks that unknown clauses, mixed statements, missing SQL and compound schema/user operations leave the failing statement's offset and historical table unchanged, including recovery from persisted history.
+`DamengSkipUnparseableDdlTest` covers default/explicit-false failure and the opt-in `true` path for lexical, syntax and historical-model planning failures, continuation through later DML/DDL, all-skipped transactions, marker-offset reload/replay and history recovery. The reload uses the real offset loader within the same fixture, rather than starting a new task; the heartbeat case checks offsets offered to a mocked heartbeat dispatcher, not real heartbeat emission or Kafka acknowledgement/persistence. A skipped statement must leave the historical model unchanged and create no schema-history entry; these unit checks do not replace Kafka acknowledgement acceptance tests. WARN output includes the LSN, `DATA_OBJ#`, original SQL, cause and risk of stale schema interpretation.
+The option does not bypass missing SQL, invalid object IDs on recognized captured-table DDL, capture-scope/identity checks, archive errors or DML parsing failures. An unknown object's DDL may have no valid table object ID and still be skipped at the analysis stage. Recovery continues to use persisted `TableChanges`; it does not reconstruct a skipped structural change. Once an offset beyond the statement is durable, resetting the option to `false` does not replay that statement. Without a later emitted record or heartbeat, in-memory progress alone does not prove that Kafka Connect persisted the new offset.
 `DamengConnectorIT#shouldReplayCommentedDdlAndNonTableStatementsThenRecoverTheirHistoricalSchema` uses a disposable Testcontainers database and the asynchronous engine.
 It archives commented privileges, COMMENT ON, index and procedure definitions while the connector is stopped, then adds a column with a Q-quoted default, checks the streamed row and default schema, and restarts again to check recovered schema and data.
 Lexical-profile validation rejects unknown or untested backslash/nested-comment settings rather than assuming their defaults.
 This regression does not enable nonzero compatibility modes or general multi-table DDL.
+
+The focused unit suites retain every base SQL seed while using representative
+combinations for secondary dimensions. `DamengNonTableDdlStreamingTest` checks
+every safe and unsafe statement against baseline LogMiner metadata, then checks
+additional metadata variants on representative statements.
+`DamengStoredObjectDdlTest` checks every stored-program definition form and uses
+one representative definition for the remaining trailing-statement variants.
+These suites avoid repeating the full Cartesian product.
+
+The 2026-10-30 consolidation passed isolated builds of the before/after unit
+suites: 2,925 and 2,577 cases respectively, plus two architecture checks in each
+run, with no failures, errors or skips. Both runs use corrected assertions for
+seven parameter cases whose expected messages predated the ANTLR migration.
+JaCoCo recorded exactly the same covered
+lines, instructions and branches before and after: LINE 4,549/4,937 (92.14098%)
+and BRANCH 2,742/3,169 (86.52572%). This is the unit-only comparison; it does not
+meet the combined unit/database 95% line gate by itself. SHA-256 checks confirmed all 81 protected official-corpus, test,
+resource and tooling files remained unchanged.
+
+The accompanying database regression covered 17 distinct cases on disposable
+DM `8.1.3.162-20240621-rev232765` containers: 12 `DamengConnectionIT` cases,
+three historical DDL/restart cases in `DamengConnectorIT`, one
+`DamengNonTableDdlIT` case and `DamengAntlrStreamingIT`.
+The first run passed 16 cases and exposed an outdated assertion requiring the
+original time-zone offset. The corrected test compares the exact stored instant
+and all fractional digits, checks the standard JDBC getters, and retains the LOB
+assertions. Rerunning all 12 connection cases passed without failures, errors or
+skips. The final `verify` passed Checkstyle and the unchanged 95% line gate:
+LINE 4,729/4,937 (95.78692%), BRANCH 2,807/3,169 (88.57684%), CLASS 105/105.
+These coverage data combine only this round's unit, architecture and database
+runs; they do not establish full connector or official-corpus acceptance.
+Reports, logs and separate before/after unit coverage reports are retained in
+`target/test-consolidation-20261030` when running in this workspace.
+
+The official-corpus consolidation now physically removes redundant fragments.
+The retained fixture contains 14,583 records, down from 16,398 collected records;
+1,815 redundant records were deleted, and the Java corpus shrank from 33 source
+parts to 29. The removed records comprise 1,694 exact-text duplicates, 65
+whitespace-only variants and 56 ordinary-identifier variants; this run removed
+no distinct numeric-value variants. The JSONL review input and identity-based
+review metadata are pruned with the Java fixtures. Removed original text is not archived elsewhere in the
+source tree. The manifest records current counts and hashes separately from the
+historical crawl counts.
+
+`DamengOfficialSqlShape` retains token spelling, quoting, comments, token
+separation, type parameters and grammar branches. Simple table definitions and
+single-table simple SELECT statements normalize ordinary short ASCII table and
+column identifiers consistently, retaining repeated names and references. Safe
+small integers can share a representative while preserving equal-value
+relationships. Numeric boundaries, strings, system objects and calls, Unicode,
+quoted identifiers, complex expressions and unsupported syntax remain distinct.
+DML and complex queries use conservative lexical grouping; no new DML parser is
+introduced to infer semantic equivalence. Script steps and their order remain
+inside their enclosing sample.
+
+Fixed behavior tests, historical failures and source prerequisites retain their
+source identities. There are 92 additional equivalent fragments because these
+sources serve independent regression or setup contexts. These are intentional
+fixture dependencies, rather than a requirement to preserve all collected
+identities. Database reports may still select representatives across the
+remaining independently owned sources; `sourceVariants` records that mapping
+without assigning independent execution credit to omitted variants.
+
+The 2026-10-30 verification snapshot passed 2,670 unit cases, two architecture
+checks and 549 Python cases. Nine current-corpus database audits and 19 JDBC,
+historical-schema and streaming cases passed against disposable DM 8.1.3.162
+containers, with no failures, errors or skips. Formatting and Checkstyle passed.
+The unchanged 95% JaCoCo line gate passed: LINE 4,733/4,937 (95.86794%),
+BRANCH 2,814/3,169 (88.79773%). The final Checkstyle run used an isolated copy
+of the tested sources; later parallel production-source edits are excluded
+from these results. Source fingerprints, reports and audit provenance are in
+`target/official-physical-pruning-20261030` in this workspace. The complete
+40-container isolated-environment audit was not rerun. Audit completion is
+separate from feature support: a successful audit can record JDBC or connector
+rejection.
+
+The ANTLR historical-model migration was verified on 2026-10-29 with 1,178 selected unit cases, including 19 `DamengAntlrDdlParserTest` cases, and nine database cases on disposable DM 8.1.3.162 containers, with no failures, errors or skips.
+The database selection covers seven `DamengConnectorIT` cases for archived DDL, restart recovery, historical column order, rename/filter transitions, character semantics and precision changes, plus `DamengDatatypesIT#shouldCaptureAllIntervalQualifiersInStreamingCreatedTable` and `shouldReplayIntervalDdlAndValuesWrittenWhileStopped`.
+Formatting and Checkstyle for the migration files passed; an unrelated `DamengOfficialImportIT` formatting error blocked the earlier unfiltered Checkstyle invocation, so the final build restricted Checkstyle to the migration files.
+The LogMiner DML parser source checksums were unchanged. This focused run does not establish support for all DM SQL or replace full module acceptance.
+
+The subsequent handwritten-lexer removal passed a clean reactor build with 1,156 selected unit cases and three `DamengConnectorIT` cases on 2026-10-29.
+The selection includes 53 explicit lexer cases, 17 default-converter cases and 120 unchanged DML-parser cases, plus new-column recovery, commented archived DDL and consecutive historical DDL in a disposable database.
+The packaged connector contains `DamengAntlrSqlLexer` and `DamengSqlToken` and no classes from the removed handwritten lexer. DML-parser source checksums remained unchanged, and the test containers were cleaned up.
+
+The subsequent `antlr`/`antlr.listener` restructuring passed a clean reactor build on 2026-10-29 with the same 1,156 selected unit cases and three database cases, with no failures, errors or skips.
+Scoped Checkstyle audited 23 production and test files with no violations. The packaged connector has no old `ddl` package or root-package `DamengDdlParser`; DML-parser source checksums remained unchanged and the disposable containers were removed.
+
+The subsequent official-manual lexical fixes add a single binary-literal token, including odd-length hex values (DM supplies a zero high nibble), native function argument keywords and JSON CHECK predicates. New contextual keyword tokens remain usable as names. Fixed-length `BINARY(n)` defaults are right-padded with zero bytes, while VARBINARY/RAW retain their length. Binary defaults pass through the existing `binary.handling.mode` converter; compound defaults remain unevaluated.
+`DamengAdvancedLogDdlTest` recognizes the four advanced-log forms but rejects their implicit `$ALOG` table changes before filtering or history mutation. Bitmap join indexes with implicit `BMJ$_` tables likewise remain unsupported. Materialized views and multi-object schema/user operations remain outside the supported classification set.
+`DamengAntlrStreamingIT` uses a disposable database and the asynchronous engine to learn a newly created table from real redo, pass a CTE/analytic-function view definition, and check binary/JSON CRUD. It then replays rows on both sides of offline default, column and JSON-constraint changes, followed by a second history recovery. Assertions distinguish historical column layouts and binary schema defaults from the database's current metadata.
+These changes passed reactor `verify` on 2026-10-29 with 1,377 distinct selected unit cases and four database cases, without failures, errors or skips. The database selection includes `DamengAntlrStreamingIT` and three existing `DamengConnectorIT` cases for commented/non-table DDL recovery, consecutive historical definitions and new matching tables. Scoped Checkstyle audited 23 production/test files with no violations. The DML-parser implementation and test source checksums remained unchanged, and all disposable database containers were removed. This is a focused regression, not a full SQL or connector acceptance run.
+
+=== Non-table object DDL classification and recovery regression
+
+The scope classifier adds explicit `NO_TABLE_CHANGE` families for USER,
+DIRECTORY, CONTEXT, LIBRARY, DOMAIN, PROFILE, empty SCHEMA and standalone
+STAT statements. User/schema/domain drops accept default RESTRICT or explicit
+RESTRICT behavior. Their CASCADE forms remain rejected because they may change
+dependent objects. PROFILE CASCADE only changes user/profile associations and
+is handled separately. Successful archived RESTRICT drops do not require a
+query of today's dictionary to reconstruct their historical scope.
+
+SQL PACKAGE, CLASS and TYPE declarations/bodies and supported COMPILE or
+DROP forms use declaration headers and balanced definition
+boundaries. This is not a complete SPL validator or an implementation of
+Java CLASS. TYPE/CLASS drops require explicit RESTRICT until default deletion
+behavior is verified across the supported version matrix. TYPE/CLASS CASCADE, embedded CREATE SCHEMA objects, implicit
+auxiliary-table changes, and unsupported table-column types remain outside
+this change. Recognizing a DOMAIN, TYPE or CLASS declaration alone does not
+enable such types in captured columns. The existing table DDL, encryption,
+timezone and compatibility-mode behavior is unchanged.
+
+`DamengNonTableDdlIT` implements ten lifecycle representatives: USER
+creation/alteration/drop, DIRECTORY replacement/drop, empty SCHEMA creation
+and RESTRICT drop, three STAT table/index/hint forms, and standalone TYPE,
+DOMAIN and CONTEXT creation/drop, PACKAGE and SQL CLASS specifications
+and bodies, TYPE bodies, and PROFILE creation/alteration/drop. Every executed SQL is required to
+succeed in the database; a JDBC rejection is recorded explicitly and fails the
+regression instead of being counted as connector support.
+The strict lifecycle contains 33 statements per online/offline round and
+requires both rounds and both recoveries.
+
+The test snapshots a captured marker table, executes each unrelated DDL while
+streaming and checks a marker after every statement against the original
+record schema and key. It repeats the lifecycle while the task is stopped,
+restarts from acknowledged offsets and file schema history, checks every queued
+marker, then restarts again and verifies a before/after UPDATE. A separate
+LogMiner session must observe operation-5 redo in each statement's own LSN
+interval, classify it as `NO_TABLE_CHANGE`, produce no historical table plan,
+and read actual marker INSERT redo as a positive control.
+
+The default evidence file is `target/non-table-ddl-it.json`; override it with
+`-Ddameng.non.table.ddl.it.evidence=/absolute/path/result.json`. It contains
+database version, JDBC status/error, statement LSN intervals, actual redo,
+classification and CDC marker results. `validationPassed=true` is set only
+after every assertion and recovery check succeeds. The test definition and
+this documented scope are not a successful execution report.
+
+LIBRARY has official-grammar classification unit coverage and a separate
+`shouldRecordLibraryDefinitionAvailability` database-only diagnostic. A native
+8.1.3.162 execution rejected both the qualified `CREATE OR REPLACE LIBRARY` form
+and the minimal unqualified `CREATE LIBRARY`, each with syntax error `-2007`.
+The diagnostic executes the two forms with distinct names; a rejection of one
+form must not be reported as proof that every form is unavailable. Each accepted definition is
+dropped separately, without invoking its target library. Only the observed
+`-2007` syntax rejection is an expected rejected result; other JDBC errors
+fail the diagnostic. It writes `target/non-table-ddl-library-probe.json`,
+overridable with `-Ddameng.non.table.ddl.library.probe.evidence=/absolute/path/library.json`.
+The report always keeps `connectorSupportVerified=false`; an accepted database
+lifecycle still requires actual redo and CDC validation before it can join the
+strict lifecycle regression.
+
+The `shouldRejectDefaultTypeOrClassDropWhileReferencedByATable` regression
+covers TYPE columns, CLASS columns, nested TYPE members and subtype inheritance.
+Each case requires default DROP to fail while dependencies exist, verifies that
+the referencing column and row remain intact, then removes the dependencies and
+requires the identical DROP to succeed. The database-only reports default to
+`target/non-table-ddl-type-drop-{type_column,class_column,nested_type_member,subtype}.json`.
+These dependency checks complement the lifecycle regression, which verifies actual
+redo, live CDC and history recovery for default TYPE/CLASS and BODY deletion.
+CASCADE remains unsupported.
+
+The lifecycle also exercises full-text `CREATE/ALTER/DROP CONTEXT INDEX`,
+conditional creation/deletion, a TIMER trigger with an inert body, and procedures
+and functions with `OUT IN` parameters. All SQL is embedded in the Java tests;
+JSON evidence is output only and is never used as test input.
+
+Run the focused regression from the repository root after formatting:
+
+[source,shell]
+----
+env JAVA_HOME=/opt/java/jdk-25.0.4+7 ./mvnw -B -ntp \
+  -pl debezium-connector-dameng -am process-sources
+env JAVA_HOME=/opt/java/jdk-25.0.4+7 ./mvnw -B -ntp \
+  -pl debezium-connector-dameng -am verify -Pdameng-tests \
+  -Dit.test=DamengNonTableDdlIT -Dfailsafe.failIfNoSpecifiedTests=false \
+  -Ddameng.image=dameng:8.1.3.162-20240621-rev232765 \
+  -Ddameng.compatible.mode=0
+----
+
+This test requires Docker and administrator credentials in its disposable
+Testcontainers database. It does not accept `dameng.hostname`, so it cannot
+create/drop these fixtures in an existing user database. It never executes
+CASCADE cleanup and does not invoke the defined LIBRARY or CONTEXT.
+Use the specified 8.1.3.162 image; an image name containing 2026 is not a
+substitute for this version.
+
+On 2026-10-30 the final native-mode reactor verification completed with
+`BUILD SUCCESS` (`/tmp/dameng-nontable-final-20261030.log`). It passed 258 distinct
+selected unit cases and all three `DamengNonTableDdlIT` methods, without failures,
+errors or skips. One method verifies actual CDC and recovery; the other two are
+database-only diagnostics and are not additional connector-support evidence.
+All 66 lifecycle statements succeeded, produced 66 actual operation-5 DDL redo
+records classified as `NO_TABLE_CHANGE`, and were followed by 66 verified CDC
+markers. Offline replay, both history recoveries and the final before/after
+UPDATE also passed. A referenced type's default DROP was rejected with `-5015`
+and its referencing table remained readable; default TYPE/CLASS deletion was
+not added to the supported syntax. Both LIBRARY forms were rejected with `-2007`.
+
+The broader selected unit phase passed 1,913 distinct cases on the final parser,
+including the regression for newly introduced object keywords used as existing
+column/expression names. Its mode-2 reactor invocation
+(`/tmp/dameng-nontable-oracle-mode-20261030.log`) failed before the CDC lifecycle:
+the built-in compatibility registry only registers mode 0 and rejected mode 2
+at task startup. This is not a mode-2 DDL/CDC pass and does not change the
+compatibility support matrix. Formatting and scoped Checkstyle passed for the
+five related Java test files with zero violations.
+
+The evidence directory `target/non-table-ddl-evidence-20261030/` retains native
+and mode-2 results separately, including the mode-2 startup failure report.
+This focused selection does not replace full connector, all-SQL, datatype or
+deployment-matrix acceptance.
 
 The broad DDL regression completed with `BUILD SUCCESS` at 17:06:50 on 2026-10-14 (`/tmp/dameng-ddl-acceptance.log`).
 It passed 1,212 unit cases, 2 module architecture checks and 98 selected database cases without failures, errors or skips.
@@ -704,6 +939,10 @@ shared identifier normalization, rejected case-insensitive environments and live
 `DamengStreamingChangeEventSourceTest` also verifies that a parameter change detected after mining publishes no events and retains the replay position.
 `DamengDdlExtensionsTest` verifies historical CTAS/LIKE derivation, physical options, single-level partition definitions, inline comments,
 duplicate projection rejection and unchanged schema history on unsupported input.
+
+Temporary tables retain `DamengTableType.TEMPORARY` identity markers without row schemas.
+Parser, snapshot, incremental snapshot, capture-scope and schema-history tests cover skipping their data and schema events, preserving object identity across restart, and capturing an ordinary table recreated under the same name.
+`DamengExternalTableHistoryIT` also covers temporary-only snapshots, both ON COMMIT policies, initial/no_data baselines, streaming CREATE/ALTER/DROP and offline ordinary-table recreation.
 
 `DamengDdlExtensionsIT` now defaults to the locally imported `dameng:8.1.3.162-20240621-rev232765` image; the dated results below describe earlier runs:
 
@@ -1019,3 +1258,1053 @@ by the final focused regression, covers 4,060 of 4,181 connector lines (97.11%).
 `DamengRecovery` covers all 77 executable lines. The 95% Maven line-coverage gate
 and formatting/checkstyle validation passed. Production code was packaged into
 the module plugin archive; the running business image was not replaced.
+
+== Official SQL regression
+
+=== Official SQL candidate inventory
+
+`src/test/collect-official-sql-corpus.py` inventories the public Chinese DM
+manual under `https://eco.dameng.com/document/dm/zh-cn/`. It starts with the
+vendor sitemap and the six manual sections' navigation links, then follows
+links within each article until no new page remains. It retains every HTML
+`code` block, plus paragraphs, list items and table cells that contain a SQL
+keyword or a syntax-clause cue. Each JSONL record has the source URL, page
+title, section heading, page-local ordinal, candidate kind and original text.
+The manifest records every page URL, inaccessible address, candidate counts
+and the JSONL SHA-256. This preserves the source of optional clauses such as
+`CREATE TABLE ... ADD LOGIC LOG`, `CREATE TABLE ... AS SELECT ... ADD LOGIC LOG`,
+partitioned-table `ADD LOGIC LOG`, and `ALTER TABLE ... DROP LOGIC LOG`.
+
+The 2026-10-28 collection visited 535 discovered addresses. After redirects,
+420 distinct pages were readable and 108 addresses led to the vendor's 404
+page. The initial collection had 16,398 records: 2,010 grammar candidates, 4,646 SQL
+examples, 6,147 other code blocks and 3,595 relevant prose fragments. After
+consolidation, the versioned fixtures contain 14,583 records: 1,935 grammar,
+4,398 SQL, 5,536 other code and 2,714 prose fragments. A
+heuristic assigns the candidate kinds; a `grammar` or `sql` label is not proof
+that the fragment is valid standalone SQL. Forty-four readable pages contain
+no matching candidate. The recorded scope is the reachable Chinese DM manual,
+not other product manuals, image-only syntax, inaccessible pages, or future
+vendor updates.
+The manifest also counts `::=` grammar markers in each page's HTML and
+extracted code blocks. In the SQL definition, query-clause and data-modification
+chapters these counts match; the only two marker differences across all pages
+are prose explanations of the `::=` notation, which are retained as prose.
+
+Collect a fresh raw inventory for review without overwriting the curated fixtures:
+
+[source,shell]
+----
+python3 debezium-connector-dameng/src/test/collect-official-sql-corpus.py \
+  --output target/official-sql-collected.jsonl \
+  --manifest target/official-sql-collected-manifest.json
+----
+
+The versioned JSONL inventory is a review source for extending SQL regression
+coverage. `DamengTableLogicLogIT` passed with `RLOG_IGNORE_TABLE_SET=0`: it
+enabled table-level logical logging while the connector ran, captured a row,
+restarted, and captured another row (`/tmp/dameng-table-logic-it.log`).
+
+=== Official SQL redo audit across object and statement families
+
+`DamengOfficialSqlCorpusTest` reads all 14,583 retained records from the Java fixtures in
+`src/test/java/io/debezium/connector/dameng/corpus`. `DamengOfficialSqlCorpus`
+retains the original URL, title, ordinal, heading, kind and text of each selected
+fragment, in source order. The fragments are divided across Java source files to stay below
+JVM method and constant-pool limits. The test checks their count, identities and
+SHA-256 over the length-prefixed UTF-8 fields, then writes
+`target/official-sql-audit.json`. Database replay tests use these same Java
+fixtures. The JSONL and manifest in `src/test/resources/dameng` contain the same retained
+selection for the Python audit tools; Java regression tests do not
+load them.
+
+The 246 historical DDL failure observations and seven run summaries are fixed in
+`DamengOfficialDdlFailureSamples.java`. The 42 reviewed audit events and 142
+privileges are fixed in `DamengOfficialReviewedSamples.java`. Their original
+resource files remain audit archives. All `target/*.json` files are generated
+reports; no Java SQL regression test requires a report from an earlier run.
+It distinguishes grammar/prose, code that is not a standalone SQL statement,
+DDL preflight, DML, queries, procedure calls, transaction or session commands,
+and administrative commands. The 823 DDL preflight rejections and one lexical
+rejection in that audit are candidate findings only: a documentation block can
+contain several commands, placeholders, or an example for a different database
+product. They are not 824 verified connector crashes. In particular, a source
+`CALL` can generate row or DDL redo through the called routine; parsing the
+source `CALL` text cannot substitute for mining that redo.
+The audit also singles out 696 `SP_*`, `SF_*`, and `DBMS_*` callable candidates
+that were previously grouped with miscellaneous code snippets. This is a
+candidate count, not 696 successful executions: some calls change server
+configuration or require objects and privileges absent from the fixture.
+
+Two test-owned database suites isolate SQL statements from *all six*
+collected manual sections, including statements within mixed scripts and
+fragments labelled as grammar or prose. They replace the object name with a unique fixture name,
+execute the SQL with JDBC, then read the archived `V$LOGMNR_CONTENTS.SQL_REDO`
+and invoke the connector's DDL analyzer and schema planner on the actual redo.
+The table suite covers `CREATE`, `ALTER`, `DROP`, and `TRUNCATE TABLE`. The other
+suite covers `CREATE`, `ALTER`, and `DROP` for indexes, views, users, schemas,
+roles, directories, sequences, synonyms, domains, functions, procedures,
+triggers, and types where a statement and disposable fixture can be isolated.
+It excludes database, tablespace, and system reconfiguration commands from
+automatic execution. Such commands can make a shared test container unusable;
+they remain indexed candidates for a separate one-command-per-container test.
+
+On `dameng:8.1.3.162-20240621-rev232765` with `COMPATIBLE_MODE=0`, the table
+suite selected 918 statements: JDBC accepted 678 and rejected 240. All 678
+accepted statements had matching archived DDL; 573 passed connector analysis
+and planning, while 105 were rejected. The non-table suite selected 414
+statements: JDBC accepted 189, rejected 195, and 30 failed fixture setup.
+All 189 accepted statements had matching archived DDL; 83 passed connector
+analysis and planning, while 106 were rejected in the 2026-10-29 rerun. Thus
+211 database-accepted fixture statements in these two suites were rejected by
+connector DDL processing. These are discovery results, not 211 independent
+production defects: source object names are substituted, and some ALTER
+fixtures do not reproduce the manual's original table definition. The findings list, with
+official URL, original and isolated SQL, actual `SQL_REDO`, and exception, is
+`src/test/resources/dameng/official-sql-verified-failures.json`. The raw
+per-case results are regenerated under `target/official-table-ddl-it.json`
+and `target/official-non-table-ddl-it.json`.
+
+The 106 non-table failures include user, routine, type, schema, context
+index, domain, and aggregate-function statements. These are important
+for streaming because `DamengStreamingChangeEventSource` analyzes every
+LogMiner operation-code-5 row before checking the configured table filter.
+For example, an ordinary `CREATE USER` accepted by the database and present in
+archived redo can stop the current task even if the new user owns no captured
+table. `DROP USER` and `DROP SCHEMA ... CASCADE` can also affect captured tables,
+so their handling requires more than simply ignoring unknown object types.
+
+The 105 table failures include valid examples of `NOT CLUSTER PRIMARY KEY`,
+`AUTO_INCREMENT`, advanced logging, partition and distributed clauses, `ROWID`,
+and a full-width semicolon accepted by this database. Some are deliberate
+capture limits, such as virtual columns; others need parser work. Three `ALTER`
+rejections depend on the synthetic baseline table's columns rather than prove
+a defect in the original manual's object context. Review the individual redo
+and error before converting any discovery result into a production bug report.
+Both suites now read every operation-code-5 row in each statement's measured
+interval and apply successful schema plans in order. They save an array of redo
+records, row-level parser outcomes, and whether the schema state remains
+reliable after a failure. `allRedoVerified=true` means every DDL was audited;
+it does not mean the parser accepted it. A unique marker INSERT must be found
+by `DATA_OBJ#`, since names can be absent without an online dictionary. The
+report starts with `validationPassed=false` and is marked true only after the
+audit assertions pass. Numeric rejection baselines have been removed: an audit
+can finish successfully while recording unsupported DDL. Current samples each
+produced one DDL record, so multiple-record state evolution still lacks a real
+database example in these two suites.
+
+The candidate inventory covers the remaining manual text, but those candidates have **not**
+all been executed against the database. Many require dependent objects, an
+alternate deployment mode, a different `COMPATIBLE_MODE`, or isolated
+administrative environments. The checked-in inventory contains 246 current
+observations from the two DDL suites, the USER/DIRECTORY/STAT representatives
+and the REVOKE CASCADE, CLASS/TYPE and datatype syntax variants.
+Older isolated and datatype findings are preserved separately under
+`historicalFindings`; the old ROLE rejection is not a current finding. Consult
+the regenerated reports for current parser results.
+
+`DamengOfficialStatementFamiliesIT` adds a separate real-redo audit for SQL
+families that are not limited to tables: query and `EXPLAIN`, session `SET`,
+role creation and removal, object privileges, comments, stored procedure
+creation and invocation, an anonymous block, table locking, and transaction control. It
+records the JDBC result, LSN range, archived redo operation codes and any DDL
+analysis failure in `target/official-statement-families-it.json`. Source `CALL`
+and `BEGIN` produced INSERT redo rather than a redo record containing the
+original call text. `CREATE ROLE` and `DROP ROLE` each produced operation-code-5
+redo; both now pass the DDL analyzer as changes outside captured table structure.
+The suite was rerun after adding ROLE handling. The
+transaction probe also observed operation code 36 for rollback to savepoint;
+its behavior needs a separate end-to-end capture assertion before claiming
+savepoint rollback support.
+
+The inventory is still wider than the executed cases. In particular, backup,
+restore, database and tablespace reconfiguration, auditing, jobs, and commands
+requiring a different database role or deployment mode have not been executed
+by this suite. Their redo behavior and connector outcome remain unknown. Each
+new family should be run on a disposable database and classified from actual
+redo, including the absence of data or DDL redo where appropriate.
+
+`DamengOfficialIsolatedSqlIT` runs selected source statements in a fresh
+test-owned DM container *per statement*. It records the original statement,
+fixture, executed SQL, JDBC result, archived redo, and Connector DDL analysis
+in `target/official-isolated-sql-it.json`. The ten cases cover table and
+column `COMMENT`, `CREATE ROLE`, `GRANT SELECT`, `REVOKE CREATE TABLE`,
+`CREATE LINK`, `CREATE OPERATOR`, a DPC partition group, PostgreSQL
+`CREATE EXTENSION`, and MySQL `SET GLOBAL binlog_format`. DM 8.1.3.162
+accepted seven cases in the historical run. The Connector accepted the two `COMMENT` statements,
+`GRANT`, and `REVOKE`, but rejected the archived `CREATE ROLE`, `CREATE LINK`,
+and `CREATE OPERATOR` DDL as unsupported object scopes. That older ROLE outcome
+is superseded by the current dedicated representative tests, while this raw
+historical run is retained. The partition group
+requires a DPC SP node; this single-node test database rejected it. The
+database also rejected `CREATE EXTENSION` and `SET GLOBAL binlog_format`
+with syntax errors. These three database rejections provide no Connector
+result. The evidence file is marked complete only after all ten isolated
+containers finish.
+Each isolated result replaces only an exact matching pending statement in the
+coverage ledger. A different pending statement in the same manual fragment
+remains unfinished until it receives its own result.
+The table and non-table DDL suites also retain each source statement before
+fixture name substitution. The ledger compares every original statement with
+its execution evidence; running only a selected table DDL cannot complete a
+source fragment containing additional setup or procedure calls. Object-name or
+fixture substitutions are marked `representativeOnly`, so they can prove one
+operation-family behavior without completing the original source example.
+Database-rejected DDL is never used to clear a pending successful-CDC requirement.
+
+=== Per-fragment official SQL coverage ledger
+
+Keep raw test reports outside `target` before running another Maven clean.
+If only an earlier normalized coverage ledger survives, the summarizer accepts
+`--historical-ledger /absolute/path/to/official-sql-coverage.jsonl`.
+It verifies all original source identities and texts against the committed
+corpus, restores observations with `historicalOnly=true`, preserves their old
+validation values separately, and excludes them from current validation and
+strict support counts. Original attempt indices and duplicate normalized
+observations are retained separately; identical historical records do not
+establish multiple actual executions. This does not reconstruct a raw test report or execute
+any SQL. Genuine frozen raw reports may be restored independently; their cases
+replace matching historical observations without counting the same case twice.
+An observation retained only in the historical ledger cannot supply a current
+accepted representative, JDBC validation count or Connector failure count.
+Its original SQL, errors, redo observations and attempt index remain available
+as historical evidence. An independently rerun raw report supplies new evidence
+without making an unexecuted optional clause or enclosing host program pass.
+For this recovery path, generate the non-SQL classification directly with
+`classify-official-non-sql.py --corpus
+debezium-connector-dameng/src/test/resources/dameng/official-sql-corpus.jsonl`.
+Historical counts described below refer to their original runs, not a rerun
+against later production source changes.
+
+The collected records are *documentation fragments*, rather than independent SQL
+statements. The current retained selection contains 14,583 fragments. They include prose, grammar templates, program source, result
+tables, and mixed SQL scripts. `DamengOfficialSqlCorpusTest` assigns each
+retained URL and ordinal a review status without silently dropping any selected record.
+`DamengOfficialQueryCorpusIT` now attempts top-level `SELECT`, `WITH`, or
+`EXPLAIN` blocks, terminated `SQL>` queries, quoted queries in host-language
+examples, and semicolon-terminated queries embedded in Chinese explanations
+across all candidate kinds in the disposable DM 8.1.3.162 database.
+It records each extracted statement, JDBC acceptance or rejection, LSN range,
+and any data or DDL redo in `target/official-query-corpus-it.json`.
+`DamengOfficialDirectSqlCorpusIT` inventories top-level `INSERT`, `UPDATE`,
+`DELETE`, `MERGE`, `SET`, `GRANT`, `REVOKE`, `COMMENT`, `CREATE`, `ALTER`, `DROP`,
+`TRUNCATE`, `RENAME`, transaction control, routine calls, auditing, backup,
+restore, purge, and analyze blocks across all inventory kinds. It attempts DML,
+session `SET`, and safe
+transaction commands in separate JDBC sessions, rolling back DML. DDL,
+privilege, metadata, system catalog, storage file, global setting, routine,
+and administrative mutations are marked for isolated execution because JDBC
+rollback does not reliably undo them. Procedure, function, trigger, package,
+type, and anonymous block definitions remain pending extraction; their
+internal semicolons are not top-level statement separators. Its evidence is
+`target/official-direct-sql-corpus-it.json`.
+
+The validated 2026-10-29 direct-SQL run recorded 4,477 segment outcomes from
+3,026 source fragments. Only 1,753 were JDBC executions: 208 accepted and
+1,545 rejected. Another 2,587 require isolation, 111 require extraction review,
+and 26 were extracted non-SQL segments. The 203 SQL literals recovered from
+host-language strings retain their original source ranges and are marked as
+representatives; executing a literal does not validate the enclosing program.
+The measured ranges contained only the positive-control transaction and its
+INSERT, verified by DATA_OBJ#. Empty or rolled-back DML and missing-fixture
+rejections do not establish end-to-end CDC coverage.
+
+The 2026-10-28 query rerun processed 2,637 blocks and attempted 2,809
+statements: 1,940 were accepted, 837 were rejected, and 37 were explicitly
+classified as non-SQL privilege or clause text. It includes queries
+following documentation comments or a `SQL>` prompt, quoted host-language
+queries, and clearly terminated examples in Chinese prose. A disposable test
+database contains minimal example schemas and tables for `PRODUCTION`,
+`PURCHASING`, `PERSON`, `RESOURCES`, `SALES`, `DMHR`, and generic `T1`/`TEST`
+queries. These fixtures distinguish missing objects from syntax errors; they
+are not the vendor's full example data. Accepted queries produced no data or
+DDL redo in their measured ranges. Database rejection remains unfinished work.
+
+`DamengOfficialFunctionSyntaxIT` instantiates 128 exact zero-, one-, or
+two-argument templates from the official function chapter with explicit
+literal arguments. On the 2024 image, 121 were accepted and seven rejected;
+their original templates, executed queries, JDBC errors, LSN ranges, and
+archived redo are in `target/official-function-syntax-it.json`. None of the
+accepted function queries produced DML or DDL redo. Rejected templates remain
+unfinished; the test does not claim that every optional argument or overload
+has been exercised. The 2026-10-29 rerun verifies the marker INSERT by DATA_OBJ#
+before accepting an empty target interval and records validated templates as
+representatives rather than whole-source execution.
+
+`DamengOfficialDatatypeSyntaxIT` instantiates 51 type declarations as isolated
+`CREATE TABLE` statements in a disposable database. Fifty were accepted by
+the 2024 image; `JSON` was rejected. Of the 50 accepted statements, the
+Connector parser accepted 47 archived DDL records and rejected `ROWID`,
+`LONG`, and `BFILE` column types. The evidence is in
+`target/official-datatype-syntax-it.json`; these three older findings remain in
+the inventory's `historicalFindings` until retested. Twenty-two templates have alternative
+spellings or optional branches that remain pending despite one tested form.
+
+`DamengOfficialReadOnlyRoutineIT` executes ten exact standalone catalog
+inspection calls. Seven were accepted without DML or DDL redo; three were
+rejected because the installed database lacks the routine or requires a DPC
+environment. The original calls, JDBC errors, LSN ranges and redo audit are
+in `target/official-read-only-routine-it.json`. The 2026-10-29 rerun verifies a
+separate marker INSERT and records `validationPassed=true` only after the
+archived-redo assertions pass.
+
+The direct SQL rerun processed 3,026 blocks and classified 4,477 extracted
+statements, including 203 quoted DML attempts in program examples. The
+database accepted 208 and rejected 1,545; 2,587 require isolated execution,
+111 require extraction, and 26 are non-SQL descriptions. All quoted DML
+attempts were rejected by the current fixture or contained host-language bind
+variables. A rejection does not demonstrate the connector's DML behavior.
+The selection now includes blocks with leading documentation comments or
+`SQL>` prompts and leaves 1,310 pending segments for review.
+None of the accepted statements produced data or DDL redo, and none was DML,
+so this run does not establish any new DML connector behavior.
+
+The isolated replay was then extended to 41 exact statements. It uses one
+fresh DM 8.1.3.162 container for each statement, including ten original
+non-table DDL samples and 31 exact `SP_CREATE_SYSTEM_PACKAGES` installation
+calls. Thirty-two statements were accepted by JDBC and nine were rejected by
+the database. Seven accepted statements emitted operation-code-5 DDL; the
+remaining accepted package installation calls emitted no redo. The complete
+per-statement evidence is `target/official-isolated-sql-it.json`; a database
+rejection is retained as an explicit result and remains unfinished for the
+strict coverage gate.
+
+The query replay now binds SQL `NULL` through JDBC `PreparedStatement` for
+positional `?` and named `:name` parameters, recording each bind count and
+value in the per-statement evidence. The fixture adds `LOGINID` to
+`RESOURCES.EMPLOYEE` and `CREDIT` to `PURCHASING.VENDOR` for the corresponding
+official queries. The latest 8.1.3.162 replay completed all 2,637 query blocks;
+23 extracted queries had bound parameters. Database acceptance is recorded
+separately from the original SQL and does not imply that an example with
+remaining text segments is fully resolved. RMAN commands such as
+`RECOVER ... UPDATE DB_MAGIC` run outside JDBC and can modify database files or
+identity. Tool-channel classification is not an absence-of-effects conclusion;
+these commands retain isolated execution requirements.
+
+These runs and the coverage ledger are reproducible with:
+
+[source,shell]
+----
+env JAVA_HOME=/opt/java/jdk-25.0.4+7 ./mvnw -B -ntp \
+  -pl debezium-connector-dameng -am verify -Pdameng-all-tests \
+  -Dsurefire.failIfNoSpecifiedTests=false -Dfailsafe.failIfNoSpecifiedTests=false \
+  '-Dtest=DamengOfficialSqlCorpusTest' \
+  '-Dit.test=DamengOfficialTableDdlIT,DamengOfficialNonTableDdlIT,DamengOfficialQueryCorpusIT,DamengOfficialFunctionSyntaxIT,DamengOfficialDatatypeSyntaxIT,DamengOfficialReadOnlyRoutineIT,DamengOfficialDirectSqlCorpusIT,DamengOfficialStatementFamiliesIT,DamengOfficialIsolatedSqlIT' \
+  -Drevapi.skip=true
+python3 debezium-connector-dameng/src/test/classify-official-non-sql.py
+python3 -m unittest debezium-connector-dameng/src/test/test_classify_official_non_sql.py \
+  debezium-connector-dameng/src/test/test_summarize_official_sql_coverage.py \
+  debezium-connector-dameng/src/test/test_group_official_sql_semantics.py
+python3 debezium-connector-dameng/src/test/summarize-official-sql-coverage.py
+python3 debezium-connector-dameng/src/test/group-official-sql-semantics.py
+python3 debezium-connector-dameng/src/test/summarize-official-sql-coverage.py \
+  --require-all-fragments-resolved
+----
+
+The summarizer joins table, non-table, query, function and datatype syntax, catalog calls, isolated SQL, direct SQL, and mapped statement
+family evidence by original URL and ordinal, then writes one row per fragment to
+`target/official-sql-coverage.jsonl`, a review-friendly CSV to
+`target/official-sql-coverage.csv`, one row per extracted or classified attempt
+to `target/official-sql-attempts.csv`, and counts to
+`target/official-sql-coverage-summary.json`.
+All retained corpus identities are indexed; removed duplicates are no longer required by the ledger. The current meaning totals,
+parent operation families and outstanding review categories are generated in
+`target/official-sql-meanings-summary.json`; execution and strict support counts
+are generated independently in `target/official-sql-coverage-summary.json`.
+These totals can decrease when an incorrect classification or overly broad
+completion claim is corrected. The counts are intentionally not duplicated as
+a fixed baseline here: semantic grouping, actual JDBC outcomes and supported
+CDC behavior answer different questions.
+The previous 7,880-complete count is retired. It included routine signatures
+classified as non-SQL, partial scripts, fixture substitutions, and no-redo
+observations without a mined positive control.
+
+The current outputs deliberately separate three questions:
+
+* `sourceMeaning.complete` means all text has a defensible meaning or explicit
+  non-SQL classification. A grammar production can meet this condition while
+  still requiring instantiation and database execution.
+* `fullSourceResultRecorded` means every original executable statement has an
+  actual result, including rejection. It does not mean CDC is supported.
+* `reviewComplete` is the conservative supported-result gate. It requires full
+  source coverage, matching original source fingerprints, no unvalidated
+  rewriting, and the relevant database/redo/Connector evidence. A source
+  rejection, unsupported DDL, empty-table DML, unresolved template, or missing
+  positive control leaves this false. Unknown routine effects, physical table
+  restoration and materialized-view refresh need dedicated data/CDC assertions;
+  their absence of mined DML alone cannot satisfy this gate.
+
+`validatedAttemptStatusCounts` separates executed JDBC outcomes from extraction,
+isolation and setup results within validated reports. Use
+`validatedJdbcExecutedAttempts` when counting statements actually submitted to
+JDBC; `validatedRunAttempts` also includes deferred and non-SQL segments.
+External tool runs have separate `utility-accepted`/`utility-rejected` process
+outcomes and `validatedUtilityExecutedAttempts`. Their command argument arrays
+and execution channel are preserved without inventing an `executedSql` or
+counting a DEXP/DMFLDR process as a JDBC submission. A successful utility
+representative still does not complete every option of the original manual.
+
+Every original statement occurrence is compared with its executed source text.
+Repeated runs cannot substitute for two occurrences within the same script.
+Literal values and quoted identifier case are preserved when comparing SQL;
+backslash-containing SQL stays strict until execution-specific lexical settings
+are available. A stronger validated repeat may supersede a weaker success for
+identical SQL on the same database version, but cannot erase an earlier failure
+or a result from a different fixture. Reports retain the evidence filename,
+database version, executing account and relevant parameter context,
+original-source verification, rewrite status, and validation flags. A passing
+execution under ENABLE_DDL_ANY_PRIV=1 does not supersede a refusal under its
+default value 0. Legacy evidence without these guarantees remains visible and unverified.
+
+The non-SQL classifier accepts confirmed complete host/configuration/XML/OS artifacts,
+strict output-only execution plans and error messages, and explanatory text
+only when its rules exclude executable SQL. The permission appendix names are
+retained as GRANT/REVOKE operands requiring instantiation, not non-SQL completion. SQL signatures,
+scalar/type grammar, and bare SQL words stay in the SQL inventory. A separate
+`classify-official-client-commands.py` recognizes the documented DISQL command
+arguments, including all 45 SET properties. Only complete client-only forms
+can resolve a fragment as non-SQL. AUTOCOMMIT, EXIT, HOST and script execution
+retain transaction or indirect SQL effects for review.
+Exact reviewed tool actions override generic shell/configuration exclusions.
+ASM disk/file creation, CP/MV, IMPORT/EXPORT, IOTEST, password changes and login
+retain their execution channel, storage/session effect and isolated-fixture
+requirements. An operation is not harmless merely because it is not JDBC SQL.
+DMRMAN BACKUP, RESTORE, RECOVER, MERGE, REPAIR, REMOVE and script inputs retain
+their distinct effects. CONFIGURE display forms are separated from configuration
+changes. Unreviewed database utility invocations, including import, bulk load,
+database initialization and DISQL script execution, remain pending instead of
+being completed by a generic utility or shell exclusion.
+Whole-source SHA checks prevent an added SQL statement from inheriting an older
+non-SQL classification. Returned SQL text and error echoes retain their source
+role instead of becoming additional submitted SQL inputs.
+DMRMAN SHOW transcripts retain one actual metadata-read input, its separate
+echo and copied output; understanding that transcript does not prove a current
+tool execution. DISQL VERIFY `original/new` lines and audit-record SQL_TEXT
+columns likewise retain output roles. Package definitions, anonymous blocks
+and their nested statements stay together. A collection's DELETE method is
+not a table DELETE. Known cursor SQL and bindings can be extracted without
+pretending that omitted host code, external scripts, debugger targets or
+scheduled routine bodies are known.
+Local JSON DOM PUT/REMOVE, array-element deletion, native hash-update functions
+and client wallet changes retain their actual target instead of becoming table
+DML. Conversely, DBMS_METADATA examples can INSERT metadata strings into user
+tables and COMMIT, CREATE_WRAPPED creates the wrapped object, and queue dequeue
+can consume messages. Scheduler ENABLE can start a known procedure's INSERT and
+COMMIT asynchronously; an unknown action remains pending. Prepared-but-unexecuted
+SQL, bound strings, copied plan nodes and DDL returned by TABLEDEF are separate
+roles. An execution-plan transcript can still contain subsequent DROP INDEX
+cleanup inputs. Foreign MySQL/Oracle configuration examples retain their dialect
+and do not establish Dameng compatibility-mode support.
+Mixed client fragments expose SQL candidates only at unambiguous statement
+boundaries; the classifier report retains the current candidate and fragment counts. Each candidate retains start/end offsets and
+`executionVerified=false`; output, client commands and unresolved source remain
+separate segments. Extraction does not complete or execute those examples.
+
+The optional `--require-all-fragments-resolved` gate still fails while source
+records are unresolved. Successful audit execution is not evidence that all
+vendor SQL or all Kafka event values are supported. The reports distinguish
+JDBC syntax acceptance, actual LogMiner redo and DDL schema planning;
+end-to-end DML assertions remain necessary for data correctness.
+An interrupted connection records an uncertain outcome, and an unmet prerequisite
+records that no SQL was submitted. Neither becomes a syntax rejection. Production
+archive-loading failures remain distinct from parser failures; a later raw SQL
+LogMiner diagnostic cannot satisfy a supported-family or source-completion gate.
+An exception handler may commit successful array-DML rows before raising.
+The ledger retains the JDBC rejection alongside independent committed rows
+and end-to-end CDC assertions; it does not equate an error with rollback.
+Error-code and source-spelling adaptations retain their own rewrite reason
+and original SQL. A test client's explicit commit is recorded separately from
+the anonymous block when the source itself contains no COMMIT.
+
+=== Semantic grouping for representative CDC tests
+
+`review-official-sql-meanings.py` reads each original fragment, retaining every
+classification's original text and offsets, source form, confidence and reason.
+It identifies operation/object families, grammar productions, routine signatures
+and embedded SQL. Each entry also records the specific remaining work, such as
+host extraction, compound-program boundaries, grammar instantiation or missing
+object context. No semantic classification creates a database-test result.
+
+`group-official-sql-semantics.py` joins those meanings with the execution ledger.
+`target/official-sql-semantic-groups.jsonl` indexes the current retained identities;
+`target/official-sql-semantic-summary.json` includes the parent operation families
+and finer syntax groups. The hierarchy groups queries under SELECT, table DDL
+under CREATE TABLE/ALTER TABLE, and object DDL under CREATE ROLE, CREATE USER,
+ALTER SYSTEM and similar concrete families. Clauses and types inherit their
+enclosing operation without being discarded as non-SQL. CALL is a parent
+category; each concrete routine and overload retains its own identity and
+requires its own effect assessment. Unknown call-shaped output fields do not
+become confirmed database calls.
+
+Ordinary SELECT and read-only WITH SELECT can share a CDC no-row-redo
+representative. SELECT NEXTVAL, FOR UPDATE, SELECT INTO and queries calling
+routines remain separate. WITH UPDATE and WITH DELETE are DML. A family
+representative proves only its sampled behavior; CREATE TABLE success cannot
+prove CTAS, LIKE, partitioning or every optional clause. The family matrix CSV
+and per-fragment pending JSONL expose missing variants and their next actions.
+The family CSV also separates validated JDBC acceptance, database rejection and
+Connector rejection counts, with both passing and failing sample SQL. A passing
+REVOKE representative does not erase a failing REVOKE CASCADE variant. Source
+meaning and execution grouping share one recognizer so JAVA CLASS, PARTITION
+GROUP, MATERIALIZED VIEW LOG and quoted literals cannot silently use different
+object identities in the two reports. Queries preserve all routine callees and
+additional locking, sequence and SELECT INTO effects; a mixed query cannot
+borrow a call-free representative.
+
+Source context also distinguishes string `INSERT(...)` functions from row
+INSERT, analytic `PARTITION BY` from table partition DDL, and MERGE PARTITIONS
+from MERGE INTO DML. A trigger's event verbs are separate from its body SQL,
+which runs when the trigger fires. A package initializer can execute on first
+access; a declared cursor does not execute until opened. Known same-page
+procedure bodies retain their own fingerprinted context instead of being
+treated as opaque calls or independent top-level DML.
+
+Driver operations retain their execution role: statement inspection and
+preparation do not execute SQL, and a SQL-looking argument passed to an already
+prepared statement may be a bound value. Unknown callbacks, ORM-generated SQL,
+external START scripts and import dump contents remain explicit pending work.
+Original foreign-dialect examples, malformed terminators and contradictory
+copied results remain visible alongside any separate adaptations.
+
+The final source-context review leaves no unread meaning-review entries.
+Entries that remain semantically partial have exact-source reviews with an
+explicit reason, such as absent external scripts, unresolved generated SQL,
+unknown callbacks, omitted code or defects in the published example. These
+are reviewed-but-partial sources, not successful executions. A missing fixture
+with known operation families remains distinguishable from an unknown SQL
+producer. Full source URLs take precedence over page basenames: for example,
+`app-dev/index.html` and `sql-dev/index.html` retain separate source identities
+and cannot borrow each other's review.
+
+The dedicated `DamengOfficialReadOnlyQueryRepresentativeIT`,
+`DamengOfficialSemanticRepresentativesIT` and
+`DamengOfficialSessionRepresentativesIT` were validated on 8.1.3.162. Together
+these execute 59 statements covering a pure SELECT, roles, grants, sequences,
+users, directories, session settings, isolation/access modes, table locking,
+transaction/savepoint controls, ALTER SESSION, STAT and EXPLAIN. They verify a unique marker INSERT
+by DATA_OBJ# after the measured statements before reporting no row/DDL redo.
+All 59 statements were accepted by JDBC. Four USER/DIRECTORY DDL records and
+three STAT records were rejected by the Connector and remain explicit findings.
+The three STAT forms cover table-column sampling, index sampling and a leading
+parallel hint. All produced operation-code-5 redo, demonstrating why statistics
+commands cannot be assumed to have no effect on LogMiner processing. Ten
+ALTER SESSION examples produced no redo. SELECT NEXTVAL produced
+operation code 37 rather than row or DDL redo. Session transaction commands
+also verify their actual commit/rollback visibility. These audits do not claim
+end-to-end savepoint CDC support.
+
+This 59-statement set was rerun on 2026-10-29 with
+`dameng:8.1.3.162-20240621-rev232765`, using a frozen source snapshot with
+production fingerprint `bb34fbbbebb0e674f7836e320d18de7fd989cdc41ff6101e8bdf24493a5e578a`.
+All three audit tests completed with no failures, errors or skips, and reproduced
+the seven parser rejections described above. Their successful diagnostic
+assertions establish that the JDBC and redo observations were recorded; they
+do not establish support for those seven statements. The raw reports are
+`official-read-only-query-representative-it.json`,
+`official-semantic-representatives-it.json` and
+`official-session-representatives-it.json`. Their SHA-256 values, source hashes
+and subsequent shared-worktree drift are retained in
+`target/official-representative-isolation.json`. Test-owned database containers
+were stopped and the running user environment was not modified.
+
+Four further audit tests were rerun against the same frozen production
+snapshot. Table DDL produced 918 isolated samples: JDBC accepted 678 and
+rejected 240; the accepted samples included 572 parser acceptances and 106
+parser rejections. Non-table DDL produced 414 samples: 189 accepted, 195
+rejected by JDBC and 30 rejected during fixture setup; 78 of the accepted
+samples had parser rejections. Ten catalog-inspection calls produced seven
+JDBC acceptances and three rejections. Eighteen statement-family samples were
+accepted and their redo assertions passed. The latter report lacks explicit
+validation and positive-control labels, so its actual execution remains
+separate from the validated-evidence count.
+
+All four audit tests completed with no failures, errors or skips. Together
+with the 59-statement set, these runs contain 191 parser-rejected sample
+observations, including repeated official examples and 15 explicit capture
+safety refusals for unsupported table/column kinds. This is not a count of
+191 independent bugs. The full original and executed SQL, source URL and
+ordinal, actual redo, error text and tested source fingerprint are retained in
+`target/official-current-parser-rejections.json` and its CSV companion.
+The build provenance is in `target/official-family-isolation.json`.
+Raw reports remain unchanged; independent review sidecars retain effective
+SQL-rewrite and representative flags, even where a raw report's
+`representativeOnly` flag was too optimistic. Successful diagnostic tests do
+not establish schema-history recovery or end-to-end Kafka event correctness.
+
+`DamengOfficialQueryCorpusIT` additionally replays 2,637 candidate blocks with
+2,814 extracted attempts: 1,972 accepted, 805 rejected by JDBC, and 37 marked as
+non-executable extracted segments. The run verifies its marker INSERT by
+DATA_OBJ# and records all observed operation codes within each statement's LSN
+range. Rejected queries and extracted non-SQL segments do not complete their
+surrounding source fragment.
+
+`DamengOfficialPrivilegesIT` instantiates the 142 distinct predefined-role
+permission names represented in the retained corpus, with source mappings for
+any separately required regression contexts.
+Those names are system privileges such as CREATE TABLE or INSERT TABLE, not
+standalone DDL or object privileges to concatenate blindly. Each selected name
+has separate GRANT and REVOKE results. It also covers table/column, view,
+procedure/function/package, sequence, domain, synonym, directory, schema and
+role authorization representatives. In the historical pre-consolidation run,
+of 503 executed SQL statements, 378 were
+accepted and emitted DDL redo; 125 were rejected by the database. All 324
+applicable DBA_SYS_PRIVS state assertions passed. The Connector accepted 365
+DDL records and rejected 13 REVOKE statements ending in CASCADE. A database privilege
+or syntax rejection is retained as such and is not counted as a Connector bug.
+
+`DamengOfficialPrivilegeAuthorityIT` separately retries the 41 distinct appendix
+privileges whose GRANT and REVOKE statements require `ENABLE_DDL_ANY_PRIV=1` according to
+the official authorization documentation. It changes that parameter only in
+its disposable database, records the SYSDBA roles and execution context, and
+restores the original value. In the historical pre-consolidation run, all 90
+statements were accepted by the database and the Connector; all 90 DBA_SYS_PRIVS state checks passed. These results
+explain the original default-0 rejections without replacing them: different
+parameter or user contexts remain separate evidence in the coverage ledger.
+
+`DamengOfficialObjectPrivilegesIT` adds CLASS, TYPE and LIBRARY object fixtures.
+The 18 CLASS/TYPE definition, compilation, removal and authorization statements
+were accepted by the database. Eight DBA_TAB_PRIVS checks and ten real-user
+method calls verify authorization before GRANT, after GRANT and after REVOKE.
+The Connector rejected ten CLASS/TYPE DDL records and two REVOKE CASCADE records.
+All seven LIBRARY statements were rejected by this database build; the four
+authorization attempts explicitly record that the object fixture is unavailable,
+so these rejections do not establish Connector support for LIBRARY.
+
+`DamengOfficialDatatypeSyntaxIT` now records source declarations separately from
+the instantiated CREATE TABLE statements, preserving optional branches as
+pending. Of 51 statements, 50 were accepted by the database and their ID/C column
+metadata and object identities were verified. JSON was rejected on this build.
+The Connector rejected ROWID, LONG and BFILE declarations. The report records
+all operation codes and validates a marker INSERT by DATA_OBJ# before setting
+`validationPassed=true`. This syntax audit does not test stored value fidelity.
+
+`DamengOfficialBackupRestoreIT` executes 33 online SQL representatives on a
+test-owned database: 31 accepted and two rejected with -2007 for the documented
+TABLE BACKUPNAME forms. The TO-named TABLE backup succeeds. All 17 actual
+backups are checked with SF_BAKSET_CHECK and nonempty physical backup pieces.
+The test limits its fixed scratch directory to 2 GiB; this run used about
+69.7 MB. All 17 SF_BAKSET_REMOVE calls returned 1, were included in the mined
+LSN range, and left only an empty directory that was then removed. These
+cleanup calls are recorded separately from the 33 corpus representatives.
+
+The accepted TABLE restore variants check actual rows, columns and object
+identities. Three data restores replace the existing row 99 with backed-up
+rows 1 and 2 while retaining the target DATA_OBJ#. Their LSN intervals contain
+no target DML redo, although the later marker INSERT is mined successfully.
+This is an explicit CDC gap, not evidence that RESTORE TABLE can be captured
+continuously. Index and constraint metadata differences are retained for
+version-specific review instead of converted into passing expectations.
+Every backup representative retains its exact source excerpt and the rewritten
+server path or object fixture; other clauses stay pending. DMRMAN offline
+RESTORE/RECOVER, remote storage, TAPE and S3 require separate environments and
+are not covered by this online JDBC test. Evidence is in
+`target/official-backup-restore-it.json`.
+
+`DamengOfficialMaterializedViewIT` adds 15 online representatives for creating
+complete/fast views and view logs, FAST/COMPLETE/FORCE/default refresh,
+USING DELETE/TRUNCATE, alteration and removal. On 8.1.3.162, 13 were accepted;
+COMPILE and DROP MATERIALIZED VIEW LOG IF EXISTS were rejected by the database.
+The test verifies each view's actual rows and resolves its MTAB$_ backing-table
+object ID. Preparation DML has separate LSN ranges, and MLOG$_ maintenance DML
+is distinguished from changes to the view's backing table. FAST and complete
+refreshes produce real backing-table DML on this build.
+
+The repeated run uses COMPATIBLE_MODE=0, RLOG_APPEND_LOGIC=2 and
+RLOG_IGNORE_TABLE_SET=1. Mining uses the Connector's OPTIONS=2048, without
+DICT_FROM_ONLINE_CATALOG; the numeric object/column spellings below describe
+this mode rather than every possible SQL_REDO representation.
+Creating either view records the original operation-5
+DDL and two MTAB$_ INSERTs in the same XID and commit SCN. Creating a view log
+adds MLOG$_ and MTRG$_ objects, but the observed DDL is the original CREATE
+MATERIALIZED VIEW LOG. Dropping a view removes both the view and its MTAB$_
+table; dropping its log removes MLOG$_ and MTRG$_. No separate CREATE/DROP
+TABLE or CREATE/DROP TRIGGER redo was observed for these implicit objects.
+Their schema history cannot therefore be assumed to arrive as ordinary
+table/trigger DDL.
+
+The manual FAST sample and COMPLETE USING DELETE each record two MTAB$_
+DELETEs and two INSERTs. COMPLETE USING TRUNCATE records an additional
+operation-5 `TRUNCATE TABLE "SYSDBA"."MTAB$_DBZ_MV_COMPLETE";` and two INSERTs,
+without per-row MTAB$_ DELETEs. FORCE and default refresh use that same
+truncate path in this fixture; this does not establish a universal FORCE
+refresh strategy. Each refresh's original DDL, internal truncate if any,
+MTAB$_ DML and MLOG$_ mark/purge DML share an XID and commit SCN. Base-table
+DML occurs in separate preparation transactions. ALTER refresh mode and
+ENABLE QUERY REWRITE record only their original DDL, without MTAB$_ DML.
+
+Every raw row retains XID, START_SCN, COMMIT_SCN, ROLL_BACK, DATA_OBJ#,
+DATA_OBJV#, RS_ID, SSN, CSF and archive coordinates, together with before/after
+object metadata. SQL_REDO can contain numeric schema names, `OBJ# n` and
+`COL n` rather than logical view/column names; object attribution uses
+DATA_OBJ# and the recorded catalog snapshots. The run also contains 63
+operation-36 rows that the event enum names ROLLBACK. All have ROLL_BACK=0
+and belong to XIDs with subsequent COMMIT records. Their presence alone must
+not be interpreted as a rollback of the entire user transaction.
+
+The 16 observed DDL rows have separate parser-stage results: 13 MATERIALIZED
+or REFRESH rows fail analysis, and three internal-table TRUNCATE rows pass
+analysis but fail planning with the probe's empty historical Tables. The latter
+are context limitations, not confirmed runtime defects. No end-to-end emitted
+CDC support is claimed. A DATA_OBJ#-verified marker controls the complete mined
+range. Original fragments, rewritten fixture SQL, rows, object IDs and every
+redo operation are retained in `target/official-materialized-view-it.json`.
+Scheduled refresh and other optional branches remain untested; these
+representatives do not complete an entire documentation page.
+
+`DamengMaterializedViewRedoIT` separately tests simple ROWID FAST views over
+independent ON COMMIT and ON DEMAND base tables. Its 19 steps and 106 checks
+pass on the same database/driver build. Each mode commits a net INSERT,
+UPDATE and DELETE separately, rolls back a mixed UPDATE/DELETE/INSERT, and
+then commits another update to check that rolled-back values do not reappear.
+ON DEMAND additionally executes a FAST refresh without intervening changes.
+Independent observer connections verify committed base/view rows, and a final
+DATA_OBJ#-verified marker validates the mined range. Evidence, including all
+207 raw redo rows, is in `target/materialized-view-redo-it.json`.
+
+All four ON COMMIT transactions leave the old view rows visible at the first
+query after COMMIT returns. Bounded 100 ms polling subsequently observes the
+expected rows, in agreement with the documented asynchronous worker. These
+queries establish observed ordering, not an exact refresh latency. Base DML
+and MLOG$_ INSERTs commit together; MTAB$_ changes and MLOG$_ marking/purging
+then commit in a different worker XID. None of these worker transactions has
+an operation-5 REFRESH row. Automatic refresh therefore cannot be detected
+solely by recognizing a REFRESH DDL prefix.
+
+In both modes, a net INSERT produces one MTAB$_ INSERT, a net UPDATE produces
+one DELETE plus one INSERT, and a net DELETE produces one DELETE. ON DEMAND
+base commits leave the view stale and write no MTAB$_ DML. Each following
+explicit FAST refresh records its original operation-5 DDL and the MTAB$_
+changes in a new transaction. The no-change refresh still records the DDL
+and COMMIT, with no MTAB$_ or MLOG$_ DML. Physical backing-table operations
+must not be assumed to preserve the base table's UPDATE operation kind.
+
+The two actual rollback transactions retain base-table and MLOG$_ raw DML
+when mining without the committed-only option. Every row in those XIDs has
+ROLL_BACK=1 and null COMMIT_SCN, neither XID has an operation-7 COMMIT, and
+each ends with operation 36 and RS_ID=-1. No MTAB$_ change is observed during
+their two-second post-rollback windows; the following committed refresh also
+excludes all rolled-back values. Other operation-36 rows in committed
+transactions have ROLL_BACK=0 and are not whole-transaction rollbacks.
+
+These are direct JDBC and raw LogMiner observations for simple single-table
+ROWID views. Catalog/row snapshots use separate queries, and LSN subwindows
+include the associated observation queries. The tests do not validate
+Connector-emitted materialized-view events, arbitrary view definitions,
+scheduled refreshes or behavior on other DM versions.
+
+`DamengMaterializedViewDictionaryIT` compares the same archived operations in
+four fresh mining sessions using OPTIONS=2048, 2064, 2128 and 16. All objects
+remain present during mining. On 8.1.3.162 each session reads 61 records, and
+all records match by SCN, SSN, archive coordinates, RS_ID and CSF. Each mode
+also finds the independent marker INSERT and both MTAB$_ targets' INSERTs.
+The actual logical-view and backing-table column labels are read through
+zero-row JDBC queries: ID/V for COMPLETE, and ID/V/X for ROWID FAST.
+
+OPTIONS=2048 produces `"150994945"."OBJ# 1019"("COL 1", "COL 2")` for the
+COMPLETE view's first INSERT. With DICT_FROM_ONLINE_CATALOG=16 added, the same
+record becomes `"SYSDBA"."MTAB$_DBZ_MVD_COMPLETE"("ID", "V")`.
+SEG_OWNER and TABLE_NAME resolve to SYSDBA and the MTAB$_ name as well.
+OPTIONS=2128 combines 2048, NO_SQL_DELIMITER=64 and the online dictionary;
+its INSERT uses the same real names without the final semicolon. OPTIONS=16
+also resolves the names. The FAST backing table resolves ID/V/X in all three
+online-dictionary modes. These names identify physical backing tables, not
+the logical materialized-view name. The observed OBJ#/COL n spelling in the
+other tests is therefore a result of the Connector's dictionary-free option,
+not a universal property of materialized-view redo. The paired raw records
+and column labels are in `target/materialized-view-dictionary-it.json`.
+This test does not change the production mining options or establish that
+today's online dictionary can correctly describe every historical schema.
+
+`DamengMaterializedViewSchemaRecoveryIT` tests DROP and same-name CREATE for
+both COMPLETE and ROWID FAST views, then mines the entire interval using
+OPTIONS=2048. Each first generation selects ID/OLD_TEXT VARCHAR(32); its
+replacement selects ID/NEW_AMOUNT DECIMAL(12,2)/NEW_NOTE VARCHAR(40). FAST
+also selects X ROWID. The logical VIEW and physical MTAB$_ definitions are
+saved to disk before deletion, then reloaded after both replacements exist.
+Fresh connections compare current object identities, catalog column schemas
+and JDBC column metadata separately. Object status fields such as VERSION
+and INFO5 are retained as evidence but do not determine schema equality.
+
+On 8.1.3.162 with driver 8.1.3.140, the COMPLETE backing-table ID changes
+from 1019 to 1020 and FAST from 1023 to 1024. Current JDBC queries by either
+reused logical or physical name return the replacement's exact columns and
+types. Current SYSOBJECTS/SYSCOLUMNS queries by the original first-generation
+IDs succeed but return no rows. The fixture allows object ID reuse by
+matching redo using both ID and its generation's LSN interval; this run does
+not exercise reuse because all four physical IDs differ.
+
+The test enables ENABLE_FLASHBACK=1 and extends UNDO_RETENTION to 3600 only
+inside its disposable database. A normal user-table control returns
+control-new currently and control-old at the saved SCN, verifying ordinary
+row flashback independently. Nevertheless, SYSOBJECTS and SYSCOLUMNS AS OF
+SCN queries by each deleted VIEW/MTAB$_ ID return empty results. They are
+tested at both the saved schema LSN and CREATE's actual operation-7 commit
+SCN; these two boundaries coincide in this run. Queries for still-existing
+replacement objects return matching identities and column schemas. The
+observations do not establish a general historical system-catalog recovery
+capability or an earliest usable metadata boundary.
+
+All four saved physical schemas correctly bind 14 INSERT redo records to
+their respective generations through the existing LogMinerDmlParser. The
+checks cover column names, JDBC types, DECIMAL precision/scale and the
+distinguishable refreshed values. The mined range contains 155 raw records
+and a DATA_OBJ#-verified marker. This validates saved metadata for INSERT
+parsing; it does not validate DELETE reconstruction, value conversion,
+Connector schema-history integration or emitted materialized-view events.
+If an object has already been deleted before its schema was captured,
+looking up current metadata cannot recover its old definition in this test.
+The diagnostic test passes while explicitly recording baselineReplayPassed=true
+and historicalRecoveryPassed=false in
+`target/materialized-view-schema-recovery-it.json`.
+
+`DamengMaterializedViewFilterIT` exercises the default exclusion of MTAB$_ and
+MLOG$_ with a full embedded Connector. Capture selects an entire dedicated schema
+without table include/exclude patterns, so the internal tables would otherwise
+be eligible. The initial COMPLETE/FAST views and log exist before startup.
+Only the five business-table/marker rows may appear in the initial snapshot.
+Every subsequent data event is checked across all topics, rather than ignoring
+unrecognized topics while waiting for business records.
+
+The streaming fixture commits a business INSERT/UPDATE/DELETE in one transaction
+that also maintains MLOG$_, performs FAST and COMPLETE USING TRUNCATE refreshes,
+and verifies the actual view rows. It then alters, drops and recreates both views
+with different column counts. A final restart replays CREATE/REFRESH/DROP records
+whose backing tables have already disappeared. Marker events verify continued
+progress, and exact business-event assertions verify that internal-record
+filtering does not discard their transactions. The DML parser and mining options
+are unchanged. Prebuilt materialized views remain outside this default filter.
+
+Unit coverage additionally checks case-insensitive internal prefixes, similar
+ordinary names, explicit include rules, the existing table.ignore.builtin=false
+switch and rejection of internal signal tables. Streaming tests retain legacy
+internal definitions in history, including an object ID reused by a business
+table, and verify that neither internal DDL nor DML changes the business model
+or prevents its marker from being delivered. The non-table DDL corpus now
+classifies ordinary materialized-view statements while rejecting PREBUILT and
+compound records containing ordinary-table changes. Earlier raw-redo audit
+reports retain the parser outcomes from before this filtering change.
+On 2026-10-30 the focused 691 unit tests, two architecture checks and this
+embedded integration test passed on DM 8.1.3.162 with driver 8.1.3.140.
+The integration fixture observes exactly five snapshot and nine streaming
+business/marker events, with no internal-table data events. Formatting and
+Checkstyle for the changed Java files also pass. Its report is
+`target/failsafe-reports/io.debezium.connector.dameng.DamengMaterializedViewFilterIT.txt`.
+
+Run the focused integration tests with:
+
+[source,shell]
+----
+./mvnw -B -ntp -pl debezium-connector-dameng -am verify -Pdameng-tests \
+  -Dantlr.tests.enabled=false -Dtest=DamengDdlStatementAnalyzerTest \
+  -Dsurefire.failIfNoSpecifiedTests=false -Dfailsafe.failIfNoSpecifiedTests=false \
+  '-Dit.test=DamengOfficialMaterializedViewIT,DamengMaterializedViewRedoIT,DamengMaterializedViewDictionaryIT,DamengMaterializedViewSchemaRecoveryIT,DamengMaterializedViewFilterIT'
+----
+
+`DamengOfficialDatabaseStateIT` executes 34 single-instance state, role,
+parameter and LOCAL-archive examples. On 8.1.3.162, 27 are accepted and seven
+are rejected for the recorded state prerequisites: repeated OPEN, an explicitly
+disabled manual status change, or missing FORCE for PRIMARY/STANDBY opening.
+It checks actual V$INSTANCE, V$RLOG and V$DM_ARCH_INI values after every step,
+including MOUNT business-table read rejection and STANDBY read acceptance/write
+rejection. Parameter values are restored; the test finishes OPEN PRIMARY.
+
+Adding a second valid LOCAL destination exposes a production archive-loading
+failure: startLogMining attempts to add duplicate copies and receives -2848.
+The report retains that failure separately from successful role validation and
+the unchanged DB_MAGIC. A raw SQL diagnostic selects seven files from the
+original destination out of 13 candidates, verifies identity and continuous
+coverage, and mines both DATA_OBJ#-verified boundary INSERTs. It is diagnostic
+evidence only, not Connector support for multiple LOCAL destinations. This
+single-instance test does not establish replicated standby, watcher, DSC or
+failover support. Results are in `target/official-database-state-it.json`;
+earlier failures remain under `target/official-sql-history/`.
+
+`DamengOfficialProceduralBulkDmlIT` replays the three FORALL UPDATE blocks
+from `dmpl-sql-exception` fragments 14, 15 and 16 through JDBC and a complete
+embedded Connector. Each block uses its own EMP fixture. The independent
+observer and emitted before/after images agree for all three columns,
+including Chinese employee names. The initial snapshot contains 20 rows;
+the four streaming cases emit exactly eight committed UPDATEs in total.
+
+The original fragment 14 raises -6170 after its handler commits two successful
+updates; fragment 15 raises -24381 after committing three. Both JDBC calls
+remain recorded as rejected while CDC correctly emits the committed rows.
+Fragment 16 declares PRAGMA error code -25000, which does not catch the actual
+-24381 on this database build. It rolls back all updates and emits no CDC.
+A fourth, separate case changes only that PRAGMA code to -24381 and verifies
+three committed updates and three CDC events. Fixture table renaming and the
+error-code adaptation retain their original source, SHA and excerpt ranges;
+they never replace the original failed outcome or complete the whole source.
+Each case has independently mined DATA_OBJ#/operation/ID-verified markers.
+A final marker and queue drain check for residual events. Evidence, including
+the rejected calls' committed rows, is in
+`target/official-procedural-bulk-dml-it.json`. A JDBC error must not be inferred
+to mean that the anonymous block left no committed changes.
+
+`DamengOfficialDynamicSqlIT` executes the four original DBMS_SQL anonymous
+blocks from fragments 31 through 34, plus a separate spelling adaptation of
+fragment 33. Five independent no-primary-key NUMBER fixtures provide a
+20-row initial snapshot with exact decimal-string assertions and null keys.
+The two read cursors leave rows unchanged and emit no CDC. Original fragment
+33 retains `bms_sql.CLOSE_CURSOR` and is rejected with -2207; the test client
+rolls back and observes no committed data or CDC. Original fragment 34 binds
+an array containing 12.3, 6.12, 8.12 and 342.12, then an explicitly recorded
+test-client commit produces four INSERT redo rows and matching CDC events.
+The separate `dbms_sql.CLOSE_CURSOR` spelling adaptation inserts 9.12 and
+emits one event. The anonymous blocks themselves contain no COMMIT.
+
+Original text, SHA, nested package-call ranges, parsed SQL strings and
+fixture/spelling transformations are retained separately. Six strict markers
+include the final fence; a queue drain finds no residual events. JDBC
+DBMS_OUTPUT.GET_LINE returned an empty buffer on this build; the report
+explicitly records `sessionOutputVerified=false`, without substituting the
+printed manual results. Evidence is in `target/official-dynamic-sql-it.json`;
+the original failed test assertion is retained separately in the test history.
+
+`DamengOfficialExportIT` executes DEXP as an external process with argument
+arrays, separately testing the omitted DROP default, `DROP=N`, and `DROP=Y`.
+Each case exports a different two-row table containing Chinese text. On
+8.1.3.162 all three processes return zero and produce nonempty dump/log files.
+The default and N cases preserve both rows and produce no target-table redo
+or CDC. The Y case deletes the source table and produces one operation-5
+`drop table "SYSDBA"."DBZ_EXP_Y" CASCADE PURGE` redo record. DDL analysis,
+planning and historical application accept that record; the complete embedded
+Connector records its DROP in schema history and continues through the next
+marker and final fence. Dropping a table does not emit per-row DELETE events.
+
+The six-row initial snapshot, case markers, final fence, empty trailing queue,
+table state, export file sizes/hashes and cleanup are asserted independently.
+The observed files total 31,458 bytes; the test caps its export directory at
+64 MiB and cleans its files and database container. Evidence is in
+`target/official-export-it.json`. The three utility runs instantiate source
+72's `DROP=Y/N`, with source 119 retaining the option's destructive meaning;
+they are not JDBC submissions or full coverage of other export combinations.
+The validated run used a temporary source copy because an unrelated unfinished
+`DamengAntlrSqlLexerTest` referenced an absent class in the shared workspace.
+Only that test was excluded in the copy; production and this IT were unchanged.
+The isolation manifest accompanies the result as
+`target/official-export-build-isolation.json`.
+
+`DamengOfficialBulkLoaderIT` runs two external DMFLDR processes with
+`DIRECT=FALSE` and `DIRECT=TRUE`, using separate INT primary-key/VARCHAR
+tables and three UTF-8 rows each, including Chinese text. Each table already
+contains a separately verified initial-snapshot row. On 8.1.3.162 both tool
+processes return zero, report the requested effective DIRECT option, and
+report three loaded rows with no data/format errors. Independent committed
+JDBC reads retain the snapshot row and find exactly the three imported rows.
+Each load produces three ordinary INSERT redo records and three complete
+embedded-Connector INSERT events with exact IDs/text and no duplicates.
+
+The case markers and final fence are verified in both redo and CDC; the
+trailing queue is empty and the Connector reports no failure. The generated
+control/data/log directory totals 15,575 bytes, is capped at 64 MiB, and is
+cleaned along with the test-owned database container. Evidence is in
+`target/official-bulk-loader-it.json`. The DIRECT option excerpts originate
+from `actual-combat-dmfldr` fragments 32 and 45; the original text, SHA,
+Unicode ranges, supporting control-file/MODE sources and scalar-fixture
+adaptations are retained. This verifies the two scalar import paths only,
+not the source examples' LOB/identity features or arbitrary control files.
+Tool acceptance, committed JDBC rows, ordinary redo and CDC correctness stay
+separate in the coverage ledger, and do not complete the entire source.
+
+The validated run used the temporary source copy with the current production
+sources, POM and ANTLR grammar synchronized; unlike the earlier export run,
+it excluded no lexer test. All 17 reactor modules built successfully and
+the single selected integration test passed. The source/class fingerprints
+and build context are retained in
+`target/official-bulk-loader-isolation.json`.
+
+`DamengOfficialImportIT` runs three external DIMP processes using separate
+test-generated DEXP dumps containing three INT-primary-key/VARCHAR rows,
+including Chinese text. It explicitly uses `FAST_LOAD=N`, `PARALLEL=1`,
+`DUMMY=Y`, and Connector `skipped.operations=none`. Existing APPEND and
+TRUNCATE targets each supply one independently checked initial-snapshot row;
+the default target does not exist when the Connector starts. The execution
+order is APPEND, TRUNCATE, then default creation, so a creation failure cannot
+hide the ordinary import controls.
+
+On 8.1.3.162 all three tools return zero and independent committed JDBC reads
+find the expected rows. APPEND retains its seed and produces three ordinary
+INSERT redo records and three exact INSERT events. TRUNCATE removes its seed
+and produces one TRUNCATE event followed by three INSERT events. Reconstructing
+state from each snapshot plus these events matches committed JDBC data, and
+both case markers pass in redo and CDC.
+
+The default absent-target import exposes a real Connector limitation. DIMP
+creates the table using one operation-5 redo record containing
+`CREATE SCHEMA "SYSDBA" AUTHORIZATION "SYSDBA" CREATE TABLE ...`.
+The current DDL parser rejects the SCHEMA token. The table and all three rows
+are committed and independently visible, but no table CREATE reaches schema
+history and no row events reach CDC. The final marker exists in raw redo but
+not CDC. This behavior can occur when DIMP imports a single ordinary table;
+it does not require a user-written multi-table CREATE SCHEMA script.
+
+The test defaults to strict regression checks for every case, the final fence,
+the trailing queue and Connector failure. Its strict run reports one failure
+for default creation; both APPEND and TRUNCATE controls pass. An explicit
+`-Ddameng.official.import.diagnostic=true` run can finish gathering evidence
+despite this known gap, while both controls remain strict. Both reports retain
+`validationPassed=false`, `regressionGatePassed=false`, `diagnosticGap=true`
+for default creation, and the full Connector failure cause chain. A successful
+diagnostic test therefore means the diagnostic ran, not that all modes work.
+Tool acceptance, committed rows, raw redo, schema history, case markers and
+the failed final fence remain distinct in `target/official-import-it.json`
+(strict) and `target/official-import-diagnostic-it.json` (explicit diagnostic).
+The coverage ledger registers the strict result once; the diagnostic rerun
+does not add another execution count.
+The utility ledger also retains report-wide failure/fence observations
+separately from each case, so the later failure does not rewrite an earlier
+passing APPEND result.
+
+These are parameter adaptations of `dimp-logical%20import` fragments 17 and
+23. Full original text, SHA, Unicode ranges, supporting option sources and
+dump file hashes are preserved, without completing the original examples or
+other TABLE_EXISTS_ACTION values. The directory totals 33,658 bytes, remains
+below the 64 MiB cap, and is removed with the test-owned database container.
+The isolated source copy built the dependencies and selected integration test
+without test exclusions. The strict and diagnostic runs use identical tested
+production classes; their exit codes and result XML are preserved. Two shared
+production source files changed concurrently after synchronization, so these
+results apply to the frozen tested fingerprint, not those later changes.
+The source/class fingerprints, shared-source drift and copy context are in
+`target/official-import-isolation.json`.
+
+
+`DamengOfficialAuditIT` uses the documented SYSAUDITOR account, separately
+recording that SYSDBA cannot enable audit on this build. The 42 operation
+entries in the second column of official table 5.3 are descriptions, not SQL
+or the TYPE argument: the test maps them to the first column and calls
+SP_AUDIT_STMT/SP_NOAUDIT_STMT. It also covers all documented WHENEVER values,
+object/column/routine APIs and SQL-sequence auditing. It validates restored
+policy state, the SQL-sequence definition order and its removal, and actual
+successful/failed INSERT audit records, then mines the
+complete LSN interval and its marker INSERT. API acceptance, stored policy
+state and actual redo are recorded separately; named destructive operations
+such as DROP TABLE are not executed merely because an audit option lists them.
+The verified run executed 199 API calls: 193 accepted, six rejected for a
+real SQL NULL user argument. The documented string 'NULL' was accepted. These
+API intervals emitted no operation codes 1 through 5 on this build.
+
+
+Generate the source meaning ledger with:
+
+[source,shell]
+----
+python3 debezium-connector-dameng/src/test/classify-official-client-commands.py
+python3 debezium-connector-dameng/src/test/review-official-sql-meanings.py \
+  --ledger debezium-connector-dameng/target/official-sql-coverage.jsonl \
+  --output debezium-connector-dameng/target/official-sql-meanings.jsonl \
+  --summary debezium-connector-dameng/target/official-sql-meanings-summary.json
+python3 -m unittest discover -s debezium-connector-dameng/src/test -p 'test_*official*.py'
+----
+
+Run the focused audit with:
+
+[source,shell]
+----
+env JAVA_HOME=/opt/java/jdk-25.0.4+7 ./mvnw -B -ntp \
+  -pl debezium-connector-dameng -am verify -Pdameng-all-tests \
+  -Dsurefire.failIfNoSpecifiedTests=false -Dfailsafe.failIfNoSpecifiedTests=false \
+  '-Dtest=DamengOfficialSqlCorpusTest' \
+  '-Dit.test=DamengOfficialTableDdlIT,DamengOfficialNonTableDdlIT,DamengOfficialDatatypeSyntaxIT,DamengOfficialStatementFamiliesIT,DamengOfficialReadOnlyQueryRepresentativeIT,DamengOfficialSemanticRepresentativesIT,DamengOfficialSessionRepresentativesIT,DamengOfficialQueryCorpusIT,DamengOfficialPrivilegesIT,DamengOfficialPrivilegeAuthorityIT,DamengOfficialObjectPrivilegesIT,DamengOfficialAuditIT,DamengOfficialBackupRestoreIT,DamengOfficialMaterializedViewIT,DamengOfficialDatabaseStateIT,DamengOfficialProceduralBulkDmlIT,DamengOfficialDynamicSqlIT,DamengOfficialExportIT,DamengOfficialBulkLoaderIT,DamengOfficialImportIT,DamengOfficialDirectSqlCorpusIT'
+----

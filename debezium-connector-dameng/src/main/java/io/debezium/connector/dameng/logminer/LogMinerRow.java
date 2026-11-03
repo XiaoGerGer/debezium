@@ -7,6 +7,8 @@ package io.debezium.connector.dameng.logminer;
 
 import java.time.Instant;
 
+import io.debezium.connector.dameng.logminer.events.EventType;
+
 /** One decoded row returned by Dameng LogMiner. */
 public record LogMinerRow(long lsn, long startLsn, long commitLsn, String transactionId, int operation, int rollback,
         String owner, String tableName, String username, String redo, String recordSetId, int sequence, int continuation,
@@ -24,6 +26,10 @@ public record LogMinerRow(long lsn, long startLsn, long commitLsn, String transa
                        String recordSetId, int sequence, int continuation, Instant timestamp) {
         this(lsn, startLsn, commitLsn, transactionId, operation, rollback, owner, tableName, username, redo,
                 recordSetId, sequence, continuation, timestamp, 0);
+    }
+
+    public EventType eventType() {
+        return EventType.from(operation);
     }
 
     public LogMinerRow withRedo(String sql) {

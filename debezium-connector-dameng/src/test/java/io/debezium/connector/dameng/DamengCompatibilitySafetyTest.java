@@ -84,7 +84,14 @@ class DamengCompatibilitySafetyTest {
         assertThat(parser.analyze(ddl, "SYSDBA").tableId()).isEqualTo(id);
         parser.parse(ddl, tables, "SYSDBA");
         assertThat(tables.forTable(id).retrieveColumnNames()).containsExactly("1".equals(mode) ? "ID" : "id", "1".equals(mode) ? "V" : "v");
-        assertThatThrownBy(() -> parser.parse("CREATE TABLE 42(ID INT)", tables, "SYSDBA")).hasMessageContaining("identifier");
+        final var original = tables.forTable(id);
+        final var invalidDdl = "CREATE TABLE 42(ID INT)";
+        final var invalidPosition = invalidDdl.indexOf("42");
+        assertThatThrownBy(() -> parser.parse(invalidDdl, tables, "SYSDBA"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("character " + invalidPosition, "line 1, column " + (invalidPosition + 1));
+        assertThat(tables.tableIds()).containsExactly(id);
+        assertThat(tables.forTable(id)).isSameAs(original);
     }
 
     @Test

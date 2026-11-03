@@ -8,7 +8,7 @@ package io.debezium.connector.dameng.compatibility;
 import java.nio.charset.Charset;
 import java.util.Set;
 
-import io.debezium.connector.dameng.DamengDdlParser;
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 
 /**
  * A registered implementation of database semantics. Sharing an implementation

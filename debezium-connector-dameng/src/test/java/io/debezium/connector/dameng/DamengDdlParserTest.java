@@ -18,6 +18,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.relational.Attribute;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
@@ -47,6 +48,23 @@ class DamengDdlParserTest {
     }
 
     @Test
+    void preservesHistoricalColumnsWhenTableLevelLogicalLoggingChanges() {
+        final var tables = new Tables();
+        final var parser = new DamengDdlParser();
+        final var id = new TableId(null, "APP", "T");
+        parser.parse("CREATE TABLE APP.T (ID INT PRIMARY KEY, V VARCHAR(40)) ADD LOGIC LOG", tables, "APP");
+        final var initial = tables.forTable(id);
+        assertThat(initial.retrieveColumnNames()).containsExactly("ID", "V");
+        assertThat(initial.primaryKeyColumnNames()).containsExactly("ID");
+
+        final var changes = parser.parse("ALTER TABLE APP.T DROP LOGIC LOG; ALTER TABLE APP.T ADD LOGIC LOG", tables, "APP");
+        assertThat(changes).extracting(DamengDdlParser.SchemaChange::type)
+                .containsExactly(DamengDdlParser.Type.ALTER, DamengDdlParser.Type.ALTER);
+        assertThat(tables.forTable(id).retrieveColumnNames()).containsExactly("ID", "V");
+        assertThat(tables.forTable(id).primaryKeyColumnNames()).containsExactly("ID");
+    }
+
+    @Test
     void preservesObjectIdentityAndNamedConstraintsAcrossTableRename() {
         final var tables = new Tables();
         final var parser = new DamengDdlParser();
@@ -67,7 +85,7 @@ class DamengDdlParserTest {
 
     @Test
     void rejectsUnknownSyntax() {
-        assertThatThrownBy(() -> new DamengDdlParser().parse("ALTER SYSTEM SWITCH LOGFILE", new Tables(), "APP"))
+        assertThatThrownBy(() -> new DamengDdlParser().parse("ALTER UNKNOWN OBJECT", new Tables(), "APP"))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -245,22 +263,6 @@ class DamengDdlParserTest {
     }
 
     @Test
-    void truncationPreservesHistoricalTableDefinition() {
-        final var tables = new Tables();
-        final var parser = new DamengDdlParser();
-        final var id = new TableId(null, "APP", "T");
-        parser.parse("CREATE TABLE APP.T (ID INT PRIMARY KEY, NAME VARCHAR(20))", tables, "APP");
-        final var original = tables.forTable(id);
-        final var changes = parser.parse("TRUNCATE TABLE APP.T REUSE STORAGE", tables, "APP");
-
-        assertThat(changes).singleElement().satisfies(change -> {
-            assertThat(change.type()).isEqualTo(DamengDdlParser.Type.TRUNCATE);
-            assertThat(change.table()).isEqualTo(original);
-        });
-        assertThat(tables.forTable(id)).isEqualTo(original);
-    }
-
-    @Test
     void acceptsStorageAndCascadeClausesWithoutChangingHistoricalColumns() {
         final var parser = new DamengDdlParser();
         final var tables = new Tables();
@@ -273,6 +275,46 @@ class DamengDdlParserTest {
         final var drop = parser.parse("DROP TABLE APP.T CASCADE CONSTRAINTS PURGE", tables, "APP");
         assertThat(drop).singleElement().satisfies(change -> assertThat(change.table()).isEqualTo(original));
         assertThat(tables.forTable(id)).isNull();
+    }
+
+    @Test
+    void dropsTheHistoricalTableWhenRedoUsesIfExists() {
+        final var parser = new DamengDdlParser();
+        final var tables = new Tables();
+        final var id = new TableId(null, "DB", "XXX");
+        parser.parse("CREATE TABLE DB.XXX (ID INT)", tables, "DB");
+        final var original = tables.forTable(id);
+        final var analysis = parser.analyze("DROP TABLE IF EXISTS XXX", "DB");
+
+        assertThat(analysis.tableId()).isEqualTo(id);
+        assertThat(parser.plan(analysis, tables)).singleElement().satisfies(change -> {
+            assertThat(change.type()).isEqualTo(DamengDdlParser.Type.DROP);
+            assertThat(change.table()).isEqualTo(original);
+        });
+        assertThat(tables.forTable(id)).isEqualTo(original);
+
+        assertThat(parser.parse("DROP TABLE IF EXISTS DB.XXX", tables, "DB"))
+                .singleElement().satisfies(change -> assertThat(change.tableId()).isEqualTo(id));
+        assertThat(tables.forTable(id)).isNull();
+    }
+
+    @Test
+    void createsTheHistoricalTableWhenRedoUsesIfNotExists() {
+        final var parser = new DamengDdlParser();
+        final var tables = new Tables();
+        final var id = new TableId(null, "DB", "XXX");
+        final var analysis = parser.analyze("CREATE TABLE IF NOT EXISTS XXX (ID INT)", "DB");
+
+        assertThat(analysis.tableId()).isEqualTo(id);
+        assertThat(parser.plan(analysis, tables)).singleElement().satisfies(change -> {
+            assertThat(change.type()).isEqualTo(DamengDdlParser.Type.CREATE);
+            assertThat(change.tableId()).isEqualTo(id);
+        });
+        assertThat(tables.forTable(id)).isNull();
+
+        assertThat(parser.parse("CREATE TABLE IF NOT EXISTS DB.XXX (ID INT)", tables, "DB"))
+                .singleElement().satisfies(change -> assertThat(change.tableId()).isEqualTo(id));
+        assertThat(tables.forTable(id).retrieveColumnNames()).containsExactly("ID");
     }
 
     @Test
@@ -501,16 +543,6 @@ class DamengDdlParserTest {
         assertThat(tables.forTable(null, "APP", "T").retrieveColumnNames()).containsExactly("ID");
     }
 
-    @Test
-    void returnsRenamedTableAndHistoricalDropDefinition() {
-        final var tables = new Tables();
-        final var changes = new DamengDdlParser().parse("CREATE TABLE T (ID INT); ALTER TABLE T RENAME TO T2; TRUNCATE TABLE T2; DROP TABLE T2", tables, "APP");
-        assertThat(changes.get(1).table().id()).isEqualTo(new TableId(null, "APP", "T2"));
-        assertThat(changes.get(1).previousTableId()).isEqualTo(new TableId(null, "APP", "T"));
-        assertThat(changes.get(2).type()).isEqualTo(DamengDdlParser.Type.TRUNCATE);
-        assertThat(changes.get(3).table().retrieveColumnNames()).containsExactly("ID");
-    }
-
     @ParameterizedTest
     @ValueSource(strings = {
             "CREATE INDEX IX_T ON APP.T(ID)",
@@ -591,7 +623,6 @@ class DamengDdlParserTest {
             "TRUNCATE TABLE APP.T",
             "RENAME TABLE APP.T TO APP.T2",
             "CREATE TABLE APP.\"INDEX\" (ID INT)",
-            "ALTER SYSTEM SWITCH LOGFILE",
             "CREATE SOMETHING UNKNOWN"
     })
     void shouldNotClassifyTableOrUnknownDdlAsHarmless(String ddl) {

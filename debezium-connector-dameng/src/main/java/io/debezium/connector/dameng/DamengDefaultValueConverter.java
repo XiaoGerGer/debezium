@@ -5,13 +5,16 @@
  */
 package io.debezium.connector.dameng;
 
+import java.sql.Types;
+import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.Optional;
 
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.SchemaBuilder;
 
-import io.debezium.connector.dameng.ddl.DamengSqlLexer;
-import io.debezium.connector.dameng.ddl.DamengSqlLexer.Kind;
+import io.debezium.connector.dameng.antlr.DamengAntlrSqlLexer;
+import io.debezium.connector.dameng.antlr.DamengSqlToken.Kind;
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser.SqlExpression;
 import io.debezium.relational.Column;
 import io.debezium.relational.DefaultValueConverter;
@@ -32,11 +35,21 @@ public final class DamengDefaultValueConverter implements DefaultValueConverter 
         final String literal = expression.trim();
         final Object value;
         if (literal.startsWith("'") || literal.regionMatches(true, 0, "N'", 0, 2) || literal.regionMatches(true, 0, "Q'", 0, 2)) {
-            final var tokens = new DamengSqlLexer().tokenize(literal);
+            final var tokens = new DamengAntlrSqlLexer().tokenize(literal);
             if (tokens.size() != 1 || tokens.get(0).kind() != Kind.STRING) {
                 return Optional.empty();
             }
             value = tokens.get(0).stringValue();
+        }
+        else if (literal.regionMatches(true, 0, "0X", 0, 2)) {
+            final var tokens = new DamengAntlrSqlLexer().tokenize(literal);
+            if (tokens.size() != 1 || tokens.get(0).kind() != Kind.BINARY || !isBinary(column)) {
+                return Optional.empty();
+            }
+            final var digits = tokens.get(0).text().substring(2);
+            // DM supplies a zero high nibble when the first byte has only one hex digit.
+            final var bytes = HexFormat.of().parseHex(digits.length() % 2 == 0 ? digits : "0" + digits);
+            value = column.jdbcType() == Types.BINARY && column.length() > bytes.length ? Arrays.copyOf(bytes, column.length()) : bytes;
         }
         else if (literal.matches("[-+]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][-+]?\\d+)?")
                 || literal.equalsIgnoreCase("true") || literal.equalsIgnoreCase("false")) {
@@ -54,5 +67,12 @@ public final class DamengDefaultValueConverter implements DefaultValueConverter 
         }
         final Field field = new Field(column.name(), 0, builder.optional().build());
         return Optional.ofNullable(converters.converter(column, field).convert(value));
+    }
+
+    private static boolean isBinary(Column column) {
+        return switch (column.jdbcType()) {
+            case Types.BINARY, Types.VARBINARY, Types.LONGVARBINARY, Types.BLOB -> true;
+            default -> false;
+        };
     }
 }
