@@ -37,6 +37,19 @@ public final class DamengDdlStatementAnalyzer {
         UNSUPPORTED
     }
 
+    /** Recognized cascading object drops require their dedicated opt-in before capture filtering. */
+    public static final class CascadeDropException extends IllegalArgumentException {
+        private static final long serialVersionUID = 1L;
+
+        private CascadeDropException(ParserRuleContext context, String operation, String target) {
+            super(DamengParseTree.error(context, "Unsupported cascading " + operation + " on " + target
+                    + ": cannot determine all affected tables from this redo; dependent tables or other objects may have been removed. "
+                    + "Ignoring leaves historical schemas and object-ID mappings unchanged and emits no deletion events; downstream data may remain, "
+                    + "and same-name recreation or object-ID reuse may cause later failures or incorrect decoding. "
+                    + "Set cascade.drop.ignore=true to ignore this statement and continue CDC while accepting these consequences").getMessage());
+        }
+    }
+
     /** Parsed partition drops and truncates require their dedicated opt-in, not the generic syntax-error switch. */
     public static final class PartitionDataRemovalException extends IllegalArgumentException {
         private static final long serialVersionUID = 1L;
@@ -59,6 +72,14 @@ public final class DamengDdlStatementAnalyzer {
                 throw failure;
             }
             return this;
+        }
+
+        public boolean isCtas() {
+            return tableStatement != null && tableStatement.createTable() != null && tableStatement.createTable().ctasQuery() != null;
+        }
+
+        public boolean isTemporaryTable() {
+            return tableStatement != null && tableStatement.createTable() != null && tableStatement.createTable().TEMPORARY() != null;
         }
     }
 
@@ -95,6 +116,7 @@ public final class DamengDdlStatementAnalyzer {
     private Analysis analyzeScope(Parsed<DamengSqlParser.DdlScopeContext> parsed, String defaultSchema) {
         final var scope = parsed.tree();
         for (var statement : scope.statement()) {
+            rejectCascadeDrop(statement, scope.statement().size() == 1);
             final var nonTable = statement.nonTableStatement();
             if (scope.statement().size() != 1 && nonTable != null
                     && (nonTable.programDefinition() != null || nonTable.javaClassDefinition() != null)) {
@@ -114,6 +136,7 @@ public final class DamengDdlStatementAnalyzer {
     }
 
     private Analysis analyzeStatement(String sql, DamengSqlParser.StatementContext statement, String defaultSchema) {
+        rejectCascadeDrop(statement, true);
         final var table = statement.tableStatement();
         if (table == null) {
             rejectPrebuiltMaterializedView(statement);
@@ -177,6 +200,48 @@ public final class DamengDdlStatementAnalyzer {
             throw DamengParseTree.error(advancedLog, "Unsupported ADVANCED LOG: this statement also " + action
                     + " implicit auxiliary table " + auxiliary + "; historical processing currently supports one table per DDL record");
         }
+    }
+
+    private static void rejectCascadeDrop(DamengSqlParser.StatementContext statement, boolean standalone) {
+        final var nonTable = statement.nonTableStatement();
+        if (nonTable == null) {
+            return;
+        }
+        final ParserRuleContext context;
+        final ParserRuleContext target;
+        final String operation;
+        if (nonTable.dropUser() != null && nonTable.dropUser().CASCADE() != null) {
+            context = nonTable.dropUser();
+            target = nonTable.dropUser().target;
+            operation = "DROP USER";
+        }
+        else if (nonTable.dropSchema() != null && nonTable.dropSchema().CASCADE() != null) {
+            context = nonTable.dropSchema();
+            target = nonTable.dropSchema().target;
+            operation = "DROP SCHEMA";
+        }
+        else if (nonTable.dropDomain() != null && nonTable.dropDomain().CASCADE() != null) {
+            context = nonTable.dropDomain();
+            target = nonTable.dropDomain().target;
+            operation = "DROP DOMAIN";
+        }
+        else if (nonTable.dropType() != null && nonTable.dropType().BODY() == null && nonTable.dropType().CASCADE() != null) {
+            context = nonTable.dropType();
+            target = nonTable.dropType().target;
+            operation = "DROP TYPE";
+        }
+        else if (nonTable.dropClass() != null && nonTable.dropClass().CASCADE() != null) {
+            context = nonTable.dropClass();
+            target = nonTable.dropClass().target;
+            operation = "DROP CLASS";
+        }
+        else {
+            return;
+        }
+        if (!standalone) {
+            throw DamengParseTree.error(context, "Unsupported compound DDL: a cascading object drop must occupy the complete LogMiner record");
+        }
+        throw new CascadeDropException(context, operation, DamengParseTree.source(target));
     }
 
     private static void rejectPrebuiltMaterializedView(DamengSqlParser.StatementContext statement) {

@@ -316,9 +316,10 @@ class DamengNonTableDdlTest {
         final var names = new String[]{ "ALLOW_IP", "AUTHORIZATION", "BODY", "EXTERNALLY", "IDENTIFIED", "NOT_ALLOW_IP", "PROFILE", "SIZE", "THROUGH",
                 "ABSTRACT", "LINK", "LOGFILE", "OPERATOR", "SYSTEM" };
         final var columns = String.join(" INT,", names) + " INT";
-        parser.parse("CREATE TABLE APP.KEYWORDS(" + columns + ");"
-                + "CREATE TABLE APP.COPIED AS SELECT " + String.join(",", names) + " FROM APP.KEYWORDS", tables, "APP");
-
-        assertThat(tables.forTable(null, "APP", "COPIED").retrieveColumnNames()).containsExactly(names);
+        parser.parse("CREATE TABLE APP.KEYWORDS(" + columns + ")", tables, "APP");
+        assertThat(tables.forTable(null, "APP", "KEYWORDS").retrieveColumnNames()).containsExactly(names);
+        final var analysis = parser.analyze("CREATE TABLE APP.COPIED AS SELECT " + String.join(",", names) + " FROM APP.KEYWORDS", "APP");
+        assertThat(analysis.isCtas()).isTrue();
+        assertThat(analysis.tableId()).isEqualTo(new TableId(null, "APP", "COPIED"));
     }
 }

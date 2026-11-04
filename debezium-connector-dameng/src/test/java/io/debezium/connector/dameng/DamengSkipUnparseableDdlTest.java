@@ -39,6 +39,7 @@ import org.slf4j.LoggerFactory;
 
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.dameng.antlr.DamengDdlParser;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.CascadeDropException;
 import io.debezium.connector.dameng.logminer.parser.DmlParserException;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.junit.logging.LogInterceptor;
@@ -82,6 +83,126 @@ class DamengSkipUnparseableDdlTest {
     private ChangeEventSourceContext context;
     private EventDispatcher<DamengPartition, TableId> dispatcher;
     private ResultSet rows;
+
+    static Stream<Arguments> cascadeDropSettings() {
+        return Stream.of(
+                Arguments.of("DROP USER EXCLUDED_USER CASCADE", 0L),
+                Arguments.of("DROP SCHEMA EXCLUDED_SCHEMA CASCADE", -1L),
+                Arguments.of("DROP DOMAIN OTHER.D CASCADE", 419430400L),
+                Arguments.of("DROP TYPE OTHER.TY CASCADE", 234882103L),
+                Arguments.of("DROP CLASS OTHER.C CASCADE", 234882104L))
+                .flatMap(statement -> Stream.of(false, true)
+                        .map(skip -> Arguments.of(skip, statement.get()[0], statement.get()[1])));
+    }
+
+    @ParameterizedTest
+    @MethodSource("cascadeDropSettings")
+    void shouldRejectCascadingDropsBeforeFilteringEvenWhenGenericSkippingIsEnabled(boolean skipUnparseable, String sql, long objectId) throws Exception {
+        configure(Boolean.toString(skipUnparseable));
+        final var original = schema.getTables().forTable(CAPTURED);
+        final var before = offset.getOffset();
+        final Map<String, Object> drop = new HashMap<>(ddl(101, 120, sql));
+        drop.put("DATA_OBJ#", objectId);
+        run(List.of(drop, dml(102, 120, false), commit(120)));
+
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasCauseInstanceOf(CascadeDropException.class)
+                .hasMessageContaining("LSN 101", "XID 78", "DATA_OBJ# " + objectId, sql, "cascade.drop.ignore=true",
+                        "downstream data may remain", "same-name recreation", "incorrect decoding");
+        assertThat(logs.containsErrorMessage(sql)).isTrue();
+        assertThat(logs.containsErrorMessage("cascade.drop.ignore=true")).isTrue();
+        assertThat(logs.containsWarnMessage(sql)).isFalse();
+        assertThat(deliveredTables).isEmpty();
+        assertThat(schemaStatements).isEmpty();
+        assertThat(schema.getTables().forTable(CAPTURED)).isSameAs(original);
+        assertThat(recover().forTable(CAPTURED)).isEqualTo(original);
+        assertThat(offset.getOffset()).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @MethodSource("cascadeDropSettings")
+    void shouldIgnoreOnlyOptedInCascadingDropsAndResumeWithUnchangedHistory(boolean skipUnparseable, String sql, long objectId) throws Exception {
+        configure(Boolean.toString(skipUnparseable), false, true);
+        final var original = schema.getTables().forTable(CAPTURED);
+        final Map<String, Object> drop = new HashMap<>(ddl(101, 120, sql));
+        drop.put("DATA_OBJ#", objectId);
+        run(List.of(drop, dml(102, 120, false), commit(120)));
+
+        assertThat(failure.get()).isNull();
+        assertThat(deliveredTables).containsExactly(original);
+        assertThat(schemaStatements).isEmpty();
+        assertThat(recover().forTable(CAPTURED)).isEqualTo(original);
+        assertThat(offset.getCommitLsn()).isEqualTo(120L);
+        for (final var detail : List.of(sql, "cascade.drop.ignore=true", "LSN 101", "XID 78", "DATA_OBJ# " + objectId,
+                "This DDL was ignored", "historical schemas", "downstream data may remain", "same-name recreation", "incorrect decoding")) {
+            assertThat(logs.containsWarnMessage(detail)).as("warning contains %s", detail).isTrue();
+        }
+        assertThat(logs.containsErrorMessage(sql)).isFalse();
+
+        offset = new DamengOffsetContext.Loader(config).load(deliveredOffsets.get(0));
+        deliveredTables.clear();
+        logs.clear();
+        polls.set(0);
+        running.set(true);
+        run(List.of(drop, dml(102, 120, false), commit(120), dml(131, 140, false), commit(140)));
+        assertThat(failure.get()).isNull();
+        assertThat(deliveredTables).containsExactly(original);
+        assertThat(logs.containsWarnMessage(sql)).isFalse();
+        assertThat(offset.getCommitLsn()).isEqualTo(140L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "DROP USER", "DROP SCHEMA S CASCADE UNKNOWN", "DROP TYPE APP.TY CASCADE; DROP PROFILE P",
+            "DROP PROFILE P; DROP CLASS APP.C CASCADE", "DROP USER U CASCADE; ALTER TABLE APP.A ADD LOST INT",
+            "DROP DOMAIN APP.D CASCADE INSERT INTO APP.A VALUES(1)", "TRUNCATE TABLE APP.A CASCADE",
+            "ALTER TABLE APP.A DROP PARTITION P1"
+    })
+    void shouldNotUseCascadeDropOptInForMalformedCompoundOrOtherOperations(String sql) throws Exception {
+        configure("false", false, true);
+        final var before = offset.getOffset();
+        run(List.of(ddl(101, 120, sql), dml(102, 120, false), commit(120)));
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class);
+        assertThat(deliveredTables).isEmpty();
+        assertThat(schemaStatements).isEmpty();
+        assertThat(offset.getOffset()).isEqualTo(before);
+        assertThat(logs.containsWarnMessage("This DDL was ignored")).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "CREATE TABLE APP.A(ID INT)", "CREATE TABLE APP.A AS SELECT 1 AS ID FROM DUAL" })
+    void shouldKeepRejectingSameNameRecreationAfterIgnoringACascadingDrop(String sql) throws Exception {
+        configure("false", false, true);
+        final var original = schema.getTables().forTable(CAPTURED);
+        run(List.of(ddl(101, 120, "DROP SCHEMA APP CASCADE"), commit(120), ddl(131, 140, sql), commit(140)));
+        assertThat(failure.get()).isInstanceOf(RuntimeException.class).hasMessageContaining("existing", "APP.A");
+        assertThat(schema.getTables().forTable(CAPTURED)).isSameAs(original);
+        assertThat(recover().forTable(CAPTURED)).isEqualTo(original);
+        assertThat(schemaStatements).isEmpty();
+        assertThat(offset.getCommitLsn()).isEqualTo(120L);
+    }
+
+    @Test
+    void shouldNotSkipDmlErrorsAfterIgnoringACascadingDrop() throws Exception {
+        configure("false", false, true);
+        final Map<String, Object> invalid = new HashMap<>(dml(102, 120, false));
+        invalid.put("SQL_REDO", "not a valid DML statement");
+        run(List.of(ddl(101, 120, "DROP TYPE OTHER.TY CASCADE"), invalid, commit(120)));
+        assertThat(failure.get()).isInstanceOf(DmlParserException.class);
+        assertThat(deliveredTables).isEmpty();
+        assertThat(offeredHeartbeatOffsets).isEmpty();
+    }
+
+    @Test
+    void shouldContinueProcessingSupportedTableDropsWhenCascadeDropIgnoringIsEnabled() throws Exception {
+        configure("false", false, true);
+        final var sql = "DROP TABLE APP.A CASCADE CONSTRAINTS";
+        run(List.of(ddl(101, 120, sql), commit(120)));
+        assertThat(failure.get()).isNull();
+        assertThat(schemaStatements).containsExactly(sql);
+        assertThat(schema.getTables().forTable(CAPTURED)).isNull();
+        assertThat(recover().forTable(CAPTURED)).isNull();
+        assertThat(logs.containsWarnMessage("This DDL was ignored")).isFalse();
+    }
 
     static Stream<Arguments> partitionDataRemovalStatements() {
         return Stream.concat(Stream.of(
@@ -385,11 +506,16 @@ class DamengSkipUnparseableDdlTest {
     }
 
     private void configure(String setting, boolean ignorePartitionDrops) throws Exception {
+        configure(setting, ignorePartitionDrops, false);
+    }
+
+    private void configure(String setting, boolean ignorePartitionDrops, boolean ignoreCascadeDrops) throws Exception {
         final var builder = DamengConnectorConfigTest.configuration()
                 .with("log.mining.window.strategy", "fixed")
                 .with("poll.interval.ms", 1)
                 .with("table.include.list", "APP.A")
                 .with(DamengConnectorConfig.PARTITION_DROP_IGNORE, ignorePartitionDrops)
+                .with(DamengConnectorConfig.CASCADE_DROP_IGNORE, ignoreCascadeDrops)
                 .with("schema.history.internal", MemorySchemaHistory.class.getName())
                 .with("schema.history.internal.store.only.captured.tables.ddl", true);
         if (setting != null) {

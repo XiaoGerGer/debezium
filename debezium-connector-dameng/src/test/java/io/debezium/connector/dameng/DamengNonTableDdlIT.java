@@ -40,9 +40,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.CascadeDropException;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Impact;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
+import io.debezium.pipeline.spi.Offsets;
+import io.debezium.relational.CustomConverterRegistry;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
 import io.debezium.storage.file.history.FileSchemaHistory;
@@ -78,7 +82,20 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
     @BeforeAll
     static void startDatabase() throws Exception {
         assumeTrue(System.getProperty("dameng.hostname") == null, "Object lifecycle tests require a test-owned database");
-        DamengTestDatabase.start();
+        // RECYCLEBIN is static: set it before the fixture configures and restarts its own database.
+        final var parameter = "dameng.test.ini.RECYCLEBIN";
+        final var previous = System.setProperty(parameter, "1");
+        try {
+            DamengTestDatabase.start();
+        }
+        finally {
+            if (previous == null) {
+                System.clearProperty(parameter);
+            }
+            else {
+                System.setProperty(parameter, previous);
+            }
+        }
     }
 
     @AfterAll
@@ -268,6 +285,10 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
                 "DROP PROCEDURE " + procedure,
                 "CREATE FUNCTION " + function + "(A OUT IN INT) RETURN INT AS BEGIN RETURN A; END;",
                 "DROP FUNCTION " + function);
+        return executeNonTableStatements(sql, miner, online);
+    }
+
+    private SourceRecord executeNonTableStatements(List<String> sql, DamengConnection miner, boolean online) throws Exception {
         SourceRecord last = null;
         for (final var statement : sql) {
             final var attempt = attempts.addObject();
@@ -301,6 +322,271 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
             writeEvidence();
         }
         return last;
+    }
+
+    @Test
+    void shouldIgnoreRecycleBinPurgesWithoutChangingCapturedTableAcrossRestarts() throws Exception {
+        evidenceProperty = "dameng.recycle.bin.it.evidence";
+        evidenceDefault = "target/recycle-bin-it.json";
+        final var prefix = "DBZ_RB_" + UUID.randomUUID().toString().replace("-", "").substring(0, 10).toUpperCase(Locale.ROOT);
+        final var tableName = prefix + "_DATA";
+        final var indexName = prefix + "_OLD_INDEX";
+        schema = DamengTestDatabase.schema();
+        table = schema + "." + tableName;
+        jdbc = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password());
+        jdbc.setAutoCommit(true);
+        evidence.put("databaseVersion", jdbc.getMetaData().getDatabaseProductVersion());
+        evidence.put("compatibleMode", DamengTestDatabase.requestedCompatibilityMode());
+        evidence.put("validationPassed", false);
+        evidence.put("scope", "six recycle-bin purge forms; live CDC, offline replay and same-name table recreation");
+
+        try (var miner = new DamengConnection(Configuration.create()
+                .with("hostname", DamengTestDatabase.hostname()).with("port", DamengTestDatabase.port())
+                .with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build())) {
+            // Snapshot the new incarnation while the old table and its index remain in the bin.
+            final long oldObjectId = prepareRecycledTable(tableName, indexName, miner);
+            execute("CREATE TABLE " + table + "(ID INT PRIMARY KEY,LABEL VARCHAR(80))");
+            execute("INSERT INTO " + table + " VALUES(0,'snapshot')");
+            final var tableId = new TableId(null, schema, tableName);
+            final long objectId = miner.getTableObjectId(tableId);
+            assertThat(objectId).isNotEqualTo(oldObjectId);
+            evidence.put("recycledObjectId", oldObjectId);
+            evidence.put("liveObjectId", objectId);
+            config = Configuration.create()
+                    .with("topic.prefix", "dameng")
+                    .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                    .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
+                    .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
+                    .with("table.include.list", Pattern.quote(table))
+                    .with("schema.history.internal", FileSchemaHistory.class.getName())
+                    .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
+                    .with("snapshot.mode", "initial").with("poll.interval.ms", 100)
+                    .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
+            startEngine();
+            rowSchema = after(next("r", 0)).schema();
+            waitForStreamingRunning("dameng", "dameng");
+            final var history = java.nio.file.Files.readAllLines(directory.resolve("history.dat"));
+            assertThat(history).isNotEmpty();
+            final long startLsn = miner.currentLsn();
+            checkpoint(executePurgeLifecycle(prefix + "_LIVE", tableName, indexName, miner, objectId, true));
+            assertThat(java.nio.file.Files.readAllLines(directory.resolve("history.dat"))).isEqualTo(history);
+
+            final var offlineTable = prefix + "_OFFLINE";
+            final var offlineIndex = prefix + "_OFFLINE_INDEX";
+            prepareRecycledTable(offlineTable, offlineIndex, miner);
+            executePurgeLifecycle(prefix + "_STOP", offlineTable, offlineIndex, miner, objectId, false);
+            startEngine();
+            SourceRecord replayed = null;
+            for (final JsonNode attempt : attempts) {
+                if (attempt.required("phase").asText().equals("offline")) {
+                    final int id = attempt.required("markerId").asInt();
+                    replayed = next("c", id);
+                    assertMarker(replayed, id);
+                    ((ObjectNode) attempt).put("cdcMarkerVerified", true);
+                }
+            }
+            assertThat(replayed).isNotNull();
+            checkpoint(replayed);
+            assertThat(java.nio.file.Files.readAllLines(directory.resolve("history.dat"))).isEqualTo(history);
+
+            startEngine();
+            waitForStreamingRunning("dameng", "dameng");
+            execute("UPDATE " + table + " SET LABEL='after-recovery' WHERE ID=" + markerId);
+            final var update = next("u", markerId);
+            assertThat(after(update).schema()).isEqualTo(rowSchema);
+            assertThat(after(update).getString("LABEL")).isEqualTo("after-recovery");
+            assertThat(((Struct) update.value()).getStruct("before").getString("LABEL")).isEqualTo("marker-" + markerId);
+            checkpoint(update);
+            assertThat(java.nio.file.Files.readAllLines(directory.resolve("history.dat"))).isEqualTo(history);
+            assertThat(miner.getTableObjectId(tableId)).isEqualTo(objectId);
+            assertThat(miner.readTableSchema(tableId).columnWithName("LABEL").length()).isEqualTo(80);
+            try (var statement = jdbc.createStatement(); var rows = statement.executeQuery("SELECT COUNT(*) FROM " + table)) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getInt(1)).isEqualTo(13);
+            }
+            verifyRedo(miner, startLsn, miner.currentLsn(), objectId);
+            assertThat(attempts).hasSize(12);
+            for (final JsonNode attempt : attempts) {
+                assertThat(attempt.required("cdcMarkerVerified").asBoolean()).as("CDC after %s", attempt.required("sql").asText()).isTrue();
+            }
+            assertThat(failure.get()).isNull();
+            evidence.put("historyRecoveryVerified", true);
+            evidence.put("validationPassed", true);
+            writeEvidence();
+        }
+    }
+
+    @Test
+    void shouldIgnoreCascadingSchemaDropsWithStaleHistoryAcrossRestarts() throws Exception {
+        evidenceProperty = "dameng.cascade.drop.it.evidence";
+        evidenceDefault = "target/cascade-drop-it.json";
+        final var prefix = "DBZ_CD_" + UUID.randomUUID().toString().replace("-", "").substring(0, 10).toUpperCase(Locale.ROOT);
+        schema = DamengTestDatabase.schema();
+        table = schema + "." + prefix + "_MARKER";
+        final var liveSchema = prefix + "_LIVE";
+        final var offlineSchema = prefix + "_OFFLINE";
+        final var victims = List.of(new TableId(null, liveSchema, "VICTIM"), new TableId(null, offlineSchema, "VICTIM"));
+        jdbc = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password());
+        jdbc.setAutoCommit(true);
+        cleanup.add("DROP TABLE " + table);
+        execute("CREATE TABLE " + table + "(ID INT PRIMARY KEY,LABEL VARCHAR(80))");
+        execute("INSERT INTO " + table + " VALUES(0,'snapshot')");
+        for (final var victim : victims) {
+            cleanup.add("DROP SCHEMA " + victim.schema() + " RESTRICT");
+            cleanup.add("DROP TABLE " + victim);
+            execute("CREATE SCHEMA " + victim.schema() + " AUTHORIZATION " + schema);
+            execute("CREATE TABLE " + victim + "(ID INT PRIMARY KEY,LABEL VARCHAR(80))");
+        }
+        evidence.put("databaseVersion", jdbc.getMetaData().getDatabaseProductVersion());
+        evidence.put("compatibleMode", DamengTestDatabase.requestedCompatibilityMode());
+        evidence.put("validationPassed", false);
+        evidence.put("scope", "captured dependent tables removed by live/offline DROP SCHEMA CASCADE; unchanged persisted history and restart with opt-in disabled");
+        config = Configuration.create()
+                .with("topic.prefix", "dameng")
+                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
+                .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
+                .with("table.include.list", Pattern.quote(table) + "," + Pattern.quote(victims.get(0).toString()) + "," + Pattern.quote(victims.get(1).toString()))
+                .with("schema.history.internal", FileSchemaHistory.class.getName())
+                .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
+                .with(DamengConnectorConfig.CASCADE_DROP_IGNORE, true)
+                .with("snapshot.mode", "initial").with("poll.interval.ms", 100)
+                .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
+        startEngine();
+        final var snapshot = next("r", 0);
+        rowSchema = after(snapshot).schema();
+        waitForStreamingRunning("dameng", "dameng");
+        execute("INSERT INTO " + table + " VALUES(" + (++markerId) + ",'marker-" + markerId + "')");
+        final var baseline = next("c", markerId);
+        checkpoint(baseline);
+        // Recover only while the engine is stopped so its schema-history metrics are unregistered.
+        final var before = recoverTables(baseline);
+        for (final var victim : victims) {
+            assertThat(before.forTable(victim)).as("empty dependent table was captured in the baseline").isNotNull();
+        }
+        final var history = java.nio.file.Files.readAllLines(directory.resolve("history.dat"));
+        try (var miner = new DamengConnection(Configuration.create()
+                .with("hostname", DamengTestDatabase.hostname()).with("port", DamengTestDatabase.port())
+                .with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build())) {
+            startEngine();
+            waitForStreamingRunning("dameng", "dameng");
+            final long start = miner.currentLsn();
+            checkpoint(executeNonTableStatements(List.of("DROP SCHEMA " + liveSchema + " CASCADE"), miner, true));
+            assertThat(java.nio.file.Files.readAllLines(directory.resolve("history.dat"))).isEqualTo(history);
+            executeNonTableStatements(List.of("DROP SCHEMA " + offlineSchema + " CASCADE"), miner, false);
+            startEngine();
+            final var replayed = next("c", markerId);
+            assertMarker(replayed, markerId);
+            ((ObjectNode) attempts.get(1)).put("cdcMarkerVerified", true);
+            checkpoint(replayed);
+            final var recovered = recoverTables(replayed);
+            for (final var victim : victims) {
+                assertThat(miner.getAllTableIds(null)).doesNotContain(victim);
+                assertThat(recovered.forTable(victim)).as("ignored cascade deliberately retains the stale historical definition")
+                        .isEqualTo(before.forTable(victim));
+            }
+            assertThat(java.nio.file.Files.readAllLines(directory.resolve("history.dat"))).isEqualTo(history);
+
+            // Acknowledged cascades do not replay or repair themselves when the opt-in is disabled.
+            config = config.edit().with(DamengConnectorConfig.CASCADE_DROP_IGNORE, false).build();
+            startEngine();
+            waitForStreamingRunning("dameng", "dameng");
+            execute("UPDATE " + table + " SET LABEL='after-cascade-recovery' WHERE ID=" + markerId);
+            final var update = next("u", markerId);
+            assertThat(after(update).schema()).isEqualTo(rowSchema);
+            assertThat(after(update).getString("LABEL")).isEqualTo("after-cascade-recovery");
+            assertThat(((Struct) update.value()).getStruct("before").getString("LABEL")).isEqualTo("marker-" + markerId);
+            checkpoint(update);
+            assertThat(java.nio.file.Files.readAllLines(directory.resolve("history.dat"))).isEqualTo(history);
+
+            final long end = miner.currentLsn();
+            Awaitility.await("cascade DDL archived").atMost(Duration.ofSeconds(90)).pollInterval(Duration.ofMillis(200))
+                    .until(() -> miner.latestArchivedLsn() >= end);
+            miner.startLogMining(start, end, false);
+            try {
+                final List<String> observed = miner.queryAndMap("SELECT SQL_REDO FROM V$LOGMNR_CONTENTS WHERE SCN > " + start
+                        + " AND SCN <= " + end + " AND OPERATION_CODE=5 ORDER BY SCN", rows -> {
+                            final List<String> result = new ArrayList<>();
+                            while (rows.next()) {
+                                final var sql = rows.getString(1);
+                                assertThatThrownBy(() -> miner.createDdlParser().analyze(sql, schema)).isInstanceOf(CascadeDropException.class);
+                                result.add(sql);
+                            }
+                            return result;
+                        });
+                assertThat(observed).containsExactly("DROP SCHEMA " + liveSchema + " CASCADE", "DROP SCHEMA " + offlineSchema + " CASCADE");
+                final var redo = evidence.putArray("ddlRedo");
+                observed.forEach(redo::add);
+            }
+            finally {
+                miner.endLogMining();
+            }
+        }
+        assertThat(failure.get()).isNull();
+        evidence.put("staleHistoryVerified", true);
+        evidence.put("restartWithOptInDisabledVerified", true);
+        evidence.put("validationPassed", true);
+        writeEvidence();
+    }
+
+    private Tables recoverTables(SourceRecord record) throws Exception {
+        final var connectorConfig = new DamengConnectorConfig(config);
+        try (var recovered = new DamengDatabaseSchema(connectorConfig, new DamengValueConverters(connectorConfig), connectorConfig.schemaNameAdjuster(),
+                connectorConfig.getTopicNamingStrategy(CommonConnectorConfig.TOPIC_NAMING_STRATEGY), new CustomConverterRegistry(List.of()),
+                new DamengTaskContext(config, connectorConfig))) {
+            recovered.recover(Offsets.of(new DamengPartition(connectorConfig.getLogicalName()),
+                    new DamengOffsetContext.Loader(connectorConfig).load(record.sourceOffset())));
+            return recovered.getTables().clone();
+        }
+    }
+
+    private long prepareRecycledTable(String name, String indexName, DamengConnection miner) throws Exception {
+        final var qualified = schema + "." + name;
+        cleanup.add("DROP TABLE " + qualified);
+        execute("CREATE TABLE " + qualified + "(ID INT,LABEL VARCHAR(30)) TABLESPACE MAIN");
+        final long objectId = miner.getTableObjectId(new TableId(null, schema, name));
+        if (indexName != null) {
+            execute("CREATE INDEX " + schema + "." + indexName + " ON " + qualified + "(LABEL)");
+        }
+        execute("DROP TABLE " + qualified);
+        assertThat(recycledObjects(name, "TABLE")).isEqualTo(1);
+        if (indexName != null) {
+            assertThat(recycledObjects(indexName, "INDEX")).isEqualTo(1);
+        }
+        return objectId;
+    }
+
+    private SourceRecord executePurgeLifecycle(String prefix, String recycledTable, String recycledIndex, DamengConnection miner,
+                                               long objectId, boolean online)
+            throws Exception {
+        final List<String> commands = List.of(
+                "PURGE INDEX " + schema + "." + recycledIndex,
+                "PURGE TABLE " + schema + "." + recycledTable,
+                "PURGE RECYCLEBIN", "PURGE DBA_RECYCLEBIN",
+                "PURGE TABLESPACE MAIN", "PURGE TABLESPACE MAIN USER " + DamengTestDatabase.user());
+        final var tableId = TableId.parse(table, false);
+        SourceRecord last = null;
+        for (int position = 0; position < commands.size(); position++) {
+            final var purgedName = position == 0 ? recycledIndex : position == 1 ? recycledTable : prefix + "_BIN_" + position;
+            if (position >= 2) {
+                prepareRecycledTable(purgedName, null, miner);
+            }
+            last = executeNonTableStatements(List.of(commands.get(position)), miner, online);
+            assertThat(recycledObjects(purgedName, position == 0 ? "INDEX" : "TABLE")).isZero();
+            assertThat(miner.getTableObjectId(tableId)).isEqualTo(objectId);
+        }
+        return last;
+    }
+
+    private long recycledObjects(String name, String type) throws SQLException {
+        try (var statement = jdbc.prepareStatement("SELECT COUNT(*) FROM USER_RECYCLEBIN WHERE ORIGINAL_NAME=? AND TYPE=?")) {
+            statement.setString(1, name);
+            statement.setString(2, type);
+            try (var rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                return rows.getLong(1);
+            }
+        }
     }
 
     @Test
@@ -468,7 +754,8 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
             assertThat(rows.next()).isFalse();
         }
         evidence.put("tableDataPreservedAfterRejectedDrop", true);
-        execute("DROP TABLE " + referenced);
+        // The recycle-bin fixture must remove the physical object before the tablespace is empty.
+        execute("DROP TABLE " + referenced + " PURGE");
         execute("DROP TABLESPACE " + tablespace);
         evidence.put("emptyTablespaceDropAccepted", true);
         evidence.put("validationPassed", true);

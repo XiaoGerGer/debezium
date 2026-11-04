@@ -15,9 +15,11 @@ import java.sql.DriverManager;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -29,6 +31,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.Configuration;
@@ -149,6 +153,139 @@ class DamengDdlExtensionsIT extends AbstractAsyncEngineConnectorTest {
             assertThat(envelope.getString("op")).isEqualTo("d");
             assertThat(envelope.getStruct("before").getString("V")).isEqualTo("updated");
         }
+    }
+
+    @ParameterizedTest
+    @MethodSource("complexCtasQueries")
+    void shouldCaptureComplexCtasFromOnlineTargetAfterExcludedSourcesAreDropped(String query, String expectedValue) throws Exception {
+        final var first = create("_SOURCE_A", "(ID INT PRIMARY KEY,V VARCHAR(30) NOT NULL)");
+        final var second = create("_SOURCE_B", "(ID INT PRIMARY KEY,V VARCHAR(30) NOT NULL)");
+        execute("INSERT INTO " + first + " VALUES(1,'left')");
+        execute("INSERT INTO " + second + " VALUES(1,'left')");
+        final var control = create("_CONTROL", "(ID INT PRIMARY KEY)");
+        execute("INSERT INTO " + control + " VALUES(0)");
+        config = config.edit().with("table.include.list", "SYSDBA\\." + prefix + "_(CONTROL|CTAS)").build();
+        startEngine();
+        final var baseline = next();
+        waitForStreamingRunning("dameng", "dameng");
+        checkpoint(baseline);
+
+        final var target = create("_CTAS", "AS " + query.replace("SOURCE_A", first).replace("SOURCE_B", second));
+        execute("DROP TABLE " + first);
+        created.remove(first);
+        execute("DROP TABLE " + second);
+        created.remove(second);
+        startEngine();
+        final var copied = next();
+        assertThat(copied.topic()).isEqualTo("dameng." + target);
+        assertThat(copied.key()).isNull();
+        final var envelope = (Struct) copied.value();
+        assertThat(envelope.getString("op")).isEqualTo("c");
+        final var after = envelope.getStruct("after");
+        assertThat(after.schema().fields()).extracting(org.apache.kafka.connect.data.Field::name).containsExactly("ID", "V");
+        assertThat(after.getInt32("ID")).isOne();
+        assertThat(after.getString("V")).isEqualTo(expectedValue);
+
+        execute("INSERT INTO " + target + " VALUES(2,'inserted')");
+        assertThat(((Struct) next().value()).getStruct("after").getString("V")).isEqualTo("inserted");
+        execute("UPDATE " + target + " SET V='updated' WHERE ID=2");
+        final var updated = (Struct) next().value();
+        assertThat(updated.getString("op")).isEqualTo("u");
+        assertThat(updated.getStruct("before").getString("V")).isEqualTo("inserted");
+        assertThat(updated.getStruct("after").getString("V")).isEqualTo("updated");
+        execute("DELETE FROM " + target + " WHERE ID=2");
+        final var deleted = (Struct) next().value();
+        assertThat(deleted.getString("op")).isEqualTo("d");
+        assertThat(deleted.getStruct("before").getString("V")).isEqualTo("updated");
+    }
+
+    static Stream<Arguments> complexCtasQueries() {
+        return Stream.of(
+                Arguments.of("SELECT 1 AS ID,CAST('left' AS VARCHAR(30)) AS V FROM DUAL", "left"),
+                Arguments.of("SELECT A.ID,B.V FROM SOURCE_A A JOIN SOURCE_B B ON A.ID=B.ID", "left"),
+                Arguments.of("SELECT A.ID,B.V FROM SOURCE_A A LEFT JOIN SOURCE_B B ON A.ID=B.ID", "left"),
+                Arguments.of("SELECT ID,V FROM SOURCE_A UNION SELECT ID,V FROM SOURCE_B", "left"),
+                Arguments.of("SELECT ID,V FROM SOURCE_A UNION ALL SELECT ID,V FROM SOURCE_B WHERE ID<0", "left"),
+                Arguments.of("WITH Q AS (SELECT ID,V FROM SOURCE_A) SELECT ID,V FROM Q", "left"),
+                Arguments.of("SELECT X.ID,X.V FROM (SELECT ID,V FROM SOURCE_A) X", "left"),
+                Arguments.of("SELECT A.ID,(SELECT MAX(B.V) FROM SOURCE_B B) AS V FROM SOURCE_A A", "left"),
+                Arguments.of("SELECT MIN(ID) AS ID,MAX(V) AS V FROM SOURCE_A", "left"),
+                Arguments.of("SELECT ID,CAST(ROW_NUMBER() OVER(ORDER BY ID) AS VARCHAR(30)) AS V FROM SOURCE_A", "1"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "drop", "rename", "recreate" })
+    void shouldFailWhenPendingCtasHasNoMatchingOnlineTarget(String action) throws Exception {
+        final var control = create("_CONTROL", "(ID INT PRIMARY KEY)");
+        execute("INSERT INTO " + control + " VALUES(0)");
+        startEngine();
+        final var baseline = next();
+        waitForStreamingRunning("dameng", "dameng");
+        checkpoint(baseline);
+        final var target = create("_CTAS", "AS SELECT 1 AS ID FROM DUAL");
+        if (action.equals("rename")) {
+            final var renamed = prefix + "_RENAMED";
+            execute("ALTER TABLE " + target + " RENAME TO " + renamed);
+            created.remove(target);
+            created.add("SYSDBA." + renamed);
+        }
+        else {
+            execute("DROP TABLE " + target);
+            if (action.equals("recreate")) {
+                execute("CREATE TABLE " + target + "(OTHER_VALUE VARCHAR(7))");
+            }
+            else {
+                created.remove(target);
+            }
+        }
+        execute("INSERT INTO " + control + " VALUES(1)");
+        startEngine();
+        Awaitility.await("CTAS must fail before consuming its data or later control rows")
+                .atMost(Duration.ofSeconds(30)).until(() -> failure.get() != null);
+        assertThat(failure.get()).hasStackTraceContaining("Cannot resolve CTAS schema")
+                .hasStackTraceContaining(target).hasStackTraceContaining("online dictionary")
+                .hasStackTraceContaining("redo object ID=").hasStackTraceContaining("online object ID=")
+                .hasStackTraceContaining("redo is still pending");
+        assertThat(waitForAvailableRecords(1, TimeUnit.SECONDS)).isFalse();
+    }
+
+    @Test
+    void shouldRecoverCtasHistoryAndReplayLaterAlterWithoutReadingAhead() throws Exception {
+        final var control = create("_CONTROL", "(ID INT PRIMARY KEY)");
+        execute("INSERT INTO " + control + " VALUES(0)");
+        startEngine();
+        next();
+        waitForStreamingRunning("dameng", "dameng");
+        final var target = create("_CTAS", "AS SELECT 1 AS ID,CAST('initial' AS VARCHAR(30)) AS V FROM DUAL");
+        final var copied = next();
+        assertThat(((Struct) copied.value()).getStruct("after").schema().fields()).hasSize(2);
+        checkpoint(copied);
+
+        execute("INSERT INTO " + target + " VALUES(2,'old')");
+        execute("ALTER TABLE " + target + " ADD EXTRA INT DEFAULT 7");
+        execute("INSERT INTO " + target + " VALUES(3,'new',8)");
+        startEngine();
+        final var old = ((Struct) next().value()).getStruct("after");
+        assertThat(old.getInt32("ID")).isEqualTo(2);
+        assertThat(old.schema().field("EXTRA")).isNull();
+        final var currentRecord = next();
+        final var current = ((Struct) currentRecord.value()).getStruct("after");
+        assertThat(current.getInt32("ID")).isEqualTo(3);
+        assertThat(current.getInt32("EXTRA")).isEqualTo(8);
+        checkpoint(currentRecord);
+        startEngine();
+        waitForStreamingRunning("dameng", "dameng");
+        execute("UPDATE " + target + " SET V='recovered' WHERE ID=3");
+        final var recovered = (Struct) next().value();
+        assertThat(recovered.getString("op")).isEqualTo("u");
+        assertThat(recovered.getStruct("after").schema()).isEqualTo(current.schema());
+        assertThat(recovered.getStruct("after").getString("V")).isEqualTo("recovered");
+    }
+
+    private void checkpoint(SourceRecord record) throws Exception {
+        stopConnector();
+        storeOffsets(config, Map.of(record.sourcePartition(), record.sourceOffset()));
+        consumedLines.clear();
     }
 
     @ParameterizedTest

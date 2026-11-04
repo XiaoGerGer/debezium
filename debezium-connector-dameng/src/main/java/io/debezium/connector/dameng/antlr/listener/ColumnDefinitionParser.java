@@ -134,6 +134,9 @@ public final class ColumnDefinitionParser {
             else if (attribute.columnConstraint() != null) {
                 primaryKey |= columnConstraint(table, column, attribute.columnConstraint());
             }
+            else if (attribute.ENCRYPT() != null) {
+                // Bare ENCRYPT uses transparent storage encryption without changing the logical column definition.
+            }
             else {
                 throw error(attribute, "Unsupported column clause");
             }

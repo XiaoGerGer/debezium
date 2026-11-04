@@ -50,12 +50,12 @@ class DamengAntlrDdlParserTest {
         assertThat(tables.tableIds()).isEmpty();
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = { "CREATE TABLE APP.COPY LIKE APP.TMP", "CREATE TABLE APP.COPY AS SELECT * FROM APP.TMP" })
-    void shouldNotDeriveOrdinaryColumnsFromATemporaryMarker(String sql) {
+    @Test
+    void shouldNotDeriveLikeColumnsFromATemporaryMarker() {
         final var id = new TableId(null, "APP", "TMP");
         tables.overwriteTable(DamengTableType.temporaryTable(id, 71));
-        assertThatThrownBy(() -> parser.parse(sql, tables, "APP")).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("temporary");
+        assertThatThrownBy(() -> parser.parse("CREATE TABLE APP.COPY LIKE APP.TMP", tables, "APP"))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("temporary");
         assertThat(tables.tableIds()).containsExactly(id);
         assertThat(DamengTableType.isTemporary(tables.forTable(id))).isTrue();
     }
@@ -77,7 +77,6 @@ class DamengAntlrDdlParserTest {
     @ParameterizedTest
     @ValueSource(strings = {
             "CREATE TABLE APP.COPY LIKE APP.EXT",
-            "CREATE TABLE APP.COPY AS SELECT * FROM APP.EXT",
             "ALTER TABLE APP.EXT ADD LOST INT",
             "TRUNCATE TABLE APP.EXT"
     })
@@ -123,25 +122,25 @@ class DamengAntlrDdlParserTest {
     }
 
     @Test
-    void shouldBuildCtasFromTheSourceDefinitionAtItsStatementPosition() {
+    void shouldBuildLikeCopiesFromTheSourceDefinitionAtTheirStatementPositions() {
         parser.parse("CREATE TABLE APP.S(ID INT IDENTITY(1,1) PRIMARY KEY, V VARCHAR(20) DEFAULT 'old' NOT NULL COMMENT 'source')", tables, "APP");
         final var sourceId = new TableId(null, "APP", "S");
         final var source = tables.forTable(sourceId);
         tables.overwriteTable(source.edit().addAttributes(source.attributes())
                 .addAttribute(Attribute.editor().name("dameng.object.id").value("202").create()).create());
 
-        final var changes = parser.parse("CREATE TABLE APP.SNAPSHOT AS SELECT A.ID AS KEY_ID, CAST(A.V AS VARCHAR(40)) AS LABEL FROM APP.S A WHERE A.ID > 0;"
+        final var changes = parser.parse("CREATE TABLE APP.SNAPSHOT LIKE APP.S;"
                 + "ALTER TABLE APP.S MODIFY V VARCHAR(90); CREATE TABLE APP.LATER LIKE APP.S", tables, "APP");
 
         final var snapshot = tables.forTable(null, "APP", "SNAPSHOT");
         final var later = tables.forTable(null, "APP", "LATER");
         assertThat(changes).extracting(DamengDdlParser.SchemaChange::type)
                 .containsExactly(DamengDdlParser.Type.CREATE, DamengDdlParser.Type.ALTER, DamengDdlParser.Type.CREATE);
-        assertThat(snapshot.retrieveColumnNames()).containsExactly("KEY_ID", "LABEL");
-        assertThat(snapshot.columnWithName("LABEL").length()).isEqualTo(40);
-        assertThat(snapshot.columnWithName("LABEL").isOptional()).isTrue();
-        assertThat(snapshot.columnWithName("KEY_ID").isOptional()).isFalse();
-        assertThat(snapshot.columnWithName("KEY_ID").isAutoIncremented()).isFalse();
+        assertThat(snapshot.retrieveColumnNames()).containsExactly("ID", "V");
+        assertThat(snapshot.columnWithName("V").length()).isEqualTo(20);
+        assertThat(snapshot.columnWithName("V").isOptional()).isFalse();
+        assertThat(snapshot.columnWithName("ID").isOptional()).isFalse();
+        assertThat(snapshot.columnWithName("ID").isAutoIncremented()).isFalse();
         assertThat(later.columnWithName("V").length()).isEqualTo(90);
         for (var copied : List.of(snapshot, later)) {
             assertThat(copied.primaryKeyColumnNames()).isEmpty();
@@ -156,15 +155,14 @@ class DamengAntlrDdlParserTest {
         assertThat(source.columnWithName("V").length()).isEqualTo(20);
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = { "LIKE S", "AS SELECT ID FROM S" })
-    void shouldResolveUnqualifiedCopySourcesInTheSessionSchema(String definition) {
+    @Test
+    void shouldResolveUnqualifiedLikeSourcesInTheSessionSchema() {
         parser.parse("CREATE TABLE APP.S(ID INT); CREATE TABLE OTHER.S(ID BIGINT)", tables, "APP");
-        final var analysis = parser.analyze("CREATE TABLE OTHER.PLANNED " + definition, "APP");
+        final var analysis = parser.analyze("CREATE TABLE OTHER.PLANNED LIKE S", "APP");
 
         final var plan = parser.plan(analysis, tables);
 
-        parser.parse("CREATE TABLE OTHER.COPY " + definition, tables, "APP");
+        parser.parse("CREATE TABLE OTHER.COPY LIKE S", tables, "APP");
 
         assertThat(plan).singleElement().satisfies(change -> {
             assertThat(change.tableId()).isEqualTo(new TableId(null, "OTHER", "PLANNED"));

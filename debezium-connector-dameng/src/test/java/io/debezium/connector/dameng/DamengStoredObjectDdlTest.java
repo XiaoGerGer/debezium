@@ -194,9 +194,9 @@ class DamengStoredObjectDdlTest {
     void shouldKeepProgramKeywordsAvailableAsExistingExpressionNames() {
         final var tables = new Tables();
 
-        parser.parse("CREATE TABLE APP.T(C INT, NAME INT, SELF INT);"
-                + "CREATE TABLE APP.U AS SELECT C,NAME,SELF FROM APP.T", tables, "APP");
-
-        assertThat(tables.forTable(null, "APP", "U").retrieveColumnNames()).containsExactly("C", "NAME", "SELF");
+        parser.parse("CREATE TABLE APP.T(C INT, NAME INT, SELF INT)", tables, "APP");
+        final var analysis = new DamengDdlStatementAnalyzer().analyze("CREATE TABLE APP.U AS SELECT C,NAME,SELF FROM APP.T", "APP").requireSupported();
+        assertThat(analysis.isCtas()).isTrue();
+        assertThat(analysis.tableId()).isEqualTo(new io.debezium.relational.TableId(null, "APP", "U"));
     }
 }

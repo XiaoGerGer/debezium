@@ -8,14 +8,18 @@ package io.debezium.connector.dameng;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.ArrayList;
@@ -70,6 +74,9 @@ class DamengStreamingFilterBoundaryTest {
     private DamengStreamingChangeEventSource source;
     private ChangeEventSourceContext context;
     private ResultSet rows;
+    private DamengConnection connection;
+    private MainConnectionProvidingConnectionFactory<DamengConnection> factory;
+    private EventDispatcher<DamengPartition, TableId> dispatcher;
 
     @BeforeEach
     @SuppressWarnings("unchecked")
@@ -83,14 +90,14 @@ class DamengStreamingFilterBoundaryTest {
         schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, offset, "DAMENG", table));
         context = mock(ChangeEventSourceContext.class);
         when(context.isRunning()).thenAnswer(invocation -> running.get());
-        final var connection = mock(DamengConnection.class);
+        connection = mock(DamengConnection.class);
         when(connection.createDdlParser()).thenReturn(new DamengDdlParser(StandardCharsets.UTF_8, false, false, false));
         final var jdbc = mock(Connection.class);
         final var statement = mock(PreparedStatement.class);
         rows = mock(ResultSet.class);
         when(connection.connection()).thenReturn(jdbc);
         when(connection.logMinerContentsQuery(false)).thenReturn("mine");
-        when(connection.readTablePreparedStatement(config, "mine", OptionalLong.empty())).thenReturn(statement);
+        when(connection.readTablePreparedStatement(any(DamengConnectorConfig.class), eq("mine"), eq(OptionalLong.empty()))).thenReturn(statement);
         when(statement.executeQuery()).thenReturn(rows);
         final var polls = new AtomicInteger();
         when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
@@ -99,9 +106,9 @@ class DamengStreamingFilterBoundaryTest {
             }
             return 150L;
         });
-        final MainConnectionProvidingConnectionFactory<DamengConnection> factory = mock(MainConnectionProvidingConnectionFactory.class);
+        factory = mock(MainConnectionProvidingConnectionFactory.class);
         when(factory.mainConnection()).thenReturn(connection);
-        final EventDispatcher<DamengPartition, TableId> dispatcher = mock(EventDispatcher.class);
+        dispatcher = mock(EventDispatcher.class);
         doAnswer(invocation -> {
             delivered.add(invocation.getArgument(1));
             return true;
@@ -400,6 +407,108 @@ class DamengStreamingFilterBoundaryTest {
         assertThat(delivered).containsExactly(INCLUDED, INCLUDED);
         assertThat(recover().forTable(INCLUDED).retrieveColumnNames()).containsExactly("ID", "LABEL");
         assertThat(recover().forTable(INCLUDED).attributeWithName("dameng.object.id").asLong()).isEqualTo(9L);
+    }
+
+    @Test
+    void shouldPersistOnlineCtasStructureAndDecodeItsPhysicalColumns() throws Exception {
+        schema.applySchemaChange(SchemaChangeEvent.ofDrop(partition, offset, "DAMENG", INCLUDED.schema(),
+                "DROP TABLE APP.A", schema.getTables().forTable(INCLUDED)));
+        final var online = Table.editor().tableId(INCLUDED)
+                .addColumn(Column.editor().name("ID").position(1).jdbcType(Types.INTEGER).type("INT").optional(true).create())
+                .addColumn(Column.editor().name("LABEL").position(2).jdbcType(Types.VARCHAR).type("VARCHAR").length(30).create()).create();
+        when(connection.getTableObjectId(INCLUDED)).thenReturn(9L);
+        when(connection.readTableSchema(INCLUDED)).thenReturn(online);
+        final Map<String, Object> create = new HashMap<>(ddl(101,
+                "CREATE TABLE APP.A AS SELECT X.ID,ROW_NUMBER() OVER(ORDER BY X.ID) AS LABEL FROM APP.UNKNOWN_SOURCE X"));
+        create.put("DATA_OBJ#", 9L);
+        final Map<String, Object> insert = new HashMap<>(dml(102));
+        insert.put("DATA_OBJ#", 9L);
+        insert.put("SQL_REDO", "INSERT INTO \"150\".\"OBJ# 9\"(\"COL 1\",\"COL 2\") VALUES(1,'value')");
+
+        run(List.of(create, insert, commit()));
+
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(publishedSchemas).containsExactly(INCLUDED);
+        final var restored = recover().forTable(INCLUDED);
+        assertThat(restored.columns()).containsExactlyElementsOf(online.columns());
+        assertThat(restored.primaryKeyColumnNames()).isEmpty();
+        assertThat(restored.attributeWithName("dameng.object.id").asLong()).isEqualTo(9L);
+        verify(connection).readTableSchema(INCLUDED);
+    }
+
+    @Test
+    void shouldSkipExcludedCtasAndItsDmlWithoutReadingTheOnlineDictionary() throws Exception {
+        final Map<String, Object> create = new HashMap<>(ddl(101,
+                "CREATE TABLE APP.B AS SELECT ROW_NUMBER() OVER(ORDER BY ID) AS RN FROM APP.MISSING_SOURCE"));
+        create.put("DATA_OBJ#", 99L);
+        final Map<String, Object> excludedInsert = new HashMap<>(dml(102));
+        excludedInsert.put("DATA_OBJ#", 99L);
+        run(List.of(create, excludedInsert, dml(103), commit()));
+
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(publishedSchemas).isEmpty();
+        assertThat(recover().forTable(EXCLUDED)).isNull();
+        assertThat(offset.getCommitLsn()).isEqualTo(120L);
+        verify(connection, never()).getTableObjectId(any());
+        verify(connection, never()).readTableSchema(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "missing", "mismatch", "changed", "queryFailure" })
+    void shouldFailUnresolvableCtasWithoutAdvancingItsOffsetOrChangingHistory(String reason) throws Exception {
+        schema.applySchemaChange(SchemaChangeEvent.ofDrop(partition, offset, "DAMENG", INCLUDED.schema(),
+                "DROP TABLE APP.A", schema.getTables().forTable(INCLUDED)));
+        offset.validateDatabaseMagic(0);
+        final var before = offset.getOffset();
+        when(connection.getTableObjectId(INCLUDED)).thenReturn(7L);
+        when(connection.readTableSchema(INCLUDED)).thenReturn(Table.editor().tableId(INCLUDED)
+                .addColumn(Column.editor().name("ID").position(1).jdbcType(Types.INTEGER).type("INT").create()).create());
+        switch (reason) {
+            case "missing" -> when(connection.getTableObjectId(INCLUDED)).thenThrow(new SQLException("No Dameng table object exists for APP.A"));
+            case "mismatch" -> when(connection.getTableObjectId(INCLUDED)).thenReturn(8L);
+            case "changed" -> when(connection.getTableObjectId(INCLUDED)).thenReturn(7L, 8L);
+            case "queryFailure" -> when(connection.readTableSchema(INCLUDED)).thenThrow(new SQLException("Metadata permission denied"));
+            default -> throw new AssertionError(reason);
+        }
+        // Metadata resolution failures must still fail with the syntax-error escape hatch enabled.
+        final var skipConfig = new DamengConnectorConfig(config.getConfig().edit()
+                .with("schema.history.internal.skip.unparseable.ddl", true).build());
+        final var handler = mock(ErrorHandler.class);
+        doAnswer(invocation -> {
+            failure.set(invocation.getArgument(0));
+            return null;
+        }).when(handler).setProducerThrowable(any());
+        source = new DamengStreamingChangeEventSource(skipConfig, factory, dispatcher, handler, Clock.SYSTEM, schema,
+                mock(DamengStreamingChangeEventSourceMetrics.class));
+
+        run(List.of(ddl(101, "CREATE TABLE APP.A AS SELECT 1 AS ID FROM DUAL"), dml(102), commit()));
+
+        assertThat(failure.get()).isInstanceOf(IllegalStateException.class)
+                .hasMessageContainingAll("CTAS", "APP.A", "LSN 101", "online dictionary", "redo object ID=7", "online object ID=",
+                        "dropped, renamed, or recreated", "redo is still pending");
+        if (reason.equals("mismatch") || reason.equals("changed")) {
+            assertThat(failure.get()).hasMessageContaining("online object ID=8");
+        }
+        assertThat(offset.getOffset()).isEqualTo(before);
+        assertThat(schema.getTables().forTable(INCLUDED)).isNull();
+        assertThat(recover().forTable(INCLUDED)).isNull();
+        assertThat(delivered).isEmpty();
+        assertThat(publishedSchemas).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "; ALTER TABLE APP.A ADD LOST INT", " ALTER TABLE APP.A ADD LOST INT" })
+    void shouldRejectCompoundCtasBeforeExcludedTableFiltering(String suffix) throws Exception {
+        offset.validateDatabaseMagic(0);
+        final var before = offset.getOffset();
+        run(List.of(ddl(101, "CREATE TABLE APP.B AS SELECT 1 AS ID FROM DUAL" + suffix), dml(102), commit()));
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class);
+        assertThat(offset.getOffset()).isEqualTo(before);
+        assertThat(recover().forTable(INCLUDED).retrieveColumnNames()).containsExactly("ID");
+        assertThat(delivered).isEmpty();
+        verify(connection, never()).readTableSchema(any());
     }
 
     private Tables recover() throws Exception {

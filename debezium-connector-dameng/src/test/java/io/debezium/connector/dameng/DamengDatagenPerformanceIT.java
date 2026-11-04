@@ -31,6 +31,8 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
 import java.util.zip.ZipInputStream;
 
 import javax.management.Attribute;
@@ -68,6 +70,33 @@ import jdk.management.jfr.FlightRecorderMXBean;
  */
 @EnabledIf("enabled")
 class DamengDatagenPerformanceIT {
+    private boolean archiveBenchmark;
+    private long[] arrivalTimes;
+    private final List<String> deliveredTransactions = new ArrayList<>();
+    private final List<Integer> transactionStarts = new ArrayList<>();
+    private final List<Integer> transactionSizes = new ArrayList<>();
+    private String lastTransaction;
+    private int currentTransactionSize;
+    private long expectedKafkaOffset;
+    private long maximumConsumerLag;
+    private final StringBuilder archives = new StringBuilder("elapsed_ms,path,arch_lsn,clsn,len,free\n");
+    private final Map<String, String> archiveStates = new HashMap<>();
+
+    void runArchiveSizeBenchmark() throws Exception {
+        archiveBenchmark = true;
+        temporaryDirectory = Files.createTempDirectory("dameng-archive-benchmark-");
+        try {
+            shouldMeasureBoundedWideTableWorkloadThroughKafka();
+        }
+        finally {
+            try (var files = Files.walk(temporaryDirectory)) {
+                for (var file : files.sorted(java.util.Comparator.reverseOrder()).toList()) {
+                    Files.deleteIfExists(file);
+                }
+            }
+        }
+    }
+
     static boolean enabled() {
         return Boolean.getBoolean("dameng.perf.enabled") || System.getProperty("dameng.perf.datagen.jar") != null;
     }
@@ -126,10 +155,13 @@ class DamengDatagenPerformanceIT {
         final int large = Integer.getInteger("dameng.perf.large.size", 10_000);
         final int small = Integer.getInteger("dameng.perf.small.size", 100);
         final int interval = Integer.getInteger("dameng.perf.interval.ms", 7_000);
-        final long expected = (large + 9L * small) * cycles;
-        assertThat(cycles).isBetween(1, 10);
+        final long expected = archiveBenchmark ? Long.getLong("dameng.archive.benchmark.operations", 1_000_000L) : (large + 9L * small) * cycles;
+        assertThat(cycles).isBetween(1, archiveBenchmark ? 100_000 : 10);
         assertThat(initialRows).isBetween(1_000, 20_000);
-        assertThat(expected).isBetween(1L, 110_000L);
+        assertThat(expected).isBetween(1L, archiveBenchmark ? 3_000_000L : 110_000L);
+        if (archiveBenchmark) {
+            arrivalTimes = new long[Math.toIntExact(expected)];
+        }
         assertThat(interval).isBetween(0, 30_000);
         Files.createDirectories(directory);
         initialFree = Files.getFileStore(disk).getUsableSpace();
@@ -188,8 +220,16 @@ class DamengDatagenPerformanceIT {
                         long lastSample = 0;
                         long generationFinished = 0;
                         while (System.nanoTime() < deadline && (generator.isAlive() || received < expected)) {
-                            for (var record : consumer.poll(Duration.ofMillis(100))) {
+                            final var records = consumer.poll(Duration.ofMillis(100));
+                            final long arrived = System.currentTimeMillis();
+                            for (var record : records) {
+                                if (archiveBenchmark) {
+                                    assertThat(record.offset()).as("Kafka offsets must be contiguous").isEqualTo(expectedKafkaOffset++);
+                                }
                                 verifyChange(JSON.readTree(record.value()));
+                                if (archiveBenchmark) {
+                                    arrivalTimes[Math.toIntExact(received - 1)] = arrived;
+                                }
                                 serializedValueBytes += record.serializedValueSize();
                                 maximumSerializedValueBytes = Math.max(maximumSerializedValueBytes, record.serializedValueSize());
                             }
@@ -217,6 +257,9 @@ class DamengDatagenPerformanceIT {
                         assertThat(generator.exitValue()).isZero();
                         assertThat(counts).containsEntry("c", expected * 7 / 100).containsEntry("u", expected * 90 / 100)
                                 .containsEntry("d", expected * 3 / 100).hasSize(3);
+                        if (archiveBenchmark) {
+                            finishLatency();
+                        }
                         final Map<String, String> databaseState = new HashMap<>();
                         try (var database = open()) {
                             readDatabase(database, databaseState);
@@ -259,6 +302,14 @@ class DamengDatagenPerformanceIT {
                                         }
                                     }
                                     Files.writeString(directory.resolve("worker.log"), worker.getLogs());
+                                    if (archiveBenchmark) {
+                                        try {
+                                            worker.copyFileFromContainer("/tmp/archive-benchmark-jdbc.csv", directory.resolve("jdbc-sessions.csv").toString());
+                                        }
+                                        catch (Exception diagnosticFailure) {
+                                            note("jdbcTimingUnavailable=" + diagnosticFailure);
+                                        }
+                                    }
                                 }
                                 finally {
                                     worker.stop();
@@ -314,6 +365,9 @@ class DamengDatagenPerformanceIT {
         properties.setProperty("transaction.large.size", Integer.toString(large));
         properties.setProperty("transaction.small.size", Integer.toString(small));
         properties.setProperty("cycles", Integer.toString(cycles));
+        if (archiveBenchmark) {
+            properties.setProperty("total.operations", System.getProperty("dameng.archive.benchmark.operations", "1000000"));
+        }
         properties.setProperty("interval.ms", Integer.toString(interval));
         properties.setProperty("random.seed", "20261015");
         final var path = temporaryDirectory.resolve("datagen.properties");
@@ -324,8 +378,12 @@ class DamengDatagenPerformanceIT {
     private Process launchGenerator(Path jar, Path config, boolean init) throws Exception {
         final List<String> command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-Xmx256m"));
         if (jar == null) {
+            if (archiveBenchmark && !init) {
+                command.add("-Ddameng.archive.benchmark.commits=" + directory.resolve("commits.csv"));
+                command.add("-Ddameng.archive.benchmark.target.rate=" + System.getProperty("dameng.archive.benchmark.target.rate", "0"));
+            }
             command.addAll(List.of("-cp", System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
-                    "io.debezium.connector.dameng.datagen.Main"));
+                    archiveBenchmark && !init ? "io.debezium.connector.dameng.datagen.ArchiveBenchmarkWorkload" : "io.debezium.connector.dameng.datagen.Main"));
         }
         else {
             command.addAll(List.of("-jar", jar.toAbsolutePath().toString()));
@@ -410,6 +468,9 @@ class DamengDatagenPerformanceIT {
                 .withEnv("KAFKA_LOG_SEGMENT_BYTES", "33554432")
                 .withEnv("KAFKA_HEAP_OPTS", "-Xms256m -Xmx512m")
                 .waitingFor(Wait.forLogMessage(".*Kafka Server started.*", 1).withStartupTimeout(Duration.ofMinutes(2)));
+        if (archiveBenchmark) {
+            broker.withLabel("dameng.archive.benchmark.run", System.getProperty("dameng.archive.benchmark.run"));
+        }
         broker.start();
         guardDisk();
         note("ownedKafka=" + broker.getDockerImageName() + " replicationFactor=1 port=" + port);
@@ -421,7 +482,8 @@ class DamengDatagenPerformanceIT {
         for (var name : topics) {
             final Map<String, String> settings;
             if (name.equals(topic)) {
-                settings = Map.of("min.insync.replicas", "1", "retention.ms", "3600000", "segment.bytes", "33554432");
+                settings = Map.of("min.insync.replicas", "1", "retention.ms", archiveBenchmark ? "-1" : "3600000",
+                        "retention.bytes", archiveBenchmark ? "-1" : "1073741824", "segment.bytes", "33554432");
             }
             else if (name.equals(topics.get(1))) {
                 settings = Map.of("min.insync.replicas", "1", "cleanup.policy", "delete", "retention.ms", "-1", "retention.bytes", "-1");
@@ -463,6 +525,23 @@ class DamengDatagenPerformanceIT {
             final var digest = MessageDigest.getInstance("SHA-256");
             assertThat(digest.digest(Files.readAllBytes(packaged))).isEqualTo(digest.digest(Files.readAllBytes(build.resolve(module))));
             note("moduleSha256=" + HexFormat.of().formatHex(digest.digest(Files.readAllBytes(packaged))));
+            if (archiveBenchmark) {
+                ArchiveBenchmarkInstrumentation.instrumentPlugin(packaged);
+                note("benchmarkJdbcInstrumentation=true instrumentedModuleSha256="
+                        + HexFormat.of().formatHex(digest.digest(Files.readAllBytes(packaged))));
+                final Path factoryJar = packaged.getParent().resolve("archive-benchmark-timing.jar");
+                try (var jar = new JarOutputStream(Files.newOutputStream(factoryJar))) {
+                    for (var name : List.of("ArchiveBenchmarkConnectionFactory", "ArchiveBenchmarkConnectionFactory$Session")) {
+                        final String resource = "io/debezium/connector/dameng/" + name + ".class";
+                        jar.putNextEntry(new JarEntry(resource));
+                        try (var input = getClass().getClassLoader().getResourceAsStream(resource)) {
+                            assertThat(input).isNotNull();
+                            input.transferTo(jar);
+                        }
+                        jar.closeEntry();
+                    }
+                }
+            }
         }
         restPort = freePort();
         do {
@@ -508,6 +587,9 @@ class DamengDatagenPerformanceIT {
                 .withCopyFileToContainer(MountableFile.forHostPath(plugin, 0755), "/tmp/perf-plugins")
                 .withCopyFileToContainer(MountableFile.forHostPath(config, 0644), "/tmp/perf-worker.properties")
                 .waitingFor(Wait.forLogMessage(".*Kafka Connect started.*", 1).withStartupTimeout(Duration.ofMinutes(2)));
+        if (archiveBenchmark) {
+            worker.withLabel("dameng.archive.benchmark.run", System.getProperty("dameng.archive.benchmark.run"));
+        }
         worker.start();
         if (memoryMiB > 0) {
             assertThat(worker.getContainerInfo().getHostConfig().getMemory()).isEqualTo(memoryMiB * 1024 * 1024);
@@ -539,13 +621,17 @@ class DamengDatagenPerformanceIT {
         config.put("log.mining.window.max.bytes", System.getProperty("dameng.perf.window.max.bytes", "67108864"));
         config.put("log.mining.batch.size", System.getProperty("dameng.perf.mining.batch.size", "1000"));
         config.put("log.mining.buffer.memory.bytes", System.getProperty("dameng.perf.buffer.memory.bytes", "67108864"));
+        if (archiveBenchmark) {
+            config.put("log.mining.buffer.spill.max.bytes", "17179869184");
+            note("benchmarkTransactionSpillMaxBytes=17179869184");
+        }
         // Only pass the retired setting when explicitly requested for compatibility regression.
         final var legacyBudget = System.getProperty("dameng.perf.buffer.max.bytes");
         if (legacyBudget != null) {
             config.put("log.mining.buffer.max.bytes", legacyBudget);
         }
         final var response = request("POST", "/connectors", JSON.writeValueAsString(Map.of("name", prefix, "config", config)));
-        assertThat(response.statusCode()).as("connector registration").isEqualTo(201);
+        assertThat(response.statusCode()).as("connector registration: %s", response.body()).isEqualTo(201);
         note("windowStrategy=" + config.get("log.mining.window.strategy") + " archiveByteBudget=" + config.get("log.mining.window.max.bytes"));
         note("logMiningBatchLsn=" + config.get("log.mining.batch.size") + " transactionCacheBytes=" + config.get("log.mining.buffer.memory.bytes")
                 + " ignoredLegacyWindowBudgetBytes=" + legacyBudget
@@ -593,6 +679,22 @@ class DamengDatagenPerformanceIT {
                 .append(',').append(gcCount).append(',').append(gcTime)
                 .append(',').append(mbeans.getAttribute(new ObjectName("java.lang:type=OperatingSystem"), "ProcessCpuTime"));
         samples.append('\n');
+        if (archiveBenchmark) {
+            final long lag = consumer.endOffsets(consumer.assignment()).get(new TopicPartition(topic, 0)) - expectedKafkaOffset;
+            maximumConsumerLag = Math.max(maximumConsumerLag, lag);
+            try (var database = open();
+                    var statement = database.createStatement();
+                    var files = statement.executeQuery("SELECT PATH, ARCH_LSN, CLSN, LEN, FREE FROM V$ARCH_FILE WHERE PATH IS NOT NULL")) {
+                while (files.next()) {
+                    final String path = files.getString(1);
+                    final String state = files.getLong(2) + "," + files.getLong(3) + "," + files.getLong(4) + "," + files.getLong(5);
+                    if (!state.equals(archiveStates.put(path, state))) {
+                        archives.append(millis(System.nanoTime() - started)).append(',').append(path).append(',').append(state).append('\n');
+                    }
+                }
+            }
+            Files.writeString(directory.resolve("archives.csv"), archives);
+        }
         Files.writeString(directory.resolve("samples.csv"), samples);
         sampleDownstream(mbeans, millis(System.nanoTime() - started));
     }
@@ -641,6 +743,21 @@ class DamengDatagenPerformanceIT {
         final var before = event.get("before");
         final var after = event.get("after");
         final var key = key(operation.equals("d") ? before : after);
+        if (archiveBenchmark) {
+            final String transaction = event.path("source").path("transaction_id").asText();
+            assertThat(transaction).isNotBlank();
+            if (!transaction.equals(lastTransaction)) {
+                if (lastTransaction != null) {
+                    transactionSizes.add(currentTransactionSize);
+                }
+                assertThat(deliveredTransactions).doesNotContain(transaction);
+                deliveredTransactions.add(transaction);
+                transactionStarts.add(Math.toIntExact(received));
+                lastTransaction = transaction;
+                currentTransactionSize = 0;
+            }
+            currentTransactionSize++;
+        }
         if (operation.equals("c")) {
             assertThat(mirror).as("insert key must be new").doesNotContainKey(key);
         }
@@ -655,6 +772,55 @@ class DamengDatagenPerformanceIT {
         }
         counts.merge(operation, 1L, Long::sum);
         received++;
+    }
+
+    private void finishLatency() throws Exception {
+        transactionSizes.add(currentTransactionSize);
+        final var commits = Files.readAllLines(directory.resolve("commits.csv"));
+        assertThat(commits.size() - 1).as("single writer commits match delivered transactions in commit order").isEqualTo(transactionSizes.size());
+        final StringBuilder transactions = new StringBuilder("transaction,xid,operations,commit_start_ms,commit_end_ms,first_arrival_ms,last_arrival_ms\n");
+        final long[] small = new long[Math.toIntExact(received)];
+        final long[] large = new long[Math.toIntExact(received)];
+        int smallCount = 0;
+        int largeCount = 0;
+        for (int i = 0; i < transactionSizes.size(); i++) {
+            final var fields = commits.get(i + 1).split(",");
+            final int size = Integer.parseInt(fields[1]);
+            assertThat(transactionSizes.get(i)).as("transaction %s operation count", i + 1).isEqualTo(size);
+            final int start = transactionStarts.get(i);
+            final long committed = Long.parseLong(fields[3]);
+            transactions.append(i + 1).append(',').append(deliveredTransactions.get(i)).append(',').append(size).append(',')
+                    .append(fields[2]).append(',').append(committed).append(',').append(arrivalTimes[start]).append(',')
+                    .append(arrivalTimes[start + size - 1]).append('\n');
+            for (int j = start; j < start + size; j++) {
+                arrivalTimes[j] -= committed;
+                assertThat(arrivalTimes[j]).as("commit confirmation to poll arrival").isGreaterThanOrEqualTo(-10L);
+                if (size == 100) {
+                    small[smallCount++] = arrivalTimes[j];
+                }
+                else if (size == 10_000) {
+                    large[largeCount++] = arrivalTimes[j];
+                }
+            }
+        }
+        Files.writeString(directory.resolve("transactions.csv"), transactions);
+        final Map<String, Object> result = new LinkedHashMap<>();
+        result.put("overall", quantiles(arrivalTimes, arrivalTimes.length));
+        result.put("small", quantiles(small, smallCount));
+        result.put("large", quantiles(large, largeCount));
+        result.put("maximumObservedConsumerLagRecords", maximumConsumerLag);
+        result.put("matching", "single writer transaction commit order, verified operation count for every transaction");
+        result.put("clock", "writer and consumer share host wall clock; commit confirmation to Kafka consumer poll");
+        Files.writeString(directory.resolve("latency.json"), JSON.writerWithDefaultPrettyPrinter().writeValueAsString(result));
+    }
+
+    private static Map<String, Long> quantiles(long[] values, int count) {
+        java.util.Arrays.sort(values, 0, count);
+        if (count == 0) {
+            return Map.of("count", 0L);
+        }
+        return Map.of("count", (long) count, "p50Ms", values[(count - 1) / 2], "p95Ms", values[(int) ((count - 1) * 0.95)],
+                "p99Ms", values[(int) ((count - 1) * 0.99)], "maxMs", values[count - 1]);
     }
 
     private void readDatabase(Connection database, Map<String, String> state) throws Exception {

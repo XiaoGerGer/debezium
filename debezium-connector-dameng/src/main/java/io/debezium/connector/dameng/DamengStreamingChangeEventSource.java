@@ -23,6 +23,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.annotation.VisibleForTesting;
 import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Analysis;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.CascadeDropException;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Impact;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.PartitionDataRemovalException;
 import io.debezium.connector.dameng.logminer.LogMinerArchiveWindow;
@@ -516,6 +517,15 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
             return ddlParser.analyze(row.redo(), row.owner() == null ? row.username() : row.owner());
         }
         catch (IllegalArgumentException failure) {
+            if (failure instanceof CascadeDropException) {
+                if (!config.isCascadeDropIgnored()) {
+                    throw ddlFailure(row, failure);
+                }
+                LOGGER.warn("Ignoring Dameng cascading object drop at LSN {}, XID {}, DATA_OBJ# {} because cascade.drop.ignore=true. "
+                        + "This DDL was ignored. SQL_REDO: '{}'; reason: {}",
+                        row.lsn(), row.transactionId(), row.objectId(), row.redo(), failure.getMessage());
+                return null;
+            }
             if (failure instanceof PartitionDataRemovalException) {
                 if (!config.isPartitionDropIgnored()) {
                     throw ddlFailure(row, failure);
@@ -533,6 +543,9 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
     }
 
     private List<DamengDdlParser.SchemaChange> planDdl(Analysis analysis, LogMinerRow row) {
+        if (analysis.isCtas() && !analysis.isTemporaryTable()) {
+            return planCtas(analysis, row);
+        }
         try {
             return ddlParser.plan(analysis, schema.getTables());
         }
@@ -541,6 +554,33 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                 return null;
             }
             throw ddlFailure(row, failure);
+        }
+    }
+
+    private List<DamengDdlParser.SchemaChange> planCtas(Analysis analysis, LogMinerRow row) {
+        final var tableId = analysis.tableId();
+        if (schema.getTables().forTable(tableId) != null) {
+            throw new IllegalStateException("CTAS refers to an existing historical table " + tableId + " at " + row.position());
+        }
+        long onlineObjectId = -1;
+        try {
+            onlineObjectId = connection.getTableObjectId(tableId);
+            if (onlineObjectId != row.objectId()) {
+                throw new IllegalStateException("Online table object identity does not match the CTAS redo");
+            }
+            final var table = connection.readTableSchema(tableId);
+            onlineObjectId = connection.getTableObjectId(tableId);
+            if (onlineObjectId != row.objectId()) {
+                throw new IllegalStateException("Online table object identity changed while reading the CTAS definition");
+            }
+            return List.of(new DamengDdlParser.SchemaChange(DamengDdlParser.Type.CREATE, table, tableId, null));
+        }
+        catch (SQLException | RuntimeException failure) {
+            throw new IllegalStateException("Cannot resolve CTAS schema for " + tableId + " at " + row.position()
+                    + "; CTAS currently requires a matching target table in the online dictionary; complete CTAS schema inference is not supported"
+                    + "; redo object ID=" + row.objectId() + ", online object ID=" + (onlineObjectId < 0 ? "unavailable" : onlineObjectId)
+                    + ". The original table may have been dropped, renamed, or recreated while its redo is still pending"
+                    + "; historical schema and this statement's offset were not changed. Reason: " + failure.getMessage(), failure);
         }
     }
 
@@ -557,7 +597,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
     private IllegalArgumentException ddlFailure(LogMinerRow row, IllegalArgumentException failure) {
         logSqlParsingFailure(row, failure);
         return new IllegalArgumentException("Cannot process Dameng DDL at LSN " + row.lsn() + ", DATA_OBJ# " + row.objectId()
-                + ": " + failure.getMessage() + "; SQL_REDO: '" + row.redo()
+                + ", XID " + row.transactionId() + ": " + failure.getMessage() + "; SQL_REDO: '" + row.redo()
                 + "'; historical schema and this statement's offset were not changed", failure);
     }
 

@@ -46,6 +46,7 @@ import io.debezium.relational.Column;
 import io.debezium.relational.ColumnEditor;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.relational.Tables;
 import io.debezium.relational.Tables.ColumnNameFilter;
 import io.debezium.relational.Tables.TableFilter;
 
@@ -285,6 +286,17 @@ public class DamengConnection extends JdbcConnection {
                     }
                     return objectId;
                 });
+    }
+
+    /** Reads a current table definition, including every physical column needed by dictionary-free redo. */
+    public Table readTableSchema(TableId tableId) throws SQLException {
+        final var tables = new Tables();
+        readSchema(tables, null, tableId.schema(), tableId::equals, null, false);
+        final var table = tables.forTable(tableId);
+        if (table == null || table.columns().isEmpty()) {
+            throw new SQLException("No readable online table definition exists for " + tableId);
+        }
+        return table;
     }
 
     /** Reads tables without captured row schemas for a new baseline, never for historical redo. */

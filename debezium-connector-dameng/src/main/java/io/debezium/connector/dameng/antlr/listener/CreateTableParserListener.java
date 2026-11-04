@@ -65,12 +65,8 @@ final class CreateTableParserListener extends BaseParserListener {
         if (statement.LIKE() != null) {
             copyColumns(editor, requireTable(tableId(statement.qualifiedName(1), analysis.defaultSchema())));
         }
-        else if (statement.selectStatement() != null) {
-            if (statement.tableDefinition() != null) {
-                throw error(statement, "Unsupported CTAS explicit column definitions");
-            }
-            selectColumns(editor, statement.selectStatement());
-            tableOptions(statement.tableOption(), editor);
+        else if (statement.ctasQuery() != null) {
+            throw error(statement, "CTAS schema resolution requires the target table's online dictionary");
         }
         else {
             columns.addDefinitions(editor, statement.tableDefinition());
@@ -139,94 +135,6 @@ final class CreateTableParserListener extends BaseParserListener {
         }
     }
 
-    private void selectColumns(TableEditor target, DamengSqlParser.SelectStatementContext select) {
-        final var queries = select.queryExpression().selectQuery();
-        if (!select.commonTableExpression().isEmpty() || select.orderByClause() != null || queries.size() != 1) {
-            throw error(select, "Unsupported CTAS query scope; only a single historical source table is supported");
-        }
-        final var query = queries.get(0);
-        if (query.tableReference().size() != 1 || query.GROUP() != null || query.HAVING() != null || query.DISTINCT() != null || query.ALL() != null) {
-            throw error(query, "Unsupported CTAS query scope; only a single historical source table is supported");
-        }
-        final var reference = query.tableReference(0);
-        final var primary = reference.tablePrimary();
-        if (!reference.joinClause().isEmpty() || primary.qualifiedName() == null
-                || query.expression().stream().anyMatch(CreateTableParserListener::hasSubquery)) {
-            throw error(query, "Unsupported CTAS query scope; only a single historical source table is supported");
-        }
-        final var source = requireTable(tableId(primary.qualifiedName(), analysis.defaultSchema()));
-        if (DamengTableType.isNonRow(source)) {
-            throw error(primary, "Cannot derive a captured CTAS schema from an external or temporary table " + source.id());
-        }
-        final var alias = primary.regularIdentifier() == null ? source.id().table() : columns.identifier(primary.regularIdentifier());
-        for (var item : query.selectItem()) {
-            if (item.ASTERISK() != null) {
-                if (item.expressionIdentifier() != null && !columns.identifier(item.expressionIdentifier()).equals(alias)) {
-                    throw error(item, "Unknown CTAS source qualifier " + item.expressionIdentifier().getText());
-                }
-                copyColumns(target, source);
-                continue;
-            }
-            final var expression = projectedExpression(item.expression());
-            final ColumnEditor column;
-            if (expression.CAST() != null) {
-                if (item.AS() == null) {
-                    throw error(item, "CAST projection requires an explicit output name");
-                }
-                column = copiedColumn(projectedColumn(projectedExpression(expression.expression(0)), source, alias)).optional(true);
-                columns.dataType(column, expression.dataType());
-            }
-            else {
-                column = copiedColumn(projectedColumn(expression, source, alias));
-            }
-            if (item.identifier() != null) {
-                column.name(columns.identifier(item.identifier()));
-            }
-            else if (item.regularIdentifier() != null) {
-                column.name(columns.identifier(item.regularIdentifier()));
-            }
-            addCopiedColumn(target, column, item);
-        }
-    }
-
-    private static boolean hasSubquery(ParserRuleContext context) {
-        return context != null && !Trees.findAllRuleNodes(context, DamengSqlParser.RULE_selectStatement).isEmpty();
-    }
-
-    private static DamengSqlParser.PrimaryExpressionContext projectedExpression(DamengSqlParser.ExpressionContext expression) {
-        ParserRuleContext current = expression;
-        while (!(current instanceof DamengSqlParser.PrimaryExpressionContext) && current.getChildCount() == 1
-                && current.getChild(0) instanceof ParserRuleContext child) {
-            current = child;
-        }
-        if (!(current instanceof DamengSqlParser.PrimaryExpressionContext primary)) {
-            throw error(expression, "Unsupported CTAS projection expression");
-        }
-        return primary;
-    }
-
-    private Column projectedColumn(DamengSqlParser.PrimaryExpressionContext expression, Table source, String alias) {
-        final var name = expression.expressionName();
-        if (name == null || expression.LPAREN() != null || name.identifier().size() > 1) {
-            throw error(expression, "Unsupported CTAS projection; a historical column is required");
-        }
-        final String columnName;
-        if (name.identifier().isEmpty()) {
-            columnName = columns.identifier(name.expressionIdentifier());
-        }
-        else {
-            if (!columns.identifier(name.expressionIdentifier()).equals(alias)) {
-                throw error(name, "Unknown CTAS source qualifier " + name.expressionIdentifier().getText());
-            }
-            columnName = columns.identifier(name.identifier(0));
-        }
-        final var column = source.columnWithName(columnName);
-        if (column == null) {
-            throw error(name, "Unknown historical CTAS source column " + columnName);
-        }
-        return column;
-    }
-
     private static ColumnEditor copiedColumn(Column source) {
         return source.edit().unsetDefaultValueExpression().autoIncremented(false).generated(false).comment(null);
     }
@@ -242,7 +150,7 @@ final class CreateTableParserListener extends BaseParserListener {
 
     private static void addCopiedColumn(TableEditor target, ColumnEditor column, ParserRuleContext context) {
         if (target.columnWithName(column.name()) != null) {
-            final var message = "Duplicate CTAS output column " + column.name();
+            final var message = "Duplicate copied column " + column.name();
             throw context == null ? new IllegalArgumentException(message) : error(context, message);
         }
         target.addColumn(column.create());

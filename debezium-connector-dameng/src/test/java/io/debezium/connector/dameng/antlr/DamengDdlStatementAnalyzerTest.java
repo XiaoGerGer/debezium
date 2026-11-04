@@ -20,6 +20,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.connector.dameng.DamengTableType;
 import io.debezium.connector.dameng.antlr.DamengDdlParser.Type;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.CascadeDropException;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Impact;
 import io.debezium.connector.dameng.compatibility.DamengIdentifierRules;
 import io.debezium.relational.Attribute;
@@ -29,6 +30,54 @@ import io.debezium.relational.Tables;
 
 class DamengDdlStatementAnalyzerTest {
     private final DamengDdlStatementAnalyzer analyzer = new DamengDdlStatementAnalyzer();
+
+    static Stream<Arguments> cascadingObjectDropStatements() {
+        return Stream.of("USER", "SCHEMA", "DOMAIN", "TYPE", "CLASS")
+                .flatMap(kind -> Stream.of("", "IF EXISTS ").flatMap(exists -> {
+                    final var targets = Stream.of("CDC_OBJECT", "\"CaScAdE\"");
+                    final var names = kind.equals("USER") || kind.equals("SCHEMA") ? targets
+                            : Stream.concat(targets, Stream.of("APP.CDC_OBJECT", "\"App\".\"Quoted Object\""));
+                    return names.map(target -> Arguments.of("DROP " + kind + " " + exists + target + " /* policy */ CASCADE;",
+                            "DROP " + kind, target));
+                }));
+    }
+
+    @ParameterizedTest
+    @MethodSource("cascadingObjectDropStatements")
+    void shouldParseCascadingObjectDropsCompletelyAndReportTheirConsequences(String sql, String operation, String target) {
+        assertThat(DamengParseTree.parseScope(sql, false).tree().statement()).hasSize(1);
+        final var analysis = analyzer.analyze(sql, "APP");
+        assertThat(analysis.impact()).isEqualTo(Impact.UNSUPPORTED);
+        assertThat(analysis.failure()).isInstanceOf(CascadeDropException.class)
+                .hasMessageContaining(operation, target, "cannot determine all affected tables", "historical schemas", "object-ID mappings",
+                        "no deletion events", "downstream data may remain", "same-name recreation", "incorrect decoding", "cascade.drop.ignore=true");
+        assertThatThrownBy(analysis::requireSupported).isSameAs(analysis.failure());
+        assertThatThrownBy(() -> new DamengDdlParser().parse(sql, new Tables(), "APP")).isInstanceOf(CascadeDropException.class);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "DROP USER", "DROP SCHEMA S CASCADE UNKNOWN", "DROP DOMAIN APP.D CASCADE CONSTRAINTS",
+            "DROP TYPE APP.T CASCADE RESTRICT", "DROP CLASS APP.C CASCADE CASCADE", "DROP CLASS BODY APP.C CASCADE",
+            "DROP USER U CASCADE; DROP PROFILE P", "DROP PROFILE P; DROP TYPE APP.T CASCADE",
+            "DROP SCHEMA S CASCADE; ALTER TABLE APP.T ADD V INT", "DROP TYPE APP.T CASCADE INSERT INTO APP.T VALUES(1)"
+    })
+    void shouldNotClassifyIncompleteUnknownOrCompoundStatementsAsOptInCascadingDrops(String sql) {
+        final var analysis = analyzer.analyze(sql, "APP");
+        assertThat(analysis.impact()).isEqualTo(Impact.UNSUPPORTED);
+        assertThat(analysis.failure()).isNotInstanceOf(CascadeDropException.class);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "DROP USER CASCADE", "DROP SCHEMA CASCADE", "DROP DOMAIN APP.CASCADE", "DROP TYPE APP.CASCADE", "DROP CLASS APP.CASCADE",
+            "DROP USER U /* CASCADE */", "DROP PROFILE P CASCADE", "DROP TYPE BODY APP.O CASCADE",
+            "DROP TYPE BODY CASCADE", "DROP CLASS BODY CASCADE", "DROP TYPE BODY IF EXISTS CASCADE", "DROP CLASS BODY IF EXISTS CASCADE",
+            "ALTER PACKAGE APP.P COMPILE CASCADE", "CREATE PROCEDURE APP.P AS BEGIN PRINT 'DROP USER U CASCADE'; END;"
+    })
+    void shouldKeepOtherCascadeUsagesOnTheirExistingNonTablePath(String sql) {
+        assertThat(analyzer.analyze(sql, "APP").requireSupported().impact()).isEqualTo(Impact.NO_TABLE_CHANGE);
+    }
 
     // DM SQL Language Manual 3.5.1.1, 3.5.2.1, 3.5.3 and 3.5.4.
     // https://eco.dameng.com/document/dm/zh-cn/pm/definition-statement.html
@@ -391,6 +440,218 @@ class DamengDdlStatementAnalyzerTest {
     }
 
     @ParameterizedTest
+    @MethodSource("purgeStatements")
+    void shouldSkipRecycleBinStatementsWithoutChangingCapturedTables(String sql) {
+        final var analysis = analyzer.analyze(sql, "APP").requireSupported();
+        assertThat(analysis.impact()).isEqualTo(Impact.NO_TABLE_CHANGE);
+        assertThat(analysis.tableId()).isNull();
+        assertThat(analysis.renamedTableId()).isNull();
+        assertThat(DamengParseTree.parseScope(sql, false).tree().statement(0).nonTableStatement().purgeStatement()).isNotNull();
+
+        final var tables = ordinaryTableHistory();
+        final var original = tables.forTable(null, "APP", "T");
+        final var parser = new DamengDdlParser();
+        assertThat(parser.plan(analysis, tables)).isEmpty();
+        assertThat(parser.parse(sql, tables, "APP")).isEmpty();
+        assertThat(tables.tableIds()).containsExactly(original.id());
+        assertThat(tables.forTable(original.id())).isSameAs(original);
+    }
+
+    static Stream<String> purgeStatements() {
+        return Stream.of(
+                Stream.of("PURGE RECYCLEBIN", "PURGE DBA_RECYCLEBIN"),
+                Stream.of("TABLE", "INDEX").flatMap(kind -> ordinaryTableNames().map(name -> "PURGE " + kind + " " + name)),
+                Stream.of("MAIN", "\"Main Space\"").flatMap(tablespace -> Stream.of("", " USER APP", " USER \"App User\"")
+                        .map(user -> "PURGE TABLESPACE " + tablespace + user)),
+                Stream.of("purge /* recycle bin */ recyclebin; -- done", "purge dba_recyclebin;",
+                        "PURGE TABLE \"APP\".\"T; DROP TABLE APP.T\";", "PURGE INDEX \"APP\".\"I\"\"Name\";",
+                        "PURGE TABLESPACE \"TS; DROP TABLE APP.T\" USER \"U\"\"Name\";"))
+                .flatMap(statements -> statements);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "PURGE RECYCLEBIN", "PURGE DBA_RECYCLEBIN", "PURGE TABLE APP.T", "PURGE INDEX APP.I",
+            "PURGE TABLESPACE MAIN", "PURGE TABLESPACE MAIN USER APP", "PURGE TABLE \"APP\".\"T; DROP TABLE APP.T\""
+    })
+    void shouldNotSwallowTableChangesOrDmlFollowingRecycleBinStatements(String sql) {
+        assertFollowingTableChangesAreNotSkipped(sql);
+        for (final var separator : new String[]{ " ", "; " }) {
+            assertUnsupported(sql + separator + "INSERT INTO APP.T(ID) VALUES(1)");
+            assertUnsupported(sql + separator + "UPDATE APP.T SET V='changed'");
+            assertUnsupported(sql + separator + "DELETE FROM APP.T");
+            assertUnsupported(sql + separator + "CALL APP.P()");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "PURGE", "PURGE UNKNOWN", "PURGE RECYCLEBIN UNKNOWN", "PURGE DBA_RECYCLEBIN UNKNOWN",
+            "PURGE TABLE", "PURGE INDEX", "PURGE TABLE APP.", "PURGE INDEX APP.",
+            "PURGE TABLE APP.T UNKNOWN", "PURGE TABLE APP.T CASCADE", "PURGE INDEX APP.I UNKNOWN",
+            "PURGE TABLE APP.T,APP.U", "PURGE TABLE APP.T.I", "PURGE TABLE IF EXISTS APP.T",
+            "PURGE TABLESPACE", "PURGE TABLESPACE MAIN USER", "PURGE TABLESPACE MAIN USER APP UNKNOWN",
+            "PURGE TABLESPACE APP.MAIN", "PURGE TABLESPACE MAIN USER APP.U", "PURGE TABLESPACE MAIN CASCADE"
+    })
+    void shouldRejectIncompleteOrUnsupportedRecycleBinStatements(String sql) {
+        assertUnsupported(sql);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "RECYCLEBIN", "DBA_RECYCLEBIN" })
+    void shouldKeepRecycleBinKeywordsUsableAsIdentifiers(String name) {
+        final var parser = new DamengDdlParser();
+        final var tables = new Tables();
+        parser.parse("CREATE TABLE APP." + name + "(" + name + " INT)", tables, "APP");
+        assertThat(tables.forTable(null, "APP", name).retrieveColumnNames()).containsExactly(name);
+        assertThat(analyzer.analyze("CREATE TABLE APP.COPY AS SELECT " + name + " FROM APP." + name, "APP").requireSupported().isCtas()).isTrue();
+    }
+
+    @ParameterizedTest
+    @MethodSource("ctasStatements")
+    void shouldRecognizeCtasStatements(String sql) {
+        final var analysis = analyzer.analyze(sql, "APP").requireSupported();
+        assertThat(analysis.impact()).isEqualTo(Impact.TABLE);
+        assertThat(analysis.isCtas()).isTrue();
+        assertThat(analysis.tableId()).isEqualTo(new TableId(null, "APP", "T"));
+        assertThat(analysis.isTemporaryTable()).isFalse();
+    }
+
+    static Stream<String> ctasStatements() {
+        return Stream.of(
+                "SELECT 1 AS ID FROM DUAL", "SELECT 1 AS ID",
+                "SELECT A.ID,B.V FROM APP.A A JOIN APP.B B ON A.ID=B.ID",
+                "SELECT A.ID,B.V FROM APP.A A LEFT JOIN APP.B B ON A.ID=B.ID",
+                "SELECT ID FROM APP.A UNION ALL SELECT ID FROM APP.B",
+                "SELECT ID FROM APP.A UNION SELECT ID FROM APP.B",
+                "WITH Q AS (SELECT ID FROM APP.A) SELECT ID FROM Q",
+                "SELECT X.ID FROM (SELECT ID FROM APP.A) X",
+                "SELECT ID,(SELECT MAX(V) FROM APP.B) AS V FROM APP.A",
+                "SELECT V,COUNT(*) AS TOTAL FROM APP.A GROUP BY V",
+                "SELECT ID,ROW_NUMBER() OVER(ORDER BY ID) AS RN,LAG(V) OVER(ORDER BY ID) AS PREV FROM APP.A",
+                "SELECT CASE WHEN ID=1 THEN V ELSE 'other' END AS V FROM APP.A",
+                "SELECT CAST(NULL AS VARCHAR(20)) AS V,ID+1 AS NEXT_ID FROM APP.A",
+                "SELECT TRUNCATE(1.23,1) AS V,JSON_VALUE(DOC,'$.x' RETURNING VARCHAR NULL ON ERROR) AS J FROM APP.A",
+                "SELECT q'[; DROP TABLE APP.A]' AS V FROM DUAL",
+                "(SELECT 1 AS ID FROM DUAL)")
+                .map(query -> "CREATE TABLE APP.T AS " + query);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "CREATE TABLE APP.T(ID INT DEFAULT CAST(1 AS INTEGER))",
+            "CREATE TABLE APP.T(V VARCHAR(100) DEFAULT 'AS SELECT 1 FROM DUAL')",
+            "CREATE TABLE APP.T(\"AS SELECT\" INT)",
+            "CREATE TABLE APP.T LIKE APP.S"
+    })
+    void shouldNotMistakeOrdinaryCreatesForCtas(String sql) {
+        assertThat(analyzer.analyze(sql, "APP").requireSupported().isCtas()).isFalse();
+    }
+
+    @Test
+    void shouldPreserveQuotedCtasTargetAndDefaultSchema() {
+        final var analysis = analyzer.analyze("create /* AS SELECT */ table \"T; AS SELECT\" as select 1 as id", "APP").requireSupported();
+        assertThat(analysis.isCtas()).isTrue();
+        assertThat(analysis.tableId()).isEqualTo(new TableId(null, "APP", "T; AS SELECT"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "CREATE TABLE APP.T AS SELECT", "CREATE TABLE APP.T AS SELECT (1 FROM DUAL",
+            "CREATE TABLE APP.T AS SELECT 1) FROM DUAL",
+            "CREATE TABLE APP.T AS SELECT 1 FROM DUAL; DROP TABLE APP.S",
+            "CREATE TABLE APP.T AS SELECT 1 FROM DUAL DROP TABLE APP.S",
+            "CREATE TABLE APP.T AS SELECT 1 FROM DUAL; ALTER TABLE APP.S ADD X INT",
+            "CREATE TABLE APP.T AS SELECT 1 FROM DUAL ALTER TABLE APP.S ADD X INT",
+            "CREATE TABLE APP.T AS SELECT 1 FROM DUAL INSERT INTO APP.S VALUES(1)",
+            "CREATE TABLE APP.T AS SELECT 1 FROM DUAL UPDATE APP.S SET ID=1",
+            "CREATE TABLE APP.T AS SELECT 1 FROM DUAL GRANT SELECT ON APP.S TO U"
+    })
+    void shouldRejectIncompleteOrCompoundCtas(String sql) {
+        assertUnsupported(sql);
+    }
+
+    @Test
+    void shouldRequireOnlineDictionaryForOfflineCtasPlanningWithoutChangingHistory() {
+        final var parser = new DamengDdlParser();
+        final var tables = ordinaryTableHistory();
+        final var original = tables.forTable(null, "APP", "T");
+        final var analysis = analyzer.analyze("CREATE TABLE APP.COPY AS SELECT * FROM APP.T", "APP").requireSupported();
+        assertThatThrownBy(() -> parser.plan(analysis, tables)).hasMessageContaining("online dictionary");
+        assertThat(tables.forTable(null, "APP", "COPY")).isNull();
+        assertThat(tables.forTable(null, "APP", "T")).isSameAs(original);
+    }
+
+    @Test
+    void shouldKeepTemporaryCtasAsNonRowHistory() {
+        final var sql = "CREATE GLOBAL TEMPORARY TABLE APP.T AS SELECT ROW_NUMBER() OVER(ORDER BY ID) AS RN FROM APP.S";
+        final var analysis = analyzer.analyze(sql, "APP").requireSupported();
+        assertThat(analysis.isCtas()).isTrue();
+        assertThat(analysis.isTemporaryTable()).isTrue();
+        assertThat(DamengTableType.isNonRow(applyTableDdl(new Tables(), sql, Type.CREATE))).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "CREATE TABLE APP.T(ID INT, pass VARCHAR(50) ENCRYPT)",
+            "CREATE TABLE APP.T(ID INT, pass VARCHAR(50) ENCRYPT DEFAULT 'initial' NOT NULL COMMENT 'secret')",
+            "CREATE TABLE APP.T(ID INT, pass VARCHAR(50) DEFAULT 'initial' NOT NULL ENCRYPT COMMENT 'secret')"
+    })
+    void testEncyptColumn(String sql) {
+        final var table = applyTableDdl(new Tables(), sql, Type.CREATE);
+        assertThat(table.retrieveColumnNames()).containsExactly("ID", "PASS");
+        assertThat(table.columnWithName("PASS").jdbcType()).isEqualTo(Types.VARCHAR);
+        assertThat(table.columnWithName("PASS").length()).isEqualTo(50);
+        assertThat(table).isEqualTo(applyTableDdl(new Tables(), sql.replace(" ENCRYPT", ""), Type.CREATE));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "ADD PASS VARCHAR(50) ENCRYPT DEFAULT 'initial' NOT NULL COMMENT 'secret'",
+            "ADD COLUMN (PASS VARCHAR(50) ENCRYPT DEFAULT 'initial' NOT NULL COMMENT 'secret')",
+            "MODIFY PASS VARCHAR(50) ENCRYPT DEFAULT 'initial' NOT NULL COMMENT 'secret'"
+    })
+    void shouldRetainLogicalColumnDefinitionsWhenAddingOrModifyingEncryptedColumns(String clause) {
+        final var tables = ordinaryTableHistory();
+        final var original = tables.forTable(null, "APP", "T");
+        if (clause.startsWith("MODIFY")) {
+            applyTableDdl(tables, "ALTER TABLE APP.T ADD PASS VARCHAR(20)", Type.ALTER);
+        }
+        final var table = applyTableDdl(tables, "ALTER TABLE APP.T " + clause, Type.ALTER);
+        assertThat(table.retrieveColumnNames()).containsExactly("ID", "V", "PASS");
+        assertThat(table.columnWithName("PASS").jdbcType()).isEqualTo(Types.VARCHAR);
+        assertThat(table.columnWithName("PASS").length()).isEqualTo(50);
+        assertThat(table.columnWithName("PASS").defaultValueExpression()).contains("'initial'");
+        assertThat(table.columnWithName("PASS").isOptional()).isFalse();
+        assertThat(table.columnWithName("PASS").comment()).isEqualTo("secret");
+        assertThat(table.columnWithName("ID")).isEqualTo(original.columnWithName("ID"));
+        assertThat(table.columnWithName("V")).isEqualTo(original.columnWithName("V"));
+        assertThat(table.primaryKeyColumnNames()).containsExactly("ID");
+        assertThat(table.attributes()).containsExactlyElementsOf(original.attributes());
+    }
+
+    @Test
+    void shouldPreserveUnspecifiedColumnPropertiesWhenOnlyEnablingTransparentEncryption() {
+        final var tables = ordinaryTableHistory();
+        final var original = tables.forTable(null, "APP", "T");
+        final var table = applyTableDdl(tables, "ALTER TABLE APP.T MODIFY V ENCRYPT", Type.ALTER);
+        assertThat(table).isEqualTo(original);
+        assertThat(table.attributes()).containsExactlyElementsOf(original.attributes());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "CREATE TABLE APP.T(ID INT, PASS VARCHAR(50) ENCRYPT WITH)",
+            "CREATE TABLE APP.T(ID INT, PASS VARCHAR(50) ENCRYPT UNKNOWN)",
+            "CREATE TABLE APP.T(ID INT, PASS VARCHAR(50) ENCRYPT); DROP TABLE APP.T",
+            "ALTER TABLE APP.T ADD PASS VARCHAR(50) ENCRYPT; DROP TABLE APP.T",
+            "ALTER TABLE APP.T MODIFY V ENCRYPT; INSERT INTO APP.T(ID) VALUES(1)"
+    })
+    void shouldRejectMalformedOrCompoundEncryptedColumnStatements(String sql) {
+        assertUnsupported(sql);
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {
             "CREATE TABLE APP.T(ID INT PRIMARY KEY DISABLE)",
             "CREATE TABLE APP.T(ID INT,CONSTRAINT PK_T PRIMARY KEY(ID) DISABLE NOVALIDATE)",
@@ -544,12 +805,10 @@ class DamengDdlStatementAnalyzerTest {
             "PARTITION BY RANGE(ID) INTERVAL(10)(PARTITION P1 VALUES LESS THAN(10))",
             "PARTITION BY LIST(V)(PARTITION P1 VALUES('a'),PARTITION PD VALUES(DEFAULT))"
     })
-    void shouldDerivePartitionedCtasColumnsFromHistoricalSource(String definition) {
-        final var parser = new DamengDdlParser();
-        final var tables = new Tables();
-        parser.parse("CREATE TABLE APP.S(ID INT,V VARCHAR(30))", tables, "APP");
-        parser.parse("CREATE TABLE APP.T " + definition + " AS SELECT ID,V FROM APP.S", tables, "APP");
-        assertThat(tables.forTable(new TableId(null, "APP", "T")).retrieveColumnNames()).containsExactly("ID", "V");
+    void shouldRecognizePartitionedCtasWithoutSourceHistory(String definition) {
+        final var analysis = analyzer.analyze("CREATE TABLE APP.T " + definition + " AS SELECT ID,V FROM APP.S", "APP").requireSupported();
+        assertThat(analysis.isCtas()).isTrue();
+        assertThat(analysis.tableId()).isEqualTo(new TableId(null, "APP", "T"));
     }
 
     @Test
@@ -569,9 +828,9 @@ class DamengDdlStatementAnalyzerTest {
         parser.parse("CREATE TABLE APP.T(ID BIGINT AUTO_INCREMENT PRIMARY KEY,V VARCHAR(30)) PARTITION BY HASH(ID) PARTITIONS 2 " + option,
                 tables, "APP");
         assertThat(tables.forTable(new TableId(null, "APP", "T")).columnWithName("ID").isAutoIncremented()).isTrue();
-        parser.parse("CREATE TABLE APP.COPY PARTITION BY HASH(ID) PARTITIONS 2 AS SELECT ID,V FROM APP.T " + option, tables, "APP");
-        assertThat(tables.forTable(new TableId(null, "APP", "COPY")).retrieveColumnNames()).containsExactly("ID", "V");
-        assertThat(tables.forTable(new TableId(null, "APP", "COPY")).columnWithName("ID").isAutoIncremented()).isFalse();
+        final var analysis = analyzer.analyze("CREATE TABLE APP.COPY PARTITION BY HASH(ID) PARTITIONS 2 AS SELECT ID,V FROM APP.T " + option, "APP")
+                .requireSupported();
+        assertThat(analysis.isCtas()).isTrue();
     }
 
     @ParameterizedTest
@@ -780,8 +1039,7 @@ class DamengDdlStatementAnalyzerTest {
         final var parser = new DamengDdlParser();
         final var tables = new Tables();
         parser.parse("CREATE TABLE APP.T(ID INT," + name + " INT)", tables, "APP");
-        parser.parse("CREATE TABLE APP.COPY AS SELECT " + name + " FROM APP.T", tables, "APP");
-        assertThat(tables.forTable(new TableId(null, "APP", "COPY")).retrieveColumnNames()).containsExactly(name);
+        assertThat(analyzer.analyze("CREATE TABLE APP.COPY AS SELECT " + name + " FROM APP.T", "APP").requireSupported().isCtas()).isTrue();
         // A lone contextual word after DROP can still be an ordinary column name.
         parser.parse("ALTER TABLE APP.T DROP " + name, tables, "APP");
         assertThat(tables.forTable(new TableId(null, "APP", "T")).retrieveColumnNames()).containsExactly("ID");
@@ -1740,8 +1998,7 @@ class DamengDdlStatementAnalyzerTest {
         final var parser = new DamengDdlParser();
         final var tables = new Tables();
         parser.parse("CREATE TABLE APP.T(" + name + " INT)", tables, "APP");
-        parser.parse("CREATE TABLE APP.COPY AS SELECT " + name + " FROM APP.T", tables, "APP");
-        assertThat(tables.forTable(new TableId(null, "APP", "COPY")).retrieveColumnNames()).containsExactly(name);
+        assertThat(analyzer.analyze("CREATE TABLE APP.COPY AS SELECT " + name + " FROM APP.T", "APP").requireSupported().isCtas()).isTrue();
     }
 
     // DM SQL Language Manual, section 6.2: ordinary views, excluding materialized views.
@@ -3445,8 +3702,7 @@ class DamengDdlStatementAnalyzerTest {
         final var parser = new DamengDdlParser();
         final var tables = new Tables();
         parser.parse("CREATE TABLE APP.T(" + name + " INT)", tables, "APP");
-        parser.parse("CREATE TABLE APP.COPY AS SELECT " + name + " FROM APP.T", tables, "APP");
-        assertThat(tables.forTable(new TableId(null, "APP", "COPY")).retrieveColumnNames()).containsExactly(name);
+        assertThat(analyzer.analyze("CREATE TABLE APP.COPY AS SELECT " + name + " FROM APP.T", "APP").requireSupported().isCtas()).isTrue();
     }
 
     @ParameterizedTest

@@ -81,6 +81,10 @@ final class DamengTestDatabase {
                         .withEnv("CASE_SENSITIVE", Integer.toString(caseSensitive))
                         .withExposedPorts(5236)
                         .waitingFor(Wait.forListeningPort().withStartupTimeout(Duration.ofMinutes(5)));
+                final String benchmarkRun = System.getProperty("dameng.archive.benchmark.run");
+                if (benchmarkRun != null) {
+                    container.withLabel("dameng.archive.benchmark.run", benchmarkRun);
+                }
                 container.start();
                 hostname = container.getHost();
                 port = container.getMappedPort(5236);
@@ -93,7 +97,7 @@ final class DamengTestDatabase {
             }
             jdbcUrl = "jdbc:dm://" + hostname + ":" + port;
             verifyCompatibilityMode(mode);
-            for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE")) {
+            for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE", "RECYCLEBIN")) {
                 final var value = System.getProperty("dameng.test.ini." + name);
                 if (value != null) {
                     verifyLexicalParameter(name, Integer.parseInt(value));
@@ -225,7 +229,7 @@ final class DamengTestDatabase {
         catch (SQLException rejected) {
             throw new SQLException("Fixture cannot set COMPATIBLE_MODE=" + mode + " on this database image", rejected);
         }
-        for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE")) {
+        for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE", "RECYCLEBIN")) {
             final var value = System.getProperty("dameng.test.ini." + name);
             if (value != null) {
                 if (!hasIniParameter(name)) {
@@ -248,7 +252,12 @@ final class DamengTestDatabase {
         assertThat(container.execInContainer("chown", "--reference=/opt/dmdbms/data/DAMENG",
                 "/opt/dmdbms/data/DAMENG/dbz_archive").getExitCode()).as("archive directory ownership").isZero();
         executeAdmin("ALTER DATABASE ARCHIVELOG");
-        executeAdmin("ALTER DATABASE ADD ARCHIVELOG 'DEST=/opt/dmdbms/data/DAMENG/dbz_archive, TYPE=LOCAL, FILE_SIZE=64, SPACE_LIMIT=1024'");
+        final int archiveSize = Integer.getInteger("dameng.test.archive.file.size.mib", 64);
+        final int archiveSpace = Integer.getInteger("dameng.test.archive.space.limit.mib", 1024);
+        assertThat(archiveSize).isBetween(64, 2048);
+        assertThat(archiveSpace).isGreaterThanOrEqualTo(archiveSize);
+        executeAdmin("ALTER DATABASE ADD ARCHIVELOG 'DEST=/opt/dmdbms/data/DAMENG/dbz_archive, TYPE=LOCAL, FILE_SIZE="
+                + archiveSize + ", SPACE_LIMIT=" + archiveSpace + "'");
         executeAdmin("ALTER DATABASE OPEN");
         container.getDockerClient().restartContainerCmd(container.getContainerId()).exec();
         final var restarted = container.getDockerClient().inspectContainerCmd(container.getContainerId()).exec();
@@ -327,7 +336,7 @@ final class DamengTestDatabase {
             try (var result = statement.executeQuery("SELECT PARA_NAME, PARA_VALUE, SESS_VALUE, FILE_VALUE FROM V$DM_INI "
                     + "WHERE PARA_NAME IN ('COMPATIBLE_MODE','LENGTH_IN_CHAR','DECIMAL_ENHANCED','IFUN_DATETIME_MODE',"
                     + "'NUMBER_MODE','FLOAT_MODE','ORA_DATE_FMT','MY_STRICT_TABLES','NVARCHAR_LENGTH_IN_CHAR','RLOG_APPEND_LOGIC','RLOG_IGNORE_TABLE_SET','RLOG_LLOG_COMPRESS',"
-                    + "'BACKSLASH_ESCAPE','NESTED_C_STYLE_COMMENT') ORDER BY PARA_NAME")) {
+                    + "'BACKSLASH_ESCAPE','NESTED_C_STYLE_COMMENT','RECYCLEBIN') ORDER BY PARA_NAME")) {
                 while (result.next()) {
                     evidence.append(result.getString(1)).append('=').append(result.getString(2))
                             .append(";session=").append(result.getString(3)).append(";file=").append(result.getString(4)).append('\n');

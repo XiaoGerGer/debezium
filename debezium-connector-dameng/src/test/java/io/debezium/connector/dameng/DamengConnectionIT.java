@@ -75,6 +75,54 @@ class DamengConnectionIT {
     }
 
     @Test
+    void shouldReadActualCtasColumnsWithoutInheritingSourceAttributes() throws Exception {
+        final var source = connection.quotedTableIdString(new TableId(null, tableId.schema(), tableId.table() + "_SOURCE"));
+        connection.execute("CREATE TABLE " + source + "(ID INT IDENTITY PRIMARY KEY,V VARCHAR(30) DEFAULT 'initial' NOT NULL,N DECIMAL(12,2))");
+        try {
+            connection.execute("INSERT INTO " + source + "(N) VALUES(12.34)");
+            createTableAs("SELECT ID,V,N,DATE '2026-11-04' AS D,TIMESTAMP '2026-11-04 10:00:00' AS TS FROM " + source);
+            // The target is usable even after the query's source has changed.
+            connection.execute("ALTER TABLE " + source + " MODIFY V VARCHAR(90)");
+            final var table = connection.readTableSchema(tableId);
+            assertThat(table.retrieveColumnNames()).containsExactly("ID", "V", "N", "D", "TS");
+            assertThat(table.primaryKeyColumnNames()).isEmpty();
+            assertThat(table.columnWithName("ID").jdbcType()).isEqualTo(Types.INTEGER);
+            assertThat(table.columnWithName("ID").isAutoIncremented()).isFalse();
+            assertThat(table.columnWithName("ID").isOptional()).isTrue();
+            assertThat(table.columnWithName("V").length()).isEqualTo(30);
+            assertThat(table.columnWithName("V").isOptional()).isFalse();
+            assertThat(table.columnWithName("V").defaultValueExpression()).isEmpty();
+            assertThat(table.columnWithName("N").length()).isEqualTo(12);
+            assertThat(table.columnWithName("N").scale()).contains(2);
+            assertThat(table.columnWithName("D").jdbcType()).isEqualTo(Types.DATE);
+            assertThat(table.columnWithName("D").length()).isEqualTo(13);
+            assertThat(table.columnWithName("TS").jdbcType()).isEqualTo(Types.TIMESTAMP);
+            assertThat(table.columnWithName("TS").scale()).contains(6);
+            assertThat(connection.getTableObjectId(tableId)).isPositive();
+        }
+        finally {
+            connection.execute("DROP TABLE " + source);
+        }
+    }
+
+    @Test
+    void shouldExposeANewObjectIdentityAfterCtasTargetRecreation() throws Exception {
+        createTableAs("SELECT 1 AS ID FROM DUAL");
+        final long originalId = connection.getTableObjectId(tableId);
+        connection.execute("DROP TABLE " + tableName());
+        connection.execute("CREATE TABLE " + tableName() + "(OTHER_VALUE VARCHAR(7))");
+        assertThat(connection.getTableObjectId(tableId)).isNotEqualTo(originalId);
+        final var current = connection.readTableSchema(tableId);
+        assertThat(current.retrieveColumnNames()).containsExactly("OTHER_VALUE");
+        assertThat(current.columnWithName("OTHER_VALUE").length()).isEqualTo(7);
+    }
+
+    private void createTableAs(String query) throws Exception {
+        connection.execute("CREATE TABLE " + tableName() + " AS " + query);
+        tableCreated = true;
+    }
+
+    @Test
     void shouldExposeArchiveFileByteLengths() throws Exception {
         final var archives = connection.readArchiveLogFiles();
         assertThat(archives).isNotEmpty().allSatisfy(file -> assertThat(file.bytes()).isPositive());

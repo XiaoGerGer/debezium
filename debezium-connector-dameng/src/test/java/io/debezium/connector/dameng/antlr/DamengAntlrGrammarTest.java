@@ -118,15 +118,9 @@ class DamengAntlrGrammarTest {
     // https://eco.dameng.com/document/dm/zh-cn/pm/advanced-log.html, section 19.3.4.
     @Test
     void shouldKeepAHexadecimalLiteralInsideOneExpressionInsteadOfAnAlias() {
-        final var tree = parse("CREATE TABLE APP.COPY AS SELECT 0xF1 FROM APP.T");
-        final var items = Trees.findAllRuleNodes(tree, DamengSqlParser.RULE_selectItem);
-
-        assertThat(items).singleElement().satisfies(item -> {
-            final var select = (DamengSqlParser.SelectItemContext) item;
-            assertThat(select.expression().getText()).isEqualTo("0xF1");
-            assertThat(select.regularIdentifier()).isNull();
-            assertThat(select.identifier()).isNull();
-        });
+        final var tree = parse("CREATE TABLE APP.T(ID INT DEFAULT 0xF1)");
+        final var literals = Trees.findAllRuleNodes(tree, DamengSqlParser.RULE_primaryExpression);
+        assertThat(literals).singleElement().satisfies(literal -> assertThat(literal.getText()).isEqualTo("0xF1"));
     }
 
     // https://eco.dameng.com/document/dm/zh-cn/pm/function.html

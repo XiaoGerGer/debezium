@@ -28,6 +28,28 @@ import org.junit.jupiter.api.Test;
 
 class DamengGeneratorTest {
     @Test
+    void totalOperationsIncludesExactTailTransaction() throws Exception {
+        final var properties = baseProperties();
+        properties.setProperty("cycles", "100");
+        properties.setProperty("total.operations", "2500");
+        final var config = new Config(properties);
+        final List<Integer> sizes = new ArrayList<>();
+        try (var raw = database(config)) {
+            new DamengGenerator(config, raw, new AtomicBoolean(), (size, times) -> {
+                sizes.add(size);
+                assertTrue(times[1] >= times[0]);
+            }).run();
+            assertEquals(1900, sizes.subList(0, 10).stream().mapToInt(Integer::intValue).sum());
+            assertEquals(600, sizes.get(10));
+            assertEquals(2500, sizes.stream().mapToInt(Integer::intValue).sum());
+            final var counts = auditCounts(raw);
+            assertEquals(1000 + 175, counts[0]);
+            assertEquals(2250, counts[1]);
+            assertEquals(75, counts[2]);
+        }
+    }
+
+    @Test
     void actualCommittedOperationsAndTransactionSizesMatchEveryCycle() throws Exception {
         Config config = config(2);
         List<long[]> commits = new ArrayList<>();

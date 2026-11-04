@@ -42,9 +42,9 @@ tableStatement
 
 createTable
     : CREATE (GLOBAL? TEMPORARY)? TABLE ifNotExists? target=qualifiedName
-        (tableDefinition tableOption* (AS selectStatement)?
+        (tableDefinition tableOption* (AS ctasQuery)?
         | LIKE qualifiedName
-        | tableOption* AS selectStatement) autoIncrementStart?
+        | tableOption* AS ctasQuery) autoIncrementStart?
     ;
 
 autoIncrementStart
@@ -82,7 +82,7 @@ externalParameter
 
 createHugeTable
     : CREATE HUGE TABLE ifNotExists? target=qualifiedName
-        (LPAREN hugeTableElement (COMMA hugeTableElement)* RPAREN | AS selectStatement)
+        (LPAREN hugeTableElement (COMMA hugeTableElement)* RPAREN | AS ctasQuery)
         partitionClause? (TABLESPACE identifier)? hugeStorageClause? hugeCompressionClause?
         (LOG (NONE | LAST | ALL))?
     ;
@@ -137,13 +137,15 @@ columnDefinition
     ;
 
 modifyColumnDefinition
-    : identifier (dataType columnAttribute* | columnAttribute+)
+    // Prefer an attribute so MODIFY V ENCRYPT does not treat ENCRYPT as a type name.
+    : identifier (columnAttribute+ | dataType columnAttribute*)
     ;
 
 columnAttribute
     : DEFAULT (ON NULL)? expression
     | IDENTITY (LPAREN signedNumber COMMA signedNumber RPAREN)?
     | AUTO_INCREMENT
+    | ENCRYPT
     | columnConstraint
     | (GENERATED ALWAYS)? AS LPAREN expression RPAREN VIRTUAL? VISIBLE?
     | COMMENT STRING
@@ -450,6 +452,7 @@ nonTableStatement
     | linkStatement
     | operatorStatement
     | administrativeStatement
+    | purgeStatement
     | tablespaceStatement
     | setStatement
     | grantStatement
@@ -459,8 +462,8 @@ nonTableStatement
     | javaClassDefinition
     ;
 
-// Object DDL follows the DM SQL Language Manual. Only successful RESTRICT
-// deletion is harmless without consulting a later online dictionary.
+// Object DDL follows the DM SQL Language Manual. The analyzer distinguishes
+// cascading drops from successful default/RESTRICT deletion.
 // https://eco.dameng.com/document/dm/zh-cn/pm/definition-statement.html
 createUser
     : CREATE USER ifNotExists? nonTableIdentifier IDENTIFIED userAuthentication userOption*
@@ -472,7 +475,7 @@ alterUser
     ;
 
 dropUser
-    : DROP USER ifExists? nonTableIdentifier RESTRICT?
+    : DROP USER ifExists? target=nonTableIdentifier (RESTRICT | CASCADE)?
     ;
 
 userAuthentication
@@ -509,7 +512,7 @@ createSchema
     ;
 
 dropSchema
-    : DROP SCHEMA ifExists? nonTableIdentifier RESTRICT?
+    : DROP SCHEMA ifExists? target=nonTableIdentifier (RESTRICT | CASCADE)?
     ;
 
 createDirectory
@@ -554,24 +557,26 @@ dropLibrary
 // to object types; dropping BODY removes its implementation, not the type.
 // A successful default/RESTRICT drop therefore cannot remove dependent tables.
 // custom-type.html (13.4.2): TYPE BODY CASCADE also preserves the type itself.
+// Prefer BODY definitions when the object name is a contextual keyword such as CASCADE.
 dropType
-    : DROP TYPE ifExists? nonTableName RESTRICT?
-    | DROP TYPE BODY ifExists? nonTableName (RESTRICT | CASCADE)?
+    : DROP TYPE BODY ifExists? nonTableName (RESTRICT | CASCADE)?
+    | DROP TYPE ifExists? target=nonTableName (RESTRICT | CASCADE)?
     ;
 
 dropClass
-    : DROP CLASS BODY? ifExists? nonTableName RESTRICT?
+    : DROP CLASS BODY ifExists? nonTableName RESTRICT?
+    | DROP CLASS ifExists? target=nonTableName (RESTRICT | CASCADE)?
     ;
 
 // Section 3.11: DOMAIN columns still require historical type resolution.
 // Defining a domain alone does not create columns; cascading its removal is
-// deliberately not treated as a harmless object operation.
+// classified separately by the analyzer.
 createDomain
     : CREATE DOMAIN ifNotExists? nonTableName nonTableTail
     ;
 
 dropDomain
-    : DROP DOMAIN ifExists? nonTableName RESTRICT?
+    : DROP DOMAIN ifExists? target=nonTableName (RESTRICT | CASCADE)?
     ;
 
 // Section 3.20: PROFILE CASCADE removes user/profile associations, not tables.
@@ -783,6 +788,14 @@ administrativeStatement
     : ALTER DATABASE (DROP LOGFILE | RENAME LOGFILE | nonTableElement)+
     | ALTER (SYSTEM | SESSION) nonTableElement+
     | ALTER JAVA CLASS nonTableName COMPILE DEBUG?
+    ;
+
+// Verified against DM 8.1.3.162 with RECYCLEBIN=1. These commands only remove
+// recycled objects; DROP TABLE ... PURGE still belongs to tableStatement.
+purgeStatement
+    : PURGE (RECYCLEBIN | DBA_RECYCLEBIN
+        | (TABLE | INDEX) nonTableName
+        | TABLESPACE nonTableIdentifier (USER nonTableIdentifier)?)
     ;
 
 // DM SQL Language Manual 3.4.1-3.4.3, including the syntax diagrams.
@@ -1247,6 +1260,21 @@ typePrecision
     : LPAREN NUMBER (COMMA signedNumber | CHAR | BYTE)? RPAREN
     ;
 
+// CTAS needs its target identity, not query expression semantics. Keep command
+// and parenthesis boundaries while the online dictionary supplies output columns.
+ctasQuery
+    : (SELECT | WITH) ctasQueryElement+
+    | LPAREN ctasQuery RPAREN ctasQueryElement*
+    ;
+
+ctasQueryElement
+    : LPAREN ctasQueryElement* RPAREN
+    | TRUNCATE LPAREN ctasQueryElement* RPAREN
+    | FOR UPDATE
+    | ~(SEMICOLON | LPAREN | RPAREN | CREATE | ALTER | DROP | TRUNCATE | RENAME
+        | GRANT | REVOKE | INSERT | UPDATE | DELETE | COMMIT | ROLLBACK | EXECUTE)
+    ;
+
 // https://eco.dameng.com/document/dm/zh-cn/pm/check-phrases.html
 // Queries and expressions are a bounded SQL subset, rather than an opaque tail.
 // Unsupported query forms fail closed; they are not evidence of harmless DDL.
@@ -1458,7 +1486,7 @@ nonCommandKeyword
     | CHARACTER | CHARACTER_CODE | CHECK | CHECKPOINT | CLASS | CLOB | CLUSTER | CLUSTERBTR
     | COLUMN | COMMENT | COMMIT | COMPILE | COMPRESS | CONNECT | CONSTANT | CONSTRAINT
     | CONSTRAINTS | CONTEXT | COUNTER | CREATION | CROSS | CURRENT | CURRENT_USER
-    | CURSOR | CYCLE | DATABASE | DATAFILE | DATE | DATETIME | DAY | DDL
+    | CURSOR | CYCLE | DATABASE | DATAFILE | DATE | DATETIME | DAY | DBA_RECYCLEBIN | DDL
     | DEBUG | DEC | DECIMAL | DECLARE | DEFAULT | DEFERRABLE | DEFERRED | DEFINER
     | DELETE | DELIMITED | DELTA | DESC | DETERMINISTIC | DIRECTORY | DISABLE | DISKSPACE
     | DISTINCT | DOMAIN | DOUBLE | DUMP | EACH | ELSE | ENABLE
@@ -1480,7 +1508,7 @@ nonCommandKeyword
     | ONLINE | ONLY | OPEN | OPTION | OR | ORDER | OUT | OUTER
     | PACKAGE | PARALLEL | PARMS | PARTIAL | PARTITION | PARTITIONS | PCTFREE | PENDANT
     | PIPELINED | PRECEDES | PRECISION | PRESERVE | PRIMARY | PRIOR | PRIVILEGES | PROCEDURE
-    | PREBUILT | PUBLIC | PURGE | RANGE | RAW | READ | REAL | REBUILD | RECORDS | REFRESH
+    | PREBUILT | PUBLIC | PURGE | RANGE | RAW | READ | REAL | REBUILD | RECORDS | RECYCLEBIN | REFRESH
     | REFERENCES | REFERENCING | REPLACE | RESTORE | RESTRICT | RETURN | REUSE
     | REVERSE | REVOKE | RIGHT | ROLE | ROLLBACK | ROW | ROWID | ROWS
     | SCHEMA | SECOND | SECTION | SEGMENT | SELECT | SEQUENCE | SERERR | SESSION

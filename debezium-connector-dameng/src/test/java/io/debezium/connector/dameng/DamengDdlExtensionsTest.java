@@ -41,12 +41,10 @@ class DamengDdlExtensionsTest {
         assertThat(table.columnWithName("V").length()).isEqualTo(30);
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = { "LIKE APP.S", "AS SELECT * FROM APP.S", "AS SELECT ID,V FROM APP.S WHERE ID>1",
-            "AS SELECT A.ID,A.V FROM APP.S AS A WHERE A.ID IN (1,2)", "AS SELECT A.ID,A.V FROM APP.S A" })
-    void shouldDeriveCopiedTableFromHistoricalColumnsWithoutCopyingKeysOrDefaults(String query) {
+    @Test
+    void shouldDeriveLikeTableFromHistoricalColumnsWithoutCopyingKeysOrDefaults() {
         parser.parse("CREATE TABLE APP.S(ID INT PRIMARY KEY,V VARCHAR(30) DEFAULT 'old' COMMENT 'source')", tables, "APP");
-        parser.parse("CREATE TABLE APP.T " + query, tables, "APP");
+        parser.parse("CREATE TABLE APP.T LIKE APP.S", tables, "APP");
         final var table = tables.forTable(null, "APP", "T");
         assertThat(table.primaryKeyColumnNames()).isEmpty();
         assertThat(table.attributes()).isEmpty();
@@ -59,11 +57,8 @@ class DamengDdlExtensionsTest {
     }
 
     @Test
-    void shouldPreserveExplicitProjectionNamesCastsAndInlineComments() {
-        parser.parse("CREATE TABLE APP.S(ID INT,V VARCHAR(30))", tables, "APP");
-        parser.parse("CREATE TABLE APP.T AS SELECT ID AS KEY_ID, CAST(V AS VARCHAR(50)) AS TEXT_VALUE FROM APP.S", tables, "APP");
-        assertThat(tables.forTable(null, "APP", "T").retrieveColumnNames()).containsExactly("KEY_ID", "TEXT_VALUE");
-        assertThat(tables.forTable(null, "APP", "T").columnWithName("TEXT_VALUE").length()).isEqualTo(50);
+    void shouldPreserveDefaultOnNullAndInlineComments() {
+        parser.parse("CREATE TABLE APP.T(ID INT)", tables, "APP");
         parser.parse("ALTER TABLE APP.T ADD C VARCHAR(30) DEFAULT ON NULL 'fallback' COMMENT q'[column;--/*]'", tables, "APP");
         final var column = tables.forTable(null, "APP", "T").columnWithName("C");
         assertThat(column.isOptional()).isFalse();
@@ -72,15 +67,9 @@ class DamengDdlExtensionsTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "CREATE TABLE APP.T AS SELECT * FROM APP.MISSING", "CREATE TABLE APP.T AS SELECT UNKNOWN FROM APP.S",
-            "CREATE TABLE APP.T AS SELECT X.ID FROM APP.S A", "CREATE TABLE APP.T AS SELECT ID+1 FROM APP.S",
-            "CREATE TABLE APP.T AS SELECT COUNT(*) FROM APP.S", "CREATE TABLE APP.T AS SELECT ID,ID FROM APP.S",
-            "CREATE TABLE APP.T AS SELECT ID,* FROM APP.S", "CREATE TABLE APP.T AS SELECT *,* FROM APP.S",
-            "CREATE TABLE APP.T(\"id\",\"ID\") AS SELECT ID,V FROM APP.S", "CREATE TABLE APP.T(\"id\" INT,\"ID\" INT)",
-            "CREATE TABLE APP.T AS SELECT ID FROM APP.S JOIN APP.S B ON 1=1", "CREATE TABLE APP.T AS SELECT ID FROM APP.S WHERE ID IN(SELECT ID FROM APP.S)",
+    @ValueSource(strings = { "CREATE TABLE APP.T(\"id\",\"ID\") AS SELECT ID,V FROM APP.S", "CREATE TABLE APP.T(\"id\" INT,\"ID\" INT)",
             "CREATE TABLE APP.T(A) AS SELECT ID,V FROM APP.S", "CREATE TABLE APP.T(A,A) AS SELECT ID,V FROM APP.S",
-            "CREATE TABLE APP.T(A,B) AS SELECT ID,V FROM APP.S", "CREATE TABLE APP.T(A INT,B VARCHAR(30)) AS SELECT ID,V FROM APP.S",
-            "CREATE TABLE APP.T AS SELECT ID FROM APP.S WHERE", "CREATE TABLE APP.T(ID INT) PARTITION BY HASH(ID) PARTITIONS 0",
+            "CREATE TABLE APP.T(A,B) AS SELECT ID,V FROM APP.S", "CREATE TABLE APP.T(ID INT) PARTITION BY HASH(ID) PARTITIONS 0",
             "CREATE TABLE APP.T(ID INT) PARTITION BY HASH(UNKNOWN) PARTITIONS 2", "CREATE TABLE APP.T(ID INT) UNKNOWN OPTION",
             "CREATE TABLE APP.T(ID INT) STORAGE(USING UNKNOWN ROW)", "CREATE TABLE APP.T(ID INT COMMENT)",
             "CREATE TABLE APP.T(ID INT COMMENT 42)", "CREATE TABLE APP.T(ID INT,V INT GENERATED ALWAYS AS(ID+1) VIRTUAL)",

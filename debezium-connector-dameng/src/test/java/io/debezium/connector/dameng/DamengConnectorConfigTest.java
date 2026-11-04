@@ -20,6 +20,16 @@ import io.debezium.relational.TableId;
 
 class DamengConnectorConfigTest {
     @Test
+    void shouldRequireAnExplicitCascadeDropOptIn() {
+        assertThat(new DamengConnectorConfig(configuration().build()).isCascadeDropIgnored()).isFalse();
+        assertThat(new DamengConnectorConfig(configuration().with(DamengConnectorConfig.CASCADE_DROP_IGNORE, true).build())
+                .isCascadeDropIgnored()).isTrue();
+        assertThat(DamengConnectorConfig.configDef().configKeys().get("cascade.drop.ignore").defaultValue).isEqualTo(false);
+        assertThat(configuration().with(DamengConnectorConfig.CASCADE_DROP_IGNORE, "invalid").build()
+                .validate(DamengConnectorConfig.ALL_FIELDS).get("cascade.drop.ignore").errorMessages()).isNotEmpty();
+    }
+
+    @Test
     void shouldRequireAnExplicitPartitionDropOptIn() {
         assertThat(new DamengConnectorConfig(configuration().build()).isPartitionDropIgnored()).isFalse();
         assertThat(new DamengConnectorConfig(configuration().with(DamengConnectorConfig.PARTITION_DROP_IGNORE, true).build())

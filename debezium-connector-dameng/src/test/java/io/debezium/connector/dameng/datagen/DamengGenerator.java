@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 
 final class DamengGenerator {
     private static final String KEY_WHERE = " WHERE \"MANDT\"=? AND \"BUKRS\"=?"
@@ -38,13 +39,19 @@ final class DamengGenerator {
     private long committedDeletes;
     private long updateSequence;
     private long completedCycles;
+    private final BiConsumer<Integer, long[]> transactionObserver;
 
     DamengGenerator(Config config, Connection connection, AtomicBoolean stopping) {
+        this(config, connection, stopping, null);
+    }
+
+    DamengGenerator(Config config, Connection connection, AtomicBoolean stopping, BiConsumer<Integer, long[]> transactionObserver) {
         this.config = config;
         this.connection = connection;
         this.stopping = stopping;
         this.random = new Random(config.seed);
         this.row = new BsegRow(config, random);
+        this.transactionObserver = transactionObserver;
     }
 
     void run() throws SQLException {
@@ -75,6 +82,14 @@ final class DamengGenerator {
                         config.largeSize, config.smallSize, config.intervalMs);
                 for (long cycle = 1; !stopping.get() && (config.cycles == 0 || cycle <= config.cycles); cycle++) {
                     long started = System.nanoTime();
+                    final long committed = committedInserts + committedUpdates + committedDeletes;
+                    if (config.totalOperations > 0 && committed >= config.totalOperations) {
+                        break;
+                    }
+                    if (config.totalOperations > 0 && config.totalOperations - committed < config.largeSize + 9L * config.smallSize) {
+                        transact(Math.toIntExact(config.totalOperations - committed), insert, update, delete);
+                        break;
+                    }
                     for (int size : WorkloadPlan.cycle(config, random)) {
                         if (stopping.get()) {
                             break;
@@ -246,7 +261,9 @@ final class DamengGenerator {
                 pending++;
             }
             executeChecked(statement(previous, insert, update, delete), pending);
+            final long commitStarted = System.currentTimeMillis();
             connection.commit();
+            final long commitFinished = System.currentTimeMillis();
             // In-memory changes and counters become visible only after the database commit succeeds.
             inserted.forEach(keys::add);
             deleted.forEach(keys::remove);
@@ -260,6 +277,9 @@ final class DamengGenerator {
             committedInserts += WorkloadPlan.inserts(size);
             committedUpdates += WorkloadPlan.updates(size);
             committedDeletes += WorkloadPlan.deletes(size);
+            if (transactionObserver != null) {
+                transactionObserver.accept(size, new long[]{ commitStarted, commitFinished });
+            }
         }
         catch (SQLException | RuntimeException e) {
             rollback(e);

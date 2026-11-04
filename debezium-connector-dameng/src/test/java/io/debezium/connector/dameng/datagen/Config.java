@@ -29,6 +29,7 @@ final class Config {
     final int largeSize;
     final int smallSize;
     final long cycles;
+    final long totalOperations;
     final long intervalMs;
     final long seed;
     final boolean initOnly;
@@ -60,6 +61,10 @@ final class Config {
             throw new IllegalArgumentException("大事务必须大于小事务，且两者操作数均须为 100 的倍数，以精确满足 7/90/3 比例");
         }
         cycles = nonnegativeLong(p, "cycles", 0);
+        totalOperations = nonnegativeLong(p, "total.operations", 0);
+        if (totalOperations % 100 != 0) {
+            throw new IllegalArgumentException("total.operations 必须为 100 的倍数");
+        }
         intervalMs = nonnegativeLong(p, "interval.ms", 1000);
         seed = Long.parseLong(p.getProperty("random.seed", "20261012"));
         initOnly = booleanValue(p, "init.only");

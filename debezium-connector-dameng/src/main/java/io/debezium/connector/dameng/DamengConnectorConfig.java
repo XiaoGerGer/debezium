@@ -178,6 +178,15 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
                     + "even if schema.history.internal.skip.unparseable.ddl is true. DM can remove partition rows without per-row DELETE redo, "
                     + "so enabling this option may leave removed rows downstream. Does not allow partition EXCHANGE.");
 
+    public static final Field CASCADE_DROP_IGNORE = Field.create("cascade.drop.ignore")
+            .withDisplayName("Ignore cascading object drops").withType(Type.BOOLEAN).withDefault(false)
+            .withWidth(Width.SHORT).withImportance(Importance.HIGH).withValidation(Field::isBoolean)
+            .withDescription("Ignore fully parsed DROP USER/SCHEMA/DOMAIN/TYPE/CLASS ... CASCADE statements. Defaults to false and stops on these operations, "
+                    + "even if schema.history.internal.skip.unparseable.ddl is true. Affected tables cannot be fully determined from the redo. "
+                    + "Ignoring preserves historical schemas and object-ID mappings without emitting deletion events; downstream data may remain, "
+                    + "and same-name recreation or object-ID reuse may cause later failures or incorrect decoding. "
+                    + "Does not allow cascading TRUNCATE or change supported table, TYPE BODY or PROFILE operations.");
+
     private static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
             .excluding(CommonConnectorConfig.QUERY_FETCH_SIZE)
             .excluding(RelationalDatabaseConnectorConfig.QUERY_TIMEOUT_MS)
@@ -192,7 +201,7 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
                     LOG_MINING_BUFFER_MAX_BYTES,
                     LOG_MINING_BUFFER_MAX_RECORDS, LOG_MINING_BUFFER_MAX_SQL_BYTES, LOG_MINING_BUFFER_MAX_TRANSACTIONS, LOG_MINING_BUFFER_MEMORY_BYTES,
                     LOG_MINING_BUFFER_SPILL_PATH, LOG_MINING_BUFFER_SPILL_MAX_BYTES,
-                    QUERY_FETCH_SIZE, TIME_PRECISION_MODE, UNAVAILABLE_VALUE_PLACEHOLDER, PARTITION_DROP_IGNORE)
+                    QUERY_FETCH_SIZE, TIME_PRECISION_MODE, UNAVAILABLE_VALUE_PLACEHOLDER, PARTITION_DROP_IGNORE, CASCADE_DROP_IGNORE)
             .events(SOURCE_INFO_STRUCT_MAKER)
             .create();
     public static final Field.Set ALL_FIELDS = Field.setOf(CONFIG_DEFINITION.all());
@@ -342,6 +351,10 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
 
     public boolean isPartitionDropIgnored() {
         return getConfig().getBoolean(PARTITION_DROP_IGNORE);
+    }
+
+    public boolean isCascadeDropIgnored() {
+        return getConfig().getBoolean(CASCADE_DROP_IGNORE);
     }
 
     private static int validateRecoveryNonce(Configuration config, Field field, Field.ValidationOutput problems) {
