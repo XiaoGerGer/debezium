@@ -69,11 +69,11 @@ class DamengConnectionTest {
         doReturn(jdbc).when(connection).connection();
         when(jdbc.getMetaData()).thenReturn(metadata);
         when(metadata.getDatabaseProductName()).thenReturn("DM DBMS");
-        when(metadata.getDatabaseProductVersion()).thenReturn("8.1.2.128");
+        when(metadata.getDatabaseProductVersion()).thenReturn("8.1.3.162");
         when(metadata.getDatabaseMajorVersion()).thenReturn(8);
         when(metadata.getDatabaseMinorVersion()).thenReturn(1);
 
-        assertThat(connection.getDatabaseVersion()).isEqualTo(new DamengDatabaseVersion("DM DBMS", "8.1.2.128", 8, 1));
+        assertThat(connection.getDatabaseVersion()).isEqualTo(new DamengDatabaseVersion("DM DBMS", "8.1.3.162", 8, 1));
     }
 
     @Test

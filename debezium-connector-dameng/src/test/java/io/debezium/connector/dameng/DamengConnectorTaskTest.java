@@ -31,7 +31,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 
 class DamengConnectorTaskTest {
-    private static final DamengDatabaseVersion TESTED_VERSION = new DamengDatabaseVersion("DM DBMS", "8.1.2.128", 8, 1);
+    private static final DamengDatabaseVersion TESTED_VERSION = new DamengDatabaseVersion("DM DBMS", "8.1.3.162", 8, 1);
     private final LogInterceptor logs = LogInterceptor.forClass(DamengConnectorTask.class);
 
     @Test
@@ -59,7 +59,7 @@ class DamengConnectorTaskTest {
     }
 
     @ParameterizedTest
-    @CsvSource({ "8.1.2.128, true", "8.1.2.129, false", "8.1.3.140, false", ", false", "'', false" })
+    @CsvSource({ "8.1.2.128, true", "8.1.2.129, false", "8.1.3.140, false", "8.1.3.162, true", "8.1.3.163, false", ", false", "'', false" })
     void shouldLogDatabaseVersionAndContinueStartupRegardlessOfTestedStatus(String productVersion, boolean tested) throws SQLException {
         final var config = DamengTestConfiguration.configuration().build();
         final var task = new DamengConnectorTask();
@@ -78,7 +78,10 @@ class DamengConnectorTaskTest {
                     });
             assertThat(logs.containsWarnMessage("has not been tested")).isEqualTo(!tested);
             if (!tested) {
-                assertThat(logs.containsWarnMessage("Tested JDBC product versions: [8.1.2.128]. Startup will continue")).isTrue();
+                assertThat(logs.getLoggingEvents("has not been tested")).singleElement().satisfies(event -> {
+                    assertThat(event.getLevel()).isEqualTo(Level.WARN);
+                    assertThat(event.getFormattedMessage()).contains("Tested JDBC product versions:", "8.1.2.128", "8.1.3.162", "Startup will continue");
+                });
             }
         }
     }

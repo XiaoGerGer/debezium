@@ -136,7 +136,7 @@ Task 自动查询 `SF_GET_CASE_SENSITIVE_FLAG()`，结果仍进入 offset 的 co
 默认镜像切换为 `dameng:8.1.3.162-20240621-rev232765`，JDBC 实测版本 `8.1.3.162`，服务器构建 `03134284194-20240621-232765-20108`。
 驱动仍为 `8.1.3.140`，Connector/Kafka 编译依赖未变。普通数据库用例使用 GB18030、COMPATIBLE_MODE=0、LENGTH_IN_CHAR=0、RLOG_APPEND_LOGIC=2、RLOG_IGNORE_TABLE_SET=1、RLOG_LLOG_COMPRESS=0；物理主备 fixture 使用 UTF-8。
 本轮未重新运行非零 COMPATIBLE_MODE 的完整矩阵，不能由原生模式结果推导其兼容性。
-版本告警名单未改，8.1.3.162 启动时的“未测试版本”WARN 仍存在；该告警本身不终止任务。
+本轮运行时版本告警名单尚未更新，8.1.3.162 启动时仍出现“未测试版本”WARN；该告警本身不终止任务。
 
 测试环境适配包括归档目录继承数据库目录属主、主备 fixture 显式接管容器入口和动态库路径，以及删除新版 dminit 不接受的 LENGTH_IN_CHAR 初始化参数。
 主备就绪检查改为主库 REALTIME 归档与双方 LOCAL 归档有效；新版备库未启用的反向发送状态为 null，不能要求双向发送均为 VALID。人工切换和 takeover 输入新版 dmmonitor 所需的 YES，并为监视器增加 90 秒超时和失败日志保存。

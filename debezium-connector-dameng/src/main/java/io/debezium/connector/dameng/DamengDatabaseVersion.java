@@ -12,8 +12,10 @@ import java.util.Set;
 /** Database version reported by JDBC, independently of the JDBC driver's version. */
 public record DamengDatabaseVersion(String productName, String productVersion, int major, int minor) {
 
-    // DM8 build 08134283904-20220804-166351-20005 reports this version through JDBC.
-    static final Set<DamengDatabaseVersion> TESTED_VERSIONS = Set.of(new DamengDatabaseVersion("DM DBMS", "8.1.2.128", 8, 1));
+    // JDBC product versions from the historical baseline and the current regression image.
+    static final Set<DamengDatabaseVersion> TESTED_VERSIONS = Set.of(
+            new DamengDatabaseVersion("DM DBMS", "8.1.2.128", 8, 1),
+            new DamengDatabaseVersion("DM DBMS", "8.1.3.162", 8, 1));
 
     public static DamengDatabaseVersion read(DatabaseMetaData metadata) throws SQLException {
         return new DamengDatabaseVersion(metadata.getDatabaseProductName(), metadata.getDatabaseProductVersion(),
