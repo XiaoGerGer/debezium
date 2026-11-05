@@ -20,7 +20,7 @@
 ** xref:connectors/postgresql.adoc[PostgreSQL]
 ** xref:connectors/oracle.adoc[Oracle]
 ** xref:connectors/dameng.adoc[Dameng]
-*** xref:connectors/dameng.adoc#dameng-support-matrix[兼容与测试矩阵]
+*** xref:connectors/dameng.adoc#dameng-support-matrix[支持范围]
 *** xref:connectors/dameng.adoc#dameng-database-setup[数据库端配置]
 *** xref:connectors/dameng.adoc#dameng-deployment[部署与 REST 管理]
 *** xref:connectors/dameng.adoc#dameng-configuration[参数参考]
