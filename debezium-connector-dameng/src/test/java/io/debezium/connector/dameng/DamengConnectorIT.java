@@ -43,6 +43,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.dameng.compatibility.DamengCompatibilityMode;
+import io.debezium.connector.dameng.compatibility.DamengCompatibilityRegistry;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.embedded.util.MetricsHelper;
 import io.debezium.junit.logging.LogInterceptor;
@@ -298,7 +300,9 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
                 assertThat(logs.containsMessage("Connected to " + version.productName() + " database version " + version.productVersion())).isTrue();
                 assertThat(logs.containsMessage("matches tested JDBC version: " + version.isTested())).isTrue();
                 assertThat(logs.containsWarnMessage("has not been tested")).isEqualTo(!version.isTested());
-                assertThat(logs.containsMessage("Dameng COMPATIBLE_MODE=0 selected compatibility profile native-v1")).isTrue();
+                final var mode = new DamengCompatibilityMode(Integer.toString(DamengTestDatabase.requestedCompatibilityMode()));
+                final var profile = DamengCompatibilityRegistry.builtIn().resolve(mode);
+                assertThat(logs.containsMessage("Dameng COMPATIBLE_MODE=" + mode + " selected compatibility profile " + profile.id())).isTrue();
             }
             finally {
                 logs.stop();

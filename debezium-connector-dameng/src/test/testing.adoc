@@ -30,7 +30,7 @@ The table records test implementation coverage, not successful execution. Maven 
 |Connection validation, all configuration combinations and field serialization need additional tests
 
 |OracleJdbcConfigurationTest, OracleConnectionTest, ConnectionIT
-|DamengConnectorIT establishes JDBC and connector connections. DamengConnectionTest and DamengConnectionIT cover object identity, JDBC normalization and archived redo fixtures. DamengLogMiningConfigurationTest covers archive/logical logging requirements, optional compression parameters on older DM versions and non-native compatibility mode rejection
+|DamengConnectorIT establishes JDBC and connector connections. DamengConnectionTest and DamengConnectionIT cover object identity, JDBC normalization and archived redo fixtures. DamengLogMiningConfigurationTest covers archive/logical logging requirements, optional compression parameters on older DM versions, mode 7 selection and rejection of unimplemented modes
 |DamengConnectionTest and DamengConnectorConfigTest additionally cover service-group failover URLs, primary/open role enforcement and rejection of unsafe driver routing. DamengRecoverySafetyIT covers non-DBA session termination and startup/streaming connection loss. Oracle TNS and RAC configuration do not apply; additional DM/JDBC versions remain unverified
 
 |OraclePartitionTest
@@ -43,7 +43,7 @@ The table records test implementation coverage, not successful execution. Maven 
 
 |OracleTableIdParserTest, OracleUtilsTest
 |LogMinerDmlParserTest covers quoted table/column identities and metadata mismatch; DamengConnectorIT checks mixed-case quoted table and key/column names in snapshot and streaming events
-|DamengCaseSensitivityIT runs initialized CASE_SENSITIVE=0 and 1 databases on 8.1.3.162, covering canonical metadata/history, quoted identifiers, strict filters, signals, recovery, primary-key case changes and incremental snapshots. Other compatibility modes and character-set combinations remain unverified
+|DamengCaseSensitivityIT runs initialized CASE_SENSITIVE=0 and 1 databases on 8.1.3.162, covering canonical metadata/history, quoted identifiers, strict filters, signals, recovery, primary-key case changes and incremental snapshots. The same suite accepts modes 0 and 7; other compatibility modes and character-set combinations remain unverified
 
 |OracleConnectorIT, OraclePrimaryKeyIT, OracleConnectorFilterIT, OracleSkipMessagesWithoutChangeConfigIT
 |DamengConnectorIT covers initial snapshot, committed CRUD, JDBC batch inserts, set-based multi-row updates/deletes, primary-key changes and headers, tombstones, tables without a primary key, table inclusion, newly matching tables, column include/exclude filters, unchanged-event and skipped-operation policies, truncation, nulls and offset restart. DamengChangeRecordEmitterTest checks primary-key dispatch and missing LOB values
@@ -268,6 +268,7 @@ All fixture-owned database containers were removed.
 
 Compatibility strategy unit tests are in `io.debezium.connector.dameng.compatibility`, matching the production package.
 `DamengCompatibilityTest` covers open mode identifiers, registry conflicts, immutable environment parameters and native DDL rules.
+`DamengPostgresCompatibilityTest` covers mode 7 selection, DM physical types, E-prefixed defaults, WITHOUT TIME ZONE and rejection of unverified settings.
 `DamengConnectionIT` and `DamengConnectorIT` retain the database and task integration checks in the main connector test package.
 
 
@@ -297,9 +298,11 @@ Ancient and future non-zone temporal boundaries have separate test instances so 
 Before creating test tables, the fixture changes only its own disposable container, restarts it and verifies the system, session and file values.
 An external `dameng.hostname` is read and checked against the requested mode; it is never reconfigured or restarted.
 The fixture records server build, JDBC version, driver, charset, selected parameters and a numbered case catalog.
-Production still rejects nonzero modes. The component tests invoke the real connection, archived LogMiner, DML/DDL parsers and converters directly;
+Production supports modes `0` and `7` through explicit compatibility profiles. The component tests invoke the real connection, archived LogMiner, DML/DDL parsers and converters directly;
 they do not mock the mode guard. Their success is component evidence, not full Connector support.
-The complete-engine layer retains the startup failure for nonzero modes until compatibility is implemented.
+Unregistered modes still fail during complete-engine startup. Mode `7` additionally requires `FLOAT_MODE=0`, `NUMBER_MODE=0`, `ORA_DATE_FMT=0` and `BACKSLASH_ESCAPE=0`.
+`DamengPostgresCompatibilityIT`, selected with `dameng.compatible.mode=7`, covers both nested-comment settings, E-prefixed defaults,
+TIME/TIMESTAMP WITHOUT TIME ZONE, mixed-case quoted identifiers, offline DDL/CRUD and recovery from the persisted offset and history.
 
 Run the component layer for an explicitly selected mode from the repository root with JDK 21 or newer:
 
@@ -317,7 +320,7 @@ Run the component layer for an explicitly selected mode from the repository root
 
 Repeat the component command with `dameng.compatible.mode` for modes under investigation.
 For mode `2`, `-Ddameng.test.ini.FLOAT_MODE=1 -Ddameng.test.ini.ORA_DATE_FMT=1` configures the documented combination in the test-owned database.
-The production task still rejects nonzero modes; component results do not establish full Connector support.
+The production task rejects unregistered modes; component results alone do not establish full Connector support.
 `dameng.datatype.case` filters the shared catalog, not other datatype or capability tests.
 Reports are ordinary Surefire/Failsafe XML, with environment and case catalog under `target/dameng-mode-evidence`.
 Preserve each run's reports separately when comparing versions or modes. No Python matrix runner is required.

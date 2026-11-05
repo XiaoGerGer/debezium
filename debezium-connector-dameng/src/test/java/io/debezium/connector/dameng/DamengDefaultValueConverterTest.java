@@ -50,6 +50,8 @@ class DamengDefaultValueConverterTest {
         return Stream.of(
                 Arguments.of("'汉😀字\\n\\tmp'", "汉😀字\\n\\tmp"),
                 Arguments.of("N'😀 O''Brien C:\\tmp'", "😀 O'Brien C:\\tmp"),
+                Arguments.of("E'汉😀字\\n\\tmp''s'", "汉😀字\\n\\tmp's"),
+                Arguments.of("e'\\n'", "\\n"),
                 Arguments.of("q'界😀 it's C:\\tmp界'", "😀 it's C:\\tmp"),
                 Arguments.of("q'aA'😀a'", "A'😀"),
                 Arguments.of("q'[]'", ""));

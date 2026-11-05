@@ -5,9 +5,12 @@ Run tests with the Maven wrapper from the repository root, using JDK 21 or newer
 ```sh
 ./mvnw -pl debezium-connector-dameng -am test
 ./mvnw -pl debezium-connector-dameng -am verify -Pdameng-tests
+./mvnw -pl debezium-connector-dameng -am verify -Pdameng-tests \
+  -Dit.test=DamengPostgresCompatibilityIT -Dfailsafe.failIfNoSpecifiedTests=false \
+  -Ddameng.compatible.mode=7
 ```
 
-The first command runs unit tests; the second also runs routine database and embedded-engine integration tests. `-am` includes reactor dependencies. Use `JAVA_HOME=/path/to/jdk` before the command if the shell defaults to an older JDK.
+The first command runs unit tests; the second also runs routine database and embedded-engine integration tests. The third runs the PostgreSQL-mode snapshot, historical DDL, CRUD and recovery regression. `-am` includes reactor dependencies. Use `JAVA_HOME=/path/to/jdk` before the command if the shell defaults to an older JDK.
 
 Database tests require Docker and the documented DM image. They create and clean up their own containers unless an external test database is explicitly configured. Integration tests are skipped by default.
 

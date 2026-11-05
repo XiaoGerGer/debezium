@@ -23,7 +23,7 @@ Connector 通过 JDBC 读取结构和快照，通过 `DBMS_LOGMNR` 挖掘归档 
 
 部署前先确认四点：
 
-* 仅支持 `COMPATIBLE_MODE=0`，单个 Connector 只运行一个 Task。
+* 支持 `COMPATIBLE_MODE=0` 和 `7`，单个 Connector 只运行一个 Task。
 * 默认 `snapshot.mode=no_data`，不扫描存量行；需要首次全量时设置 `initial`。
 * 交付语义为至少一次，重启可能重发未确认的事件，下游需支持幂等处理。
 * 浮点精度、行外 LOB 和 LOCAL TIME ZONE 有已知限制，见 <<dameng-data-types,类型映射>>。
@@ -52,9 +52,20 @@ offset 中的 `compatibility_signature` 记录兼容和词法环境，`capture_s
 [id="dameng-compatible-mode-matrix"]
 === 兼容模式
 
-仅支持服务器实际的 `COMPATIBLE_MODE=0`（达梦原生模式）。其他模式和未知模式均拒绝启动，不回退到原生规则。
+支持服务器实际的 `COMPATIBLE_MODE=0`（达梦原生模式）和 `COMPATIBLE_MODE=7`（PostgreSQL 兼容模式），分别选择 `native-v1` 和 `postgres-v1`。
+其他模式和未知模式均拒绝启动，不回退到原生规则。
 `dameng.compatible.mode` 是测试属性；JDBC 的 `compatibleMode` 驱动选项也不能覆盖服务器检查。
 数据库端的日志和词法参数要求见 <<dameng-database-setup,数据库准备>>。
+
+模式 7 使用达梦 JDBC、归档日志和 `DBMS_LOGMNR`，沿用达梦物理类型映射，不使用 PostgreSQL 的复制协议。
+未引用标识符转大写；引用标识符按 `CASE_SENSITIVE` 和 `IDENTIFIER_MODE` 处理，不按 PostgreSQL 规则转小写。
+支持历史 DDL 中的 `TIME/TIMESTAMP ... WITHOUT TIME ZONE` 和 `E'...'` 字面量。
+模式 7 要求 `BACKSLASH_ESCAPE=0`、`FLOAT_MODE=0`、`NUMBER_MODE=0`、`ORA_DATE_FMT=0`；这些参数会记录到兼容签名并在运行边界复核。
+在该设置下，`E'a\n'` 的反斜杠保留为文字，不解释为换行。
+模式 7 不代表数据库接受所有 PostgreSQL 类型：当前测试的 DM 8.1.3.162 不接受 `SERIAL`、`INT4`、`BYTEA`、`JSONB`、`UUID` 等声明。
+模式 7 的定向回归使用当前默认的 DM 8.1.3.162 镜像、`DmJdbcDriver18 8.1.3.140` 和 GB18030 字符集，覆盖 `CASE_SENSITIVE=0/1`。
+浮点精度、行外 LOB 和 LOCAL TIME ZONE 的限制同样适用于模式 7，见 <<dameng-data-types,类型映射>>。
+切换兼容模式必须建立新的采集基线，不能复用另一模式的 offset 和 schema history。
 
 本实现使用 JDBC LogMiner，不提供 JNI 生产适配器、XStream、OpenLogReplicator、Oracle RAC/PDB 或 Flashback。
 并行初始快照、阻塞快照、自定义 snapshotter、主动丢弃事务和手工注入历史 DDL 未提供。
@@ -118,9 +129,10 @@ offset 中的 `compatibility_signature` 记录兼容和词法环境，`capture_s
 |`RLOG_APPEND_LOGIC` |`2` |UPDATE 和 DELETE 的逻辑日志包含完整的非 BLOB/CLOB 列值，供 Connector 还原行像。值为 `1` 时，有主键表的日志可能只包含主键和更新列。
 |`RLOG_IGNORE_TABLE_SET` |`1` 或 `0` |`1` 维持全表逻辑日志行为；`0` 时由任务配置者手动为每张采集表开启表级逻辑日志，Connector 在启动时打印 WARN 并继续。其他值会使流式任务拒绝启动。
 |`RLOG_LLOG_COMPRESS` |存在时为 `0` |压缩逻辑日志可能使 INSERT 的值无法完整挖取。旧版本没有该参数时，Connector 接受其缺失。
-|`COMPATIBLE_MODE` |`0` |仅支持原生模式，其他值或缺失时拒绝。
+|`COMPATIBLE_MODE` |`0` 或 `7` |原生模式或 PostgreSQL 兼容模式，其他值或缺失时拒绝。
+|`FLOAT_MODE`、`NUMBER_MODE`、`ORA_DATE_FMT` |模式 7 时均为 `0` |模式 7 校验并记录到兼容签名；其他值或缺失会被拒绝。
 |`LENGTH_IN_CHAR` |`0` |使用已验证的字节长度语义。其他值或查询不到该参数都会被拒绝。
-|`BACKSLASH_ESCAPE` |8.1.3.162 使用 `0` |值为 1 的新版本字面量语义尚未适配；代码范围检查仍接受 0、1。
+|`BACKSLASH_ESCAPE` |8.1.3.162 使用 `0` |值为 1 的新版本字面量语义尚未适配；模式 7 拒绝 1，原生模式代码范围检查仍接受 0、1。
 |`NESTED_C_STYLE_COMMENT` |`0` 或 `1` |`0` 在第一个 `*/` 结束块注释；`1` 按嵌套层数匹配结束。其他值或缺失会被拒绝。
 |`CASE_SENSITIVE` |`0` 或 `1` |通过 `SF_GET_CASE_SENSITIVE_FLAG()` 读取，命名规则见 <<dameng-case-sensitive,大小写>>。
 |`IDENTIFIER_MODE` |缺失、`0` 或 `1` |缺失/0 保留引用名大小写，1 转大写；显式模式仅有解析单测，需目标库验证。
@@ -677,7 +689,7 @@ DDL 语法覆盖和实库可执行性分别记录在模块 `src/test/testing.ado
 [id="dameng-data-types"]
 == 数据类型映射
 
-以下为原生模式的默认映射。以实际 JDBC 物理类型和历史 DDL 为依据，不能只按另一数据库同名声明推断。
+以下为原生模式和已支持的 PostgreSQL 兼容模式的默认映射。以实际 JDBC 物理类型和历史 DDL 为依据，不能只按另一数据库同名声明推断。
 JSON 中 bytes 常呈 Base64；Decimal 的 JSON 表示还取决于 Converter 设置，不能把 Connect BYTES 直接理解为业务字符串。
 
 [cols="3,2,5",options="header"]
@@ -745,7 +757,7 @@ LogMiner 未提供足够的原写入会话时区信息，因此带 `Z` 的输出
 [id="dameng-topics"]
 == Topic 与消息用途
 
-默认 Topic 命名保留实际 schema/table 名称大小写。原生模式未加引号的标识符通常为大写，例如 `dameng.APP.CUSTOMERS`。
+默认 Topic 命名保留实际 schema/table 名称大小写。原生模式和 PostgreSQL 兼容模式未加引号的标识符通常为大写，例如 `dameng.APP.CUSTOMERS`。
 以下以 `topic.prefix=dameng` 为例；自定义 TopicNamingStrategy 或 SMT 会改变相应业务 Topic 路由。
 
 [cols="2,3,4",options="header"]
@@ -1461,6 +1473,18 @@ Surefire 在 test 阶段执行单元测试，Failsafe 在 integration-test 执�
 ----
 
 嵌套套件与其他类的 `#方法` 筛选应分次执行，混合到一个 it.test 值可能漏跑嵌套套件。核对 XML 中实际执行的类与数量。
+
+PostgreSQL 兼容模式的专用回归覆盖快照、引用名大小写、归档 DDL、默认值、CRUD 和重启恢复。
+测试只配置自己创建的容器，不修改外部数据库：
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng -am verify -Pdameng-tests \
+  -Dit.test=DamengPostgresCompatibilityIT -Dfailsafe.failIfNoSpecifiedTests=false \
+  -Ddameng.compatible.mode=7
+----
+
+共享的 `DamengConnectorIT`、`DamengCaseSensitivityIT` 和 `DamengDatatypesIT` 也可通过 `-Ddameng.compatible.mode=7` 验证模式 7。
 报告位于模块 `target/surefire-reports/`、`target/failsafe-reports/`，不同调用会残留历史 XML；同一工作区串行运行。
 覆盖率使用 `clean verify -Pdameng-tests,dameng-coverage` 收集新数据，95% 行覆盖率门槛不替代行为验收。
 

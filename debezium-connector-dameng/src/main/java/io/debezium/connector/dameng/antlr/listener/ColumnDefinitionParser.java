@@ -284,9 +284,6 @@ public final class ColumnDefinitionParser {
         boolean timeZone = false;
         boolean localTimeZone = false;
         if (name.equals("TIMESTAMP") || name.equals("DATETIME") || name.equals("TIME") || name.equals("DATETIME2")) {
-            if (type.WITHOUT() != null) {
-                throw error(type, "Unsupported temporal type qualifier");
-            }
             timeZone = type.WITH() != null;
             localTimeZone = type.LOCAL() != null;
             if (localTimeZone && !name.equals("TIMESTAMP")) {

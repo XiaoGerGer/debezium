@@ -34,7 +34,8 @@ public final class DamengDefaultValueConverter implements DefaultValueConverter 
         }
         final String literal = expression.trim();
         final Object value;
-        if (literal.startsWith("'") || literal.regionMatches(true, 0, "N'", 0, 2) || literal.regionMatches(true, 0, "Q'", 0, 2)) {
+        if (literal.startsWith("'") || literal.regionMatches(true, 0, "N'", 0, 2) || literal.regionMatches(true, 0, "Q'", 0, 2)
+                || literal.regionMatches(true, 0, "E'", 0, 2)) {
             final var tokens = new DamengAntlrSqlLexer().tokenize(literal);
             if (tokens.size() != 1 || tokens.get(0).kind() != Kind.STRING) {
                 return Optional.empty();

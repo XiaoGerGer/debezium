@@ -52,7 +52,7 @@ class DamengCompatibilityTest {
         assertThat(mode.value()).isEqualTo(value);
         assertThat(mode.toString()).isEqualTo(value);
         assertThatThrownBy(() -> DamengCompatibilityRegistry.builtIn().resolve(mode))
-                .isInstanceOf(IllegalStateException.class).hasMessageContaining("COMPATIBLE_MODE=" + value, "registered modes: [0]");
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("COMPATIBLE_MODE=" + value, "registered modes: [0, 7]");
     }
 
     @Test

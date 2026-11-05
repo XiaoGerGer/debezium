@@ -461,7 +461,7 @@ TILDE: '~';
 // https://eco.dameng.com/document/dm/zh-cn/pm/dm_sql-introduction.html
 // https://eco.dameng.com/document/dm/zh-cn/sql-dev/practice-strings.html
 Q_QUOTE_START: 'Q' '\'' { startAlternativeQuote(); } -> more, pushMode(Q_DELIMITER_MODE);
-STRING_START: 'N'? '\'' -> more, pushMode(STRING_MODE);
+STRING_START: ('N' | 'E')? '\'' -> more, pushMode(STRING_MODE);
 IDENTIFIER_START: '"' -> more, pushMode(IDENTIFIER_MODE);
 HEX_BINARY_LITERAL: '0X' [0-9A-F]+;
 // Consume malformed suffixes as one error, rather than a literal plus an alias.

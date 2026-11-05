@@ -138,12 +138,22 @@ class DamengLogMiningConfigurationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "1", "2", "3", "4", "5", "6", "7", "42" })
-    void shouldRejectNonNativeTypeSemantics(String compatibilityMode) throws Exception {
+    @ValueSource(strings = { "1", "2", "3", "4", "5", "6", "42" })
+    void shouldRejectUnimplementedTypeSemantics(String compatibilityMode) throws Exception {
         when(connection.getIniParameter("COMPATIBLE_MODE")).thenReturn(compatibilityMode);
 
         assertThatThrownBy(connection::validateLogMiningConfiguration)
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("COMPATIBLE_MODE");
+    }
+
+    @Test
+    void shouldAcceptPostgresModeWithVerifiedTypeSettings() throws Exception {
+        when(connection.getIniParameter("COMPATIBLE_MODE")).thenReturn("7");
+        for (var name : java.util.List.of("FLOAT_MODE", "NUMBER_MODE", "ORA_DATE_FMT")) {
+            when(connection.getIniParameter(name)).thenReturn("0");
+        }
+        assertThatCode(connection::validateLogMiningConfiguration).doesNotThrowAnyException();
+        assertThat(connection.getCompatibilityEnvironment().mode().value()).isEqualTo("7");
     }
 
     @ParameterizedTest
