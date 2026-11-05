@@ -331,6 +331,27 @@
                         <configuration>
                             <includes>
                                 <include>**/*ProbeIT.java</include>
+                            </includes>
+                            <excludes combine.self="override">
+                                <exclude>**/DamengKafkaConnectIT.java</exclude>
+                            </excludes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>dameng-performance-tests</id>
+            <properties>
+                <skipITs>false</skipITs>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration>
+                            <includes>
                                 <include>**/*BenchmarkIT.java</include>
                                 <include>**/*PerformanceIT.java</include>
                             </includes>

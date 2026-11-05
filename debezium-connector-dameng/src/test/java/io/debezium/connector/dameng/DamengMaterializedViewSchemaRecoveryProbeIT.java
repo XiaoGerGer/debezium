@@ -38,7 +38,7 @@ import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 
 /** Separates persisted generation baselines from diagnostic historical-catalog recovery. */
-class DamengMaterializedViewSchemaRecoveryIT {
+class DamengMaterializedViewSchemaRecoveryProbeIT {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Path EVIDENCE = Path.of("target/materialized-view-schema-recovery-it.json");
     private static final String MARKER = "DBZ_MVS_MARKER";

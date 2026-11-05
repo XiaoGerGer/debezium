@@ -76,7 +76,7 @@ class DamengIncrementalSnapshotChangeEventSourceTest {
     @BeforeEach
     @SuppressWarnings("unchecked")
     void before() throws Exception {
-        config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("signal.data.collection", "APP.SIGNAL")
                 .with("schema.history.internal", MemorySchemaHistory.class.getName()).build());
         notifications = mock(NotificationService.class, RETURNS_DEEP_STUBS);

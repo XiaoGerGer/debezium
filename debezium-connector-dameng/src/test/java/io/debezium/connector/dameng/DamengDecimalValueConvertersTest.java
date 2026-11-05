@@ -66,7 +66,7 @@ class DamengDecimalValueConvertersTest {
     }
 
     private static DamengValueConverters converters(String mode) {
-        return new DamengValueConverters(new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        return new DamengValueConverters(new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("decimal.handling.mode", mode).build()));
     }
 

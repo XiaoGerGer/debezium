@@ -186,7 +186,7 @@ class DamengCaptureScopeHistoryTest {
     }
 
     private static DamengConnectorConfig config(Path file, String include) {
-        return new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        return new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("table.include.list", include)
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with(FileSchemaHistory.FILE_PATH, file.toString()).build());

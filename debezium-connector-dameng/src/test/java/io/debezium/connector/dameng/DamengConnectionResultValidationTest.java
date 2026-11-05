@@ -167,7 +167,7 @@ class DamengConnectionResultValidationTest {
 
     @Test
     void shouldPreserveTheSqlFailureWhenCheckingAStoredRestartPosition() throws Exception {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
         final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
         final var failure = new SQLException("V$RLOG temporarily unavailable", "08006");
         doThrow(failure).when(connection).currentLsn();

@@ -143,46 +143,6 @@ final class DamengTestDatabase {
         return result.getStdout() + result.getStderr();
     }
 
-    /** A fixed scratch directory in the test-owned container, never an external backup location. */
-    static String createOfficialBackupDirectory() throws Exception {
-        if (container == null) {
-            throw new IllegalStateException("Official backup tests require a test-owned database container");
-        }
-        final String directory = "/opt/dmdbms/data/DAMENG/dbz_official_backup";
-        assertThat(container.execInContainer("mkdir", "-p", directory).getExitCode()).isZero();
-        assertThat(container.execInContainer("chown", "--reference=/opt/dmdbms/data/DAMENG", directory).getExitCode()).isZero();
-        return directory;
-    }
-
-    /** A local archive destination owned exclusively by the disposable state-transition fixture. */
-    static String createOfficialStateArchiveDirectory() throws Exception {
-        if (container == null) {
-            throw new IllegalStateException("Database state tests require a test-owned database container");
-        }
-        final String directory = "/opt/dmdbms/data/DAMENG/dbz_state_archive";
-        assertThat(container.execInContainer("mkdir", "-p", directory).getExitCode()).isZero();
-        assertThat(container.execInContainer("chown", "--reference=/opt/dmdbms/data/DAMENG", directory).getExitCode()).isZero();
-        return directory;
-    }
-
-    static long officialBackupDirectoryBytes() throws Exception {
-        if (container == null) {
-            throw new IllegalStateException("Official backup tests require a test-owned database container");
-        }
-        final var size = container.execInContainer("du", "-sb", "/opt/dmdbms/data/DAMENG/dbz_official_backup");
-        assertThat(size.getExitCode()).as("test backup directory size: %s", size.getStderr()).isZero();
-        return Long.parseLong(size.getStdout().trim().split("\\s+")[0]);
-    }
-
-    static void removeOfficialBackupDirectory() throws Exception {
-        if (container == null) {
-            throw new IllegalStateException("Official backup tests require a test-owned database container");
-        }
-        final String directory = "/opt/dmdbms/data/DAMENG/dbz_official_backup";
-        assertThat(container.execInContainer("rm", "-rf", "--", directory).getExitCode()).isZero();
-        assertThat(container.execInContainer("test", "!", "-e", directory).getExitCode()).as("test backup directory was removed").isZero();
-    }
-
     /** Freeze inputs for paired miner benchmarks; never operates on an external database. */
     static List<String> freezeBenchmarkArchives(List<String> sources, Path evidenceDirectory) throws Exception {
         if (container == null) {
@@ -348,9 +308,8 @@ final class DamengTestDatabase {
                 System.getProperty("project.build.directory", "target") + "/dameng-mode-evidence"));
         Files.createDirectories(directory);
         Files.writeString(directory.resolve("environment-mode-" + requestedCompatibilityMode() + ".txt"), evidence);
-        final var selection = java.util.regex.Pattern.compile(System.getProperty("dameng.datatype.case", ".*"));
         final var catalog = new StringBuilder();
-        final var cases = DamengDatatypeCases.boundaries().filter(type -> selection.matcher(type.name()).find()).toList();
+        final var cases = DamengDatatypeCases.boundaryTypes().toList();
         for (int index = 0; index < cases.size(); index++) {
             final var type = cases.get(index);
             catalog.append(index + 1).append('\t').append(type.name()).append('\t')

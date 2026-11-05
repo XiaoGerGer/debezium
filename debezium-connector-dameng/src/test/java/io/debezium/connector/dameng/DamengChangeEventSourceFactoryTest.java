@@ -48,7 +48,7 @@ class DamengChangeEventSourceFactoryTest {
 
     @Test
     void shouldCreateSnapshotAndLogMinerStreamingSources() throws Exception {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
         final var factory = factory(config);
 
         assertThat(factory.getSnapshotChangeEventSource(progressListener, notifications)).isInstanceOf(DamengSnapshotChangeEventSource.class);
@@ -61,7 +61,7 @@ class DamengChangeEventSourceFactoryTest {
 
     @Test
     void shouldDisableIncrementalSnapshotsWithoutASourceSignalTable() {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
 
         assertThat(factory(config).getIncrementalSnapshotChangeEventSource(new DamengOffsetContext(config, 123),
                 progressListener, dataListener, notifications)).isEmpty();
@@ -71,7 +71,7 @@ class DamengChangeEventSourceFactoryTest {
 
     @Test
     void shouldUseTheIndependentConnectionForSchemaQualifiedSourceSignals() {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().with("signal.data.collection", "APP.SIGNALS").build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("signal.data.collection", "APP.SIGNALS").build());
         final var table = new TableId(null, "APP", "SIGNALS");
         when(incrementalConnection.quotedTableIdString(table)).thenReturn("\"APP\".\"SIGNALS\"");
 

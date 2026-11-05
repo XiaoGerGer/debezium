@@ -15,7 +15,7 @@ import io.debezium.relational.history.HistoryRecord;
 import io.debezium.relational.history.HistoryRecordComparator;
 
 class DamengHistoryRecordComparatorTest {
-    private final HistoryRecordComparator comparator = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build())
+    private final HistoryRecordComparator comparator = new DamengConnectorConfig(DamengTestConfiguration.configuration().build())
             .getHistoryRecordComparator();
 
     @Test

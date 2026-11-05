@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.dameng;
 
+import static io.debezium.connector.dameng.DamengTestConfiguration.configuration;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -14,7 +15,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import io.debezium.config.Configuration;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.TableId;
@@ -166,14 +166,6 @@ class DamengConnectorConfigTest {
         assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("recovery.restart.nonce").errorMessages()).isNotEmpty();
         assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("recovery.restart.nonce", "x".repeat(129)).build()))
                 .hasMessageContaining("128");
-    }
-
-    static Configuration.Builder configuration() {
-        return Configuration.create()
-                .with("topic.prefix", "dameng")
-                .with("database.hostname", "localhost")
-                .with("database.user", "SYSDBA")
-                .with("database.password", "test");
     }
 
     @Test

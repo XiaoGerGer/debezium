@@ -26,7 +26,7 @@ import io.debezium.relational.Tables;
 
 class DamengDefaultValueConverterTest {
     private final DamengDefaultValueConverter defaults = new DamengDefaultValueConverter(
-            new DamengValueConverters(new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build())));
+            new DamengValueConverters(new DamengConnectorConfig(DamengTestConfiguration.configuration().build())));
 
     @Test
     void shouldDecodeQuotedCharacterDefaultsWithoutEvaluatingThemAsSql() {
@@ -148,7 +148,7 @@ class DamengDefaultValueConverterTest {
     @MethodSource("fixedBinaryHandlingModes")
     void shouldPadFixedBinaryDefaultsBeforeApplyingConfiguredBinaryHandling(String mode, String expected) {
         final var converters = new DamengValueConverters(new DamengConnectorConfig(
-                DamengConnectorConfigTest.configuration().with("binary.handling.mode", mode).build()));
+                DamengTestConfiguration.configuration().with("binary.handling.mode", mode).build()));
         final var converter = new DamengDefaultValueConverter(converters);
         final var column = column(Types.BINARY).edit().type("BINARY").length(4).create();
 
@@ -166,7 +166,7 @@ class DamengDefaultValueConverterTest {
     @MethodSource("binaryHandlingModes")
     void shouldApplyConfiguredBinaryHandlingToHexBinaryDefaults(String mode, String expected) {
         final var converters = new DamengValueConverters(new DamengConnectorConfig(
-                DamengConnectorConfigTest.configuration().with("binary.handling.mode", mode).build()));
+                DamengTestConfiguration.configuration().with("binary.handling.mode", mode).build()));
         final var converter = new DamengDefaultValueConverter(converters);
 
         assertThat(converter.parseDefaultValue(column(Types.VARBINARY), "0x00fbff")).contains(expected);

@@ -289,7 +289,7 @@ class DamengAntlrDdlParserTest {
         assertThat(column.scale()).contains(0);
         assertThat(column.defaultValueExpression()).contains(expression);
         final var defaults = new DamengDefaultValueConverter(new DamengValueConverters(
-                new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build())));
+                new DamengConnectorConfig(DamengTestConfiguration.configuration().build())));
         assertThat(defaults.parseDefaultValue(column, column.defaultValueExpression().orElseThrow()))
                 .contains("P999999999Y11M0DT0H0M0S");
     }
@@ -316,7 +316,7 @@ class DamengAntlrDdlParserTest {
         assertThat(changed.scale()).isEqualTo(original.scale());
         assertThat(changed.defaultValueExpression()).contains(replacement);
         final var defaults = new DamengDefaultValueConverter(new DamengValueConverters(
-                new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build())));
+                new DamengConnectorConfig(DamengTestConfiguration.configuration().build())));
         assertThat(defaults.parseDefaultValue(changed, changed.defaultValueExpression().orElseThrow()))
                 .contains("P0Y0M1DT2H3M4.000005S");
     }

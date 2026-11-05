@@ -165,11 +165,6 @@ class DamengDatatypesIT extends AbstractAsyncEngineConnectorTest {
                 () -> DamengDatatypeAssertions.assertRow(((Struct) streamed.value()).getStruct("after"), expectedStreaming, "streaming"));
     }
 
-    static Stream<TypeCase> boundaryTypes() {
-        final var selection = java.util.regex.Pattern.compile(System.getProperty("dameng.datatype.case", ".*"));
-        return DamengDatatypeCases.boundaries().filter(type -> selection.matcher(type.name()).find());
-    }
-
     static Stream<TypeCase> wideTimestampStringTypes() {
         return IntStream.rangeClosed(7, 9).mapToObj(precision -> {
             final var fraction = "." + "9".repeat(precision);
@@ -191,10 +186,11 @@ class DamengDatatypesIT extends AbstractAsyncEngineConnectorTest {
 
     @ParameterizedTest(name = "Connect output {0}: {1}")
     @MethodSource("negativeZeroTypes")
-    void shouldPreserveNegativeZeroInRawConnectorCrud(String type) throws Exception {
+    void shouldPreserveStoredZeroBitsInRawConnectorCrud(String type) throws Exception {
         config = config.edit().with("tombstones.on.delete", false).build();
         createTable("VALUE " + type);
         insertFloatingValue(1, type, "-0.0");
+        // The database may normalize the input; the connector must preserve the bits JDBC actually reads.
         final var expected = storedValues(1);
         startEngine();
         final var snapshot = nextRecord();
@@ -228,7 +224,7 @@ class DamengDatatypesIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @ParameterizedTest(name = "{0}")
-    @MethodSource("boundaryTypes")
+    @MethodSource("io.debezium.connector.dameng.DamengDatatypeCases#boundaryTypes")
     void shouldPreserveTypeBoundariesAndNullCrudImages(TypeCase type) throws Exception {
         final var declaration = type.declaration();
         final boolean floating = declaration.equals("REAL") || declaration.startsWith("FLOAT") || declaration.startsWith("DOUBLE");

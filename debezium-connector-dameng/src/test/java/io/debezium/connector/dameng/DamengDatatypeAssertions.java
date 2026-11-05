@@ -166,14 +166,14 @@ final class DamengDatatypeAssertions {
     }
 
     static void assertRow(Struct row, Map<String, Object> expected, String stage) {
-        assertAll(stage, () -> assertColumns(row, expected, stage + "/Connect"), () -> {
+        assertAll(stage, () -> assertConnectRow(row, expected, stage), () -> {
             if (row != null) {
                 try (var converter = new JsonConverter()) {
                     converter.configure(Map.of("schemas.enable", true), false);
                     final var encoded = converter.fromConnectData("dameng.types", row.schema(), row);
                     final var decoded = converter.toConnectData("dameng.types", encoded);
                     assertThat(decoded.schema()).as(stage + "/JSON schema").isEqualTo(row.schema());
-                    assertColumns((Struct) decoded.value(), expected, stage + "/JSON");
+                    assertColumns((Struct) decoded.value(), expected, stage + "/JSON", true);
                 }
             }
         });
@@ -181,10 +181,10 @@ final class DamengDatatypeAssertions {
 
     /** Separate connector-output regression; callers must not treat this as a JSON round-trip check. */
     static void assertConnectRow(Struct row, Map<String, Object> expected, String stage) {
-        assertColumns(row, expected, stage + "/Connect");
+        assertColumns(row, expected, stage + "/Connect", false);
     }
 
-    private static void assertColumns(Struct row, Map<String, Object> expected, String stage) {
+    private static void assertColumns(Struct row, Map<String, Object> expected, String stage, boolean jsonRoundTrip) {
         if (expected == null) {
             assertThat(row).as(stage).isNull();
             return;
@@ -210,14 +210,15 @@ final class DamengDatatypeAssertions {
             }
             else if (value instanceof Float number) {
                 assertThat(actual).as(label + "/Java type").isInstanceOf(Float.class);
-                if (number != 0.0f || (Float) actual != 0.0f) {
+                // JsonConverter normalizes negative zero; raw Connect values must retain the stored bits.
+                if (!jsonRoundTrip || number != 0.0f || (Float) actual != 0.0f) {
                     assertThat(Float.floatToRawIntBits((Float) actual)).as("%s stored bits: JDBC=%s, event=%s", label, number, actual)
                             .isEqualTo(Float.floatToRawIntBits(number));
                 }
             }
             else if (value instanceof Double number) {
                 assertThat(actual).as(label + "/Java type").isInstanceOf(Double.class);
-                if (number != 0.0d || (Double) actual != 0.0d) {
+                if (!jsonRoundTrip || number != 0.0d || (Double) actual != 0.0d) {
                     assertThat(Double.doubleToRawLongBits((Double) actual)).as("%s stored bits: JDBC=%s, event=%s", label, number, actual)
                             .isEqualTo(Double.doubleToRawLongBits(number));
                 }

@@ -1,3 +1,4 @@
+////
 <guidelines>
 
 **AGENTS! Before you do anything else:**
@@ -7,11 +8,12 @@ If someone asks you for help working on this codebase, you MUST first follow wit
 You SHOULD understand where they are coming from, what they need, and what issue they want to work on.
 
 </guidelines>
+////
 
 = Dameng connector test coverage
 
-For the current reproducible test entry point, integrated datagen, offline setup and prerequisites, see link:../../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-testing[the unified Dameng documentation].
-The dated results and applicability matrix below are historical evidence, not the outcome of the latest source build.
+For Maven entry points and prerequisites, see link:README.md[the test README] and link:../../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-testing[the Dameng manual].
+Detailed upgrade runs, datatype failure indices and performance comparisons are in link:regression-history.adoc[the historical regression records]. Dated results below apply only to their recorded source and environment.
 
 Oracle tests provide behavioral requirements; Oracle SQL, redo event formats, adapters and database capabilities are not evidence of Dameng support. The current Oracle directory contains 119 Java files with 838 explicitly annotated test methods. Inherited and parameterized tests change the actual execution count.
 
@@ -175,7 +177,7 @@ To retest the unresolved floating precision limitation, run the strict assertion
   -Ddameng.datatype.floating.diagnostics=true
 ----
 
-Run the routine engine/database regression with `verify -Pdameng-tests`; run a database capability probe or load benchmark explicitly with `verify -Pdameng-probes -Dit.test=<ProbeIT>`. The probe profile selects only `*ProbeIT`, `*BenchmarkIT`, and `*PerformanceIT`. Use `verify -Pdameng-all-tests` to select every Failsafe test class; known floating limitations still require `-Ddameng.datatype.floating.diagnostics=true`. Run the packaged worker regression separately with `verify -Pdameng-connect-tests,assembly`. Ordinary `test` does not run these Failsafe integration tests. Surefire/Failsafe XML, rather than this implementation inventory, determines the result of each invocation.
+Run the routine engine/database regression with `verify -Pdameng-tests`; run a database capability probe explicitly with `verify -Pdameng-probes -Dit.test=<ProbeIT>`. The probe profile selects only `*ProbeIT`. Performance experiments use `verify -Pdameng-performance-tests` and their own opt-in properties. Use `verify -Pdameng-all-tests` to select every Failsafe test class except the independent Kafka Connect runtime suite; known floating limitations still require `-Ddameng.datatype.floating.diagnostics=true`. Run the packaged worker regression separately with `verify -Pdameng-connect-tests,assembly`. Ordinary `test` does not run these Failsafe integration tests. Surefire/Failsafe XML, rather than this implementation inventory, determines the result of each invocation.
 
 === Recorded execution on 2026-10-10
 
@@ -299,41 +301,28 @@ Production still rejects nonzero modes. The component tests invoke the real conn
 they do not mock the mode guard. Their success is component evidence, not full Connector support.
 The complete-engine layer retains the startup failure for nonzero modes until compatibility is implemented.
 
-Run the repeatable matrix from the repository root with a supported build JDK:
+Run the component layer for an explicitly selected mode from the repository root with JDK 21 or newer:
 
 [source,shell]
 ----
-JAVA_HOME=/opt/java/jdk-25.0.4+7 \
-  python3 debezium-connector-dameng/src/test/run-compatible-mode-matrix.py
-----
+./mvnw -pl debezium-connector-dameng -am verify -Pdameng-probes \
+  -Dit.test=DamengDatatypeProbeIT -Dfailsafe.failIfNoSpecifiedTests=false \
+  -Ddameng.compatible.mode=0
 
-By default it builds and installs reactor dependencies once, then runs both layers in a fresh Maven JVM for mode `0`.
-Use `--modes` to select the modes under implementation or investigation; identifiers are nonnegative integers without a fixed maximum of 8.
-For a disposable mode `2` database, `--ini FLOAT_MODE=1 --ini ORA_DATE_FMT=1` sets and verifies the documented Oracle-compatible parameter combination before running probes. `--ini NUMBER_MODE=1` can be used to test the separate NUMBER declaration behavior. These options never modify an external database.
-A recognized identifier does not enable its production semantics. Compatibility implementations are registered explicitly and accepted in priority order.
-Shared outside-range cases record server rejection or acceptance; accepted values are compared strictly against their actual JDBC storage baseline.
-They do not assume that only mode 4 can perform a database conversion. Mode-specific parameter contracts require their own acceptance cases.
-The supported-mode boundary and compatibility contract are maintained in the link:../../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-support-matrix[connector manual].
-It continues after failures, preserves each mode's Maven log, command, XML, environment and capabilities under a new `target/compatible-mode-runs` directory,
-and writes `summary.json`. It returns a nonzero exit status when any run fails, skips tests or produces no test XML.
-Database refusal to configure modes 7 or 8 on an old image is a setup failure, never a passed or skipped compatibility test.
-Use `--image` with a newer compatible image to execute those modes; the fixture currently requires the documented `/opt/dmdbms/data/DAMENG` image layout.
-
-For a component-only matrix or a focused development run:
-
-[source,shell]
-----
-JAVA_HOME=/opt/java/jdk-25.0.4+7 \
-  python3 debezium-connector-dameng/src/test/run-compatible-mode-matrix.py \
-  --modes 0,1,2,3,4,5,6 --layer probe --skip-build
-
-./mvnw -pl debezium-connector-dameng verify -Pdameng-tests \
-  -Dit.test=DamengDatatypesIT -Ddameng.compatible.mode=0 \
+./mvnw -pl debezium-connector-dameng -am verify -Pdameng-tests \
+  -Dit.test=DamengDatatypesIT -Dfailsafe.failIfNoSpecifiedTests=false \
+  -Ddameng.compatible.mode=0 \
   '-Ddameng.datatype.case=BIGINT|TIME\(3\)|DECIMAL\(38,'
 ----
 
-`--case` (or `dameng.datatype.case`) filters only the new shared catalog, not the existing datatype methods or capability tests.
-The matrix collects JaCoCo data with the aggregate check disabled for each narrow run; run the separate complete-module coverage gate for the 95% requirement.
+Repeat the component command with `dameng.compatible.mode` for modes under investigation.
+For mode `2`, `-Ddameng.test.ini.FLOAT_MODE=1 -Ddameng.test.ini.ORA_DATE_FMT=1` configures the documented combination in the test-owned database.
+The production task still rejects nonzero modes; component results do not establish full Connector support.
+`dameng.datatype.case` filters the shared catalog, not other datatype or capability tests.
+Reports are ordinary Surefire/Failsafe XML, with environment and case catalog under `target/dameng-mode-evidence`.
+Preserve each run's reports separately when comparing versions or modes. No Python matrix runner is required.
+The supported-mode boundary is maintained in the link:../../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-support-matrix[connector manual].
+Run the separate clean, complete-module coverage gate for the 95% requirement.
 Neither a successful coverage check nor a successful dependency build overrides a failed consistency assertion.
 
 Run unit tests with the repository Maven wrapper and a supported JDK. Integration tests run a complete Debezium engine and require a native-mode DM instance with archive logging, `RLOG_APPEND_LOGIC=2`, and `RLOG_LLOG_COMPRESS=0` when that parameter exists. The standard test fixture sets `RLOG_IGNORE_TABLE_SET=1`; the connector also accepts `0` with a warning, leaving table-level logical logging to the operator. The tests create and drop uniquely named tables in `dameng.schema`.
@@ -380,7 +369,7 @@ These passing regressions do not override the strict datatype failures.
 
 Four real connector cases verify negative zero in snapshot and INSERT/UPDATE/DELETE raw Connect output.
 The strict matrix still requires schema-enabled JSON round trips; it does not use the Connect-only assertion helper.
-`DamengJsonConverterCompatibilityTest` documents the stock Kafka 4.3.0 decoder's negative-zero and NaN losses.
+`DamengJsonConverterProbeIT` documents the stock Kafka 4.3.0 decoder's negative-zero and NaN losses.
 Its diagnostic success is not datatype acceptance.
 `shouldDiagnoseMineValueAvailabilityWithoutReplacingHistoricalRowsWithCurrentData` compares dictionary-free and online dictionary mining
 after the row has been deleted. On this build, online `MINE_VALUE` still rounds doubles and omits TIME WITH TIME ZONE fractions.
@@ -1094,13 +1083,14 @@ it forwards vendor calls unchanged and is never part of the production build.
 It separates C getData wall/caller-CPU time, result-queue polling sleeps, transaction-end polling sleeps,
 sampled string-conversion time, and END wall/caller-CPU time.
 The probe's instrumentation overhead limits interpretation; parameter effects were confirmed in a separate run without the probe.
+
 == BSEG generator performance probe
 
-`DamengDatagenPerformanceIT` is an opt-in diagnostic for the current plugin ZIP in a real distributed Kafka Connect worker.
-It starts a test-owned DM 8 database from the existing `dameng.image`, invokes an explicitly supplied external generator JAR,
-and uses the explicitly supplied Kafka cluster. It does not change existing connectors or database objects.
-Its business, schema-history, config, offset and status topics have unique names, one partition, one replica and `min.insync.replicas=1`.
-Only these topics and the containers owned by the probe are removed on exit. The consumer uses explicit partition assignment and does not commit offsets.
+`DamengDatagenPerformanceIT` starts a test-owned DM database and an independent Kafka Connect worker with the current plugin.
+Enable it with `dameng.perf.enabled=true`. The generator runs from the compiled test classpath; `dameng.perf.datagen.jar` optionally selects an external JAR.
+It starts its own single-broker Kafka cluster unless `dameng.perf.bootstrap.servers` selects an external test cluster.
+Topics use unique names, one partition, one replica and `min.insync.replicas=1`. Cleanup removes only test-owned topics and containers.
+The consumer uses explicit partition assignment and does not commit offsets.
 
 The supplied BSEG generator creates 221 columns. The default diagnostic starts with 5,000 rows and generates a finite mix of inserts (7%),
 updates (90%) and deletes (3%), including one 10,000-operation transaction and nine 100-operation transactions per round.
@@ -1113,17 +1103,30 @@ Build and run from the repository root (Linux host networking; Docker and local 
 
 [source,bash]
 ----
-env JAVA_HOME=/opt/java/jdk-25.0.4+7 ./mvnw -B -ntp \
-  -pl debezium-connector-dameng -am process-sources verify -Passembly,dameng-probes \
-  -Dtest=NoTestsForDatagenPerformance -Dsurefire.failIfNoSpecifiedTests=false \
+./mvnw -B -ntp -pl debezium-connector-dameng -am process-sources verify \
+  -Passembly,dameng-performance-tests \
   -Dit.test=DamengDatagenPerformanceIT -Dfailsafe.failIfNoSpecifiedTests=false \
-  -DskipITs=false -Drevapi.skip=true \
-  -Ddameng.perf.datagen.jar=/home/badxiao/projects/datagen/target/dameng-datagen.jar \
-  -Ddameng.perf.bootstrap.servers=localhost:9092 \
-  -Ddameng.perf.cycles=6 -Ddameng.perf.interval.ms=9000 \
-  -Ddameng.perf.mining.batch.size=1000 \
+  -Ddameng.perf.enabled=true \
   -Ddameng.perf.directory=target/dameng-datagen-performance/run-name
 ----
+
+[cols="3,2,5",options="header"]
+|===
+|性能测试系统属性 |默认 |用途
+|dameng.perf.enabled |false；通过系统属性显式开启 |显式启用有限性能回归。
+|dameng.perf.initial.rows |5000 |初始行数，允许 1000～20000；使用有界基线替代原独立脚本的 100000 行初始化。
+|dameng.perf.cycles |3 |轮数，允许 1～10，禁止无限负载。
+|dameng.perf.large.size / dameng.perf.small.size |10000 / 100 |每个大/小事务的操作数，须为 100 的倍数，大事务须大于小事务。
+|dameng.perf.interval.ms |7000 |每轮结束后的暂停，允许 0～30000 ms。
+|dameng.perf.timeout.seconds |240 |生成和 Kafka 追平的等待时间，不含容器启动。
+|dameng.perf.min.free.gib |15 |测试结果所在文件系统的最低剩余空间。
+|dameng.perf.docker.min.free.gib |15 |自有 Broker 容器所在 Docker 数据文件系统的最低剩余空间；可通过该系统属性调整。
+|dameng.perf.max.growth.gib |4 |本轮允许的文件系统空间增长；达到阈值立即失败并清理测试容器。
+|dameng.perf.window.strategy |fixed |显式 archive_bytes/fixed 进行同负载比较。
+|dameng.perf.window.max.bytes |67108864 |文件预算模式的字节软预算。
+|dameng.perf.mining.batch.size |1000 |fixed 模式的 LSN 跨度；10000 可作为固定对照。
+|dameng.perf.directory |target/dameng-datagen-performance |性能证据目录；比较多轮结果时显式指定独立目录。
+|===
 
 The diagnostic bounds workload size to 110,000 DML operations and 20,000 initial rows, checks Docker filesystem free space,
 and stops workload generation if free space falls below 15 GiB or filesystem usage grows by 4 GiB. These sampled filesystem guards
@@ -1140,7 +1143,7 @@ It does not impose a cumulative mining-session limit. Actual resource limits sti
 For a window-size comparison, keep the heap, container memory, cache threshold and resource limits fixed and vary only `dameng.perf.mining.batch.size`.
 The JFR file is bounded to 64 MiB. There is no image build or archive-copy step.
 
-The worker defaults to the already available Kafka 3.9.1 image with the current plugin, talking to the supplied Kafka 2.0 broker.
+The worker defaults to a Kafka 3.9.1 image with the current plugin; its broker is test-owned unless an external test cluster is configured.
 This does not change the Maven Kafka dependency version. JSON schemas are disabled and decimals use string representation.
 `samples.csv` records independently queried archive upper LSN, completed mining LSN, safe replay LSN, Kafka end offset,
 verified consumption count, queue capacity, buffer metrics, sampled heap usage, cumulative GC counters and process CPU time.
@@ -1951,7 +1954,7 @@ redo operation are retained in `target/official-materialized-view-it.json`.
 Scheduled refresh and other optional branches remain untested; these
 representatives do not complete an entire documentation page.
 
-`DamengMaterializedViewRedoIT` separately tests simple ROWID FAST views over
+`DamengMaterializedViewRedoProbeIT` separately tests simple ROWID FAST views over
 independent ON COMMIT and ON DEMAND base tables. Its 19 steps and 106 checks
 pass on the same database/driver build. Each mode commits a net INSERT,
 UPDATE and DELETE separately, rolls back a mixed UPDATE/DELETE/INSERT, and
@@ -1992,7 +1995,7 @@ include the associated observation queries. The tests do not validate
 Connector-emitted materialized-view events, arbitrary view definitions,
 scheduled refreshes or behavior on other DM versions.
 
-`DamengMaterializedViewDictionaryIT` compares the same archived operations in
+`DamengMaterializedViewDictionaryProbeIT` compares the same archived operations in
 four fresh mining sessions using OPTIONS=2048, 2064, 2128 and 16. All objects
 remain present during mining. On 8.1.3.162 each session reads 61 records, and
 all records match by SCN, SSN, archive coordinates, RS_ID and CSF. Each mode
@@ -2015,7 +2018,7 @@ and column labels are in `target/materialized-view-dictionary-it.json`.
 This test does not change the production mining options or establish that
 today's online dictionary can correctly describe every historical schema.
 
-`DamengMaterializedViewSchemaRecoveryIT` tests DROP and same-name CREATE for
+`DamengMaterializedViewSchemaRecoveryProbeIT` tests DROP and same-name CREATE for
 both COMPLETE and ROWID FAST views, then mines the entire interval using
 OPTIONS=2048. Each first generation selects ID/OLD_TEXT VARCHAR(32); its
 replacement selects ID/NEW_AMOUNT DECIMAL(12,2)/NEW_NOTE VARCHAR(40). FAST
@@ -2097,7 +2100,7 @@ Run the focused integration tests with:
 ./mvnw -B -ntp -pl debezium-connector-dameng -am verify -Pdameng-tests \
   -Dantlr.tests.enabled=false -Dtest=DamengDdlStatementAnalyzerTest \
   -Dsurefire.failIfNoSpecifiedTests=false -Dfailsafe.failIfNoSpecifiedTests=false \
-  '-Dit.test=DamengOfficialMaterializedViewIT,DamengMaterializedViewRedoIT,DamengMaterializedViewDictionaryIT,DamengMaterializedViewSchemaRecoveryIT,DamengMaterializedViewFilterIT'
+  '-Dit.test=DamengOfficialMaterializedViewIT,DamengMaterializedViewRedoProbeIT,DamengMaterializedViewDictionaryProbeIT,DamengMaterializedViewSchemaRecoveryProbeIT,DamengMaterializedViewFilterIT'
 ----
 
 `DamengOfficialDatabaseStateIT` executes 34 single-instance state, role,

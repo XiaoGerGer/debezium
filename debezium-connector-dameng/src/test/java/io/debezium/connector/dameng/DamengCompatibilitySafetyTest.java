@@ -36,7 +36,7 @@ import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
 
 class DamengCompatibilitySafetyTest {
-    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
+    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
 
     private DamengCompatibilityEnvironment environment(String identifier) {
         final Map<String, String> parameters = new HashMap<>(Map.of("LENGTH_IN_CHAR", "0", "CASE_SENSITIVE", "1",

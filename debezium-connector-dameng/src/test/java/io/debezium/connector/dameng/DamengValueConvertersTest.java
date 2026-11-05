@@ -43,7 +43,7 @@ import io.debezium.time.ZonedTimestamp;
 
 class DamengValueConvertersTest {
     private final DamengValueConverters converters = new DamengValueConverters(
-            new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build()));
+            new DamengConnectorConfig(DamengTestConfiguration.configuration().build()));
 
     @ParameterizedTest
     @MethodSource("numbers")
@@ -133,7 +133,7 @@ class DamengValueConvertersTest {
         final var column = Column.editor().name("LOCAL_TS").jdbcType(Types.TIMESTAMP).type("TIMESTAMP WITH LOCAL TIME ZONE")
                 .length(36).scale(6).optional(true).create();
         final var modeConverters = new DamengValueConverters(new DamengConnectorConfig(
-                DamengConnectorConfigTest.configuration().with("time.precision.mode", precisionMode).build()));
+                DamengTestConfiguration.configuration().with("time.precision.mode", precisionMode).build()));
         final var field = new Field(column.name(), 0, modeConverters.schemaBuilder(column).optional().build());
         final var converter = modeConverters.converter(column, field);
         assertThat(field.schema().name()).isEqualTo(ZonedTimestamp.SCHEMA_NAME);
@@ -155,7 +155,7 @@ class DamengValueConvertersTest {
     @Test
     void shouldRetainNumericTemporalRepresentationWhenExplicitlyConfigured() {
         final var numeric = new DamengValueConverters(new DamengConnectorConfig(
-                DamengConnectorConfigTest.configuration().with("time.precision.mode", "adaptive").build()));
+                DamengTestConfiguration.configuration().with("time.precision.mode", "adaptive").build()));
         final var date = column(Types.DATE);
         final var dateField = new Field(date.name(), 0, numeric.schemaBuilder(date).optional().build());
         assertThat(numeric.converter(date, dateField).convert(new SqlExpression("DATE'2026-09-24'")))
@@ -173,7 +173,7 @@ class DamengValueConvertersTest {
                 .length(36).scale(precision).optional(true).create();
         for (var mode : new String[]{ "adaptive", "adaptive_time_microseconds" }) {
             final var modeConverters = new DamengValueConverters(new DamengConnectorConfig(
-                    DamengConnectorConfigTest.configuration().with("time.precision.mode", mode).build()));
+                    DamengTestConfiguration.configuration().with("time.precision.mode", mode).build()));
             final var field = new Field(column.name(), 0, modeConverters.schemaBuilder(column).optional().build());
             final var converter = modeConverters.converter(column, field);
             assertThat(field.schema().name()).isEqualTo(IsoTimestamp.SCHEMA_NAME);
@@ -185,7 +185,7 @@ class DamengValueConvertersTest {
         }
 
         final var nanosConverters = new DamengValueConverters(new DamengConnectorConfig(
-                DamengConnectorConfigTest.configuration().with("time.precision.mode", "nanoseconds").build()));
+                DamengTestConfiguration.configuration().with("time.precision.mode", "nanoseconds").build()));
         assertThat(nanosConverters.schemaBuilder(column).build().name()).isEqualTo(NanoTimestamp.SCHEMA_NAME);
     }
 
@@ -276,7 +276,7 @@ class DamengValueConvertersTest {
 
     @Test
     void shouldUseDatabaseCharsetForColumnsAddedByDdl() {
-        final var converter = new DamengValueConverters(new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build()), Charset.forName("GB18030"));
+        final var converter = new DamengValueConverters(new DamengConnectorConfig(DamengTestConfiguration.configuration().build()), Charset.forName("GB18030"));
         final var column = Column.editor().name("VALUE").jdbcType(Types.CHAR).type("CHAR", "CHAR(8)").length(8).optional(true).create();
         final var field = new Field(column.name(), 0, converter.schemaBuilder(column).optional().build());
         assertThat(converter.converter(column, field).convert("达梦")).isEqualTo("达梦    ");

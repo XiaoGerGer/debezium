@@ -16,7 +16,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /** Diagnostic of the stock converter, separate from connector data-consistency acceptance. */
-class DamengJsonConverterCompatibilityTest {
+class DamengJsonConverterProbeIT {
     @ParameterizedTest
     @ValueSource(booleans = { true, false })
     void shouldExposeStockJsonDecoderLossOfNegativeZero(boolean float32) throws Exception {

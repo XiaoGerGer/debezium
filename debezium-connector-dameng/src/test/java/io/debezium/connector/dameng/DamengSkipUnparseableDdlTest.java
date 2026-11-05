@@ -581,7 +581,7 @@ class DamengSkipUnparseableDdlTest {
     }
 
     private void configure(String setting, boolean ignorePartitionDrops, boolean ignoreCascadeDrops, boolean ignorePartitionExchanges) throws Exception {
-        final var builder = DamengConnectorConfigTest.configuration()
+        final var builder = DamengTestConfiguration.configuration()
                 .with("log.mining.window.strategy", "fixed")
                 .with("poll.interval.ms", 1)
                 .with("table.include.list", "APP.A")

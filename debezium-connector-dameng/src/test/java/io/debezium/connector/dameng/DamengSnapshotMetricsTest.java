@@ -37,7 +37,7 @@ class DamengSnapshotMetricsTest {
     @BeforeEach
     void before() {
         server = "dameng-snapshot-metrics-" + UUID.randomUUID();
-        final var raw = DamengConnectorConfigTest.configuration().with("topic.prefix", server).build();
+        final var raw = DamengTestConfiguration.configuration().with("topic.prefix", server).build();
         taskContext = spy(new DamengTaskContext(raw, new DamengConnectorConfig(raw)));
         final var clock = mock(Clock.class);
         when(clock.currentTimeInNanos()).thenAnswer(invocation -> nanos.get());

@@ -54,7 +54,7 @@ import io.debezium.util.Clock;
 
 class DamengNonTableDdlStreamingTest {
     private static final TableId CAPTURED = new TableId(null, "APP", "A");
-    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
             .with("log.mining.window.strategy", "fixed")
             .with("poll.interval.ms", 1)
             .with("table.include.list", "APP.A")
@@ -135,7 +135,7 @@ class DamengNonTableDdlStreamingTest {
     static Stream<Arguments> safeStatementsWithObjectMetadata() {
         // Every grammar seed exercises streaming once. Object metadata is orthogonal to
         // classification, so repeat only ordinary, quoted, stored-object and table-referencing forms.
-        final var baseline = DamengNonTableDdlTest.safeStatements().map(sql -> Arguments.of(sql, 0L, "", ""));
+        final var baseline = DamengDdlTestCases.safeStatements().map(sql -> Arguments.of(sql, 0L, "", ""));
         final var metadataVariants = Stream.of(
                 "CREATE USER CDC_USER IDENTIFIED BY Test_123456",
                 "CREATE DIRECTORY \"DROP TABLE APP.A\" AS '/tmp/; ALTER TABLE APP.A ADD BAD INT'",
@@ -173,7 +173,7 @@ class DamengNonTableDdlStreamingTest {
     static Stream<Arguments> unsafeStatementsWithObjectMetadata() {
         // Reject every unsafe seed. Representative cascade, compound, lexical and trailing-DDL
         // failures also prove that an unrelated object cannot bypass validation through filtering.
-        final var baseline = DamengNonTableDdlTest.unsafeStatements().map(sql -> Arguments.of(sql, 0L, "", ""));
+        final var baseline = DamengDdlTestCases.unsafeStatements().map(sql -> Arguments.of(sql, 0L, "", ""));
         final var metadataVariants = Stream.of(
                 "DROP SCHEMA CDC_SCHEMA CASCADE",
                 "CREATE SCHEMA CDC_SCHEMA AUTHORIZATION SYSDBA CREATE TABLE A(ID INT)",

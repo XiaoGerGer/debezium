@@ -94,7 +94,7 @@ class DamengLogMiningConfigurationTest {
 
     @ParameterizedTest
     @NullAndEmptySource
-    @ValueSource(strings = { "0", "1", "3" })
+    @ValueSource(strings = { "0", "1", "3", "4" })
     void shouldRejectIncompleteLogicalBeforeImages(String appendLogic) throws Exception {
         when(connection.getIniParameter("RLOG_APPEND_LOGIC")).thenReturn(appendLogic);
 

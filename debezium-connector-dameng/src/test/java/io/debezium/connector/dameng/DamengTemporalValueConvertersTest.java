@@ -27,7 +27,7 @@ import io.debezium.time.ZonedTimestamp;
 
 class DamengTemporalValueConvertersTest {
     private final DamengValueConverters converters = new DamengValueConverters(
-            new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build()));
+            new DamengConnectorConfig(DamengTestConfiguration.configuration().build()));
 
     @ParameterizedTest
     @MethodSource("zonedValues")

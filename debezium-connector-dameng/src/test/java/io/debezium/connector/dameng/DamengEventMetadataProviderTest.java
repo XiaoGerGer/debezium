@@ -22,7 +22,7 @@ class DamengEventMetadataProviderTest {
 
     @Test
     void shouldReadEventTimeAndRestartPositionsFromTheEmittedSource() {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
         final var offset = new DamengOffsetContext(config, 100);
         final var table = new TableId(null, "APP", "EVENTS");
         final var eventTime = Instant.parse("2026-09-24T01:02:03.456Z");

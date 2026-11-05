@@ -61,7 +61,7 @@ class DamengFailoverConnectionTest {
 
     @Test
     void shouldWaitForReplicaReplayBeforeResumingAnAcknowledgedOffset() throws Exception {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().with("database.standby.hosts", "replica:5236").build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("database.standby.hosts", "replica:5236").build());
         try (var connection = spy(new DamengConnection(config.getJdbcConfig()))) {
             final var history = List.of(new DamengDatabaseIdentity.OpenRecord("open", Instant.EPOCH, 10, 0));
             final var ready = new DamengDatabaseIdentity(1, 10, 200, history, 20);
@@ -81,7 +81,7 @@ class DamengFailoverConnectionTest {
 
     @Test
     void shouldRouteCaptureOnlyToStandbyWithoutPassingInternalFlagsToDriver() throws Exception {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("database.standby.hosts", "a:5236,b:5237").build());
         final var jdbc = mock(Connection.class);
         final var statement = mock(Statement.class);
@@ -114,7 +114,7 @@ class DamengFailoverConnectionTest {
 
     @Test
     void shouldPassTheControlledServiceGroupAndRoutingPropertiesToTheDriver() throws Exception {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("database.failover.hosts", "primary:5236,standby:5237").build());
         final var jdbc = mock(Connection.class);
         final var statement = mock(Statement.class);
@@ -134,7 +134,7 @@ class DamengFailoverConnectionTest {
 
     @Test
     void shouldPreserveSingleEndpointUrlsWithoutTransparentReconnection() throws Exception {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().with("database.port", 5327).build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("database.port", 5327).build());
         final var jdbc = mock(Connection.class);
         final var statement = mock(Statement.class);
         when(jdbc.createStatement()).thenReturn(statement);
@@ -171,7 +171,7 @@ class DamengFailoverConnectionTest {
     void shouldRetryWhenPrimaryDemotionRacesWithHistoryRead() throws Exception {
         try (var connection = connectionWithNewPrimaryHistory()) {
             doNothing().doThrow(new SQLException("Former primary was demoted", "08006")).when(connection).validateServerRole();
-            final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+            final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                     .with("database.failover.hosts", "primary:5236,standby:5236").build());
             final var offset = new DamengOffsetContext(config, 150);
             assertThatThrownBy(() -> connection.validatePrimaryStandbyIdentity(offset))
@@ -184,7 +184,7 @@ class DamengFailoverConnectionTest {
     void shouldRejectInconsistentHistoryWhenPrimaryIsStable() throws Exception {
         try (var connection = connectionWithNewPrimaryHistory()) {
             doNothing().when(connection).validateServerRole();
-            final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+            final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                     .with("database.failover.hosts", "primary:5236,standby:5236").build());
             final var offset = new DamengOffsetContext(config, 150);
             assertThatThrownBy(() -> connection.validatePrimaryStandbyIdentity(offset))
@@ -193,7 +193,7 @@ class DamengFailoverConnectionTest {
     }
 
     private DamengConnection connectionWithNewPrimaryHistory() throws Exception {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("database.failover.hosts", "primary:5236,standby:5236").build());
         final var connection = spy(new DamengConnection(config.getJdbcConfig()));
         doReturn(10L).when(connection).databaseMagic();
@@ -220,7 +220,7 @@ class DamengFailoverConnectionTest {
     }
 
     private DamengConnection connectionWithRole(boolean failover, String role, String status) throws Exception {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("database.failover.hosts", failover ? "primary:5236,standby:5236" : "").build());
         final var connection = spy(new DamengConnection(config.getJdbcConfig()));
         final var result = mock(ResultSet.class);

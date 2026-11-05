@@ -30,7 +30,7 @@ import io.debezium.schema.SchemaChangeEvent;
 import io.debezium.util.Clock;
 
 class DamengChangeRecordEmitterTest {
-    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
             .with("schema.history.internal", MemorySchemaHistory.class.getName()).build());
     private final DamengPartition partition = new DamengPartition(config.getLogicalName());
     private final DamengOffsetContext offset = new DamengOffsetContext(config, 10);

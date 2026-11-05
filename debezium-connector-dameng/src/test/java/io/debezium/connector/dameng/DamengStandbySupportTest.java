@@ -32,7 +32,7 @@ class DamengStandbySupportTest {
 
     @BeforeEach
     void before() throws Exception {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("database.standby.hosts", "replica:5236").with("database.standby.replay.timeout.ms", 1).build());
         support = new DamengStandbySupport(config, primary);
         when(primary.readPrimaryStandbyIdentity()).thenReturn(primaryIdentity);

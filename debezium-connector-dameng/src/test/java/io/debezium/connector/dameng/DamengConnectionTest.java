@@ -91,41 +91,6 @@ class DamengConnectionTest {
     }
 
     @Test
-    void acceptsOlderServerWithoutCompressionParameter() throws SQLException {
-        final var connection = validConnection();
-        doReturn(null).when(connection).getIniParameter("RLOG_LLOG_COMPRESS");
-        connection.validateLogMiningConfiguration();
-    }
-
-    @Test
-    void requiresCompleteLogicalRecords() throws SQLException {
-        final var connection = validConnection();
-        for (String value : List.of("0", "1", "3", "4")) {
-            doReturn(value).when(connection).getIniParameter("RLOG_APPEND_LOGIC");
-            assertThatThrownBy(connection::validateLogMiningConfiguration).hasMessageContaining("RLOG_APPEND_LOGIC");
-        }
-    }
-
-    @Test
-    void acceptsManualTableLoggingButRejectsUnknownModesAndCompressedInsertLogs() throws SQLException {
-        final var connection = validConnection();
-        doReturn("0").when(connection).getIniParameter("RLOG_IGNORE_TABLE_SET");
-        connection.validateLogMiningConfiguration();
-        doReturn("2").when(connection).getIniParameter("RLOG_IGNORE_TABLE_SET");
-        assertThatThrownBy(connection::validateLogMiningConfiguration).hasMessageContaining("RLOG_IGNORE_TABLE_SET");
-        doReturn("1").when(connection).getIniParameter("RLOG_IGNORE_TABLE_SET");
-        doReturn("1").when(connection).getIniParameter("RLOG_LLOG_COMPRESS");
-        assertThatThrownBy(connection::validateLogMiningConfiguration).hasMessageContaining("RLOG_LLOG_COMPRESS");
-    }
-
-    @Test
-    void rejectsIncompatibleDatabaseTypeSemantics() throws SQLException {
-        final var connection = validConnection();
-        doReturn("2").when(connection).getIniParameter("COMPATIBLE_MODE");
-        assertThatThrownBy(connection::validateLogMiningConfiguration).hasMessageContaining("COMPATIBLE_MODE");
-    }
-
-    @Test
     void rejectsUnverifiedOrUnknownCharacterLengthSemantics() throws SQLException {
         final var connection = validConnection();
         connection.validateCompatibilityMode();
@@ -159,34 +124,6 @@ class DamengConnectionTest {
         doReturn("0").when(connection).getIniParameter("NESTED_C_STYLE_COMMENT");
         doReturn(null).when(connection).getIniParameter("NLS_LENGTH_SEMANTICS");
         assertThat(connection.getCompatibilityEnvironment().parameters()).doesNotContainKey("NLS_LENGTH_SEMANTICS");
-    }
-
-    @Test
-    void rejectsMissingArchiveAtRestartBoundary() throws SQLException {
-        final var connection = archiveConnection(List.of(log("a", 101, 200, 11, 0)));
-        assertThatThrownBy(() -> connection.archiveLogsForRange(100, 200)).hasMessageContaining("restart LSN");
-    }
-
-    @Test
-    void rejectsInteriorGapAndMixedDatabaseArchives() throws SQLException {
-        final var connection = archiveConnection(List.of(log("a", 1, 100, 11, 0), log("c", 201, 300, 11, 200)));
-        assertThatThrownBy(() -> connection.archiveLogsForRange(50, 250)).hasMessageContaining("gap");
-        doReturn(List.of(log("a", 1, 300, 11, 0), log("foreign", 101, 200, 22, 100))).when(connection).readArchiveLogFiles();
-        assertThatThrownBy(() -> connection.archiveLogsForRange(50, 250)).hasMessageContaining("DB_MAGIC");
-    }
-
-    @Test
-    void acceptsAdjacentBoundariesAndExplicitPredecessorChain() throws SQLException {
-        final var adjacent = archiveConnection(List.of(log("a", 1, 100, 11, 0), log("b", 101, 200, 11, 0)));
-        assertThat(adjacent.archiveLogsForRange(50, 200)).hasSize(2);
-        final var chain = archiveConnection(List.of(log("a", 1, 100, 11, 0), log("b", 110, 200, 11, 100)));
-        assertThat(chain.archiveLogsForRange(50, 200)).hasSize(2);
-    }
-
-    @Test
-    void rejectsArchiveFromAnotherDatabaseGeneration() throws SQLException {
-        final var connection = archiveConnection(List.of(log("a", 1, 200, 22, 0)));
-        assertThatThrownBy(() -> connection.archiveLogsForRange(50, 100)).hasMessageContaining("DB_MAGIC");
     }
 
     @Test

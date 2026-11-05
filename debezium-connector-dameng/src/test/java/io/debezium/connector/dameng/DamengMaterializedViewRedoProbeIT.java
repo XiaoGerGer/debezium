@@ -38,7 +38,7 @@ import io.debezium.config.Configuration;
 import io.debezium.relational.TableId;
 
 /** Row-state and raw-redo evidence for asynchronous and explicitly requested FAST refreshes. */
-class DamengMaterializedViewRedoIT {
+class DamengMaterializedViewRedoProbeIT {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Path EVIDENCE = Path.of("target/materialized-view-redo-it.json");
     private static final String MANUAL = "https://eco.dameng.com/document/dm/zh-cn/pm/materialized-view.html";

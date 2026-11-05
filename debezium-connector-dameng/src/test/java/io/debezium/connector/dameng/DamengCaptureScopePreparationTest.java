@@ -59,7 +59,7 @@ class DamengCaptureScopePreparationTest {
         when(reader.connection()).thenReturn(jdbc);
         when(reader.currentLsn()).thenReturn(300L);
         when(reader.databaseMagic()).thenReturn(42L);
-        final var quoting = new DamengConnection(DamengConnectorConfigTest.configuration().build());
+        final var quoting = new DamengConnection(DamengTestConfiguration.configuration().build());
         when(reader.quotedTableIdString(any())).thenAnswer(invocation -> quoting.quotedTableIdString(invocation.getArgument(0)));
         when(reader.getTableObjectId(any())).thenReturn(81L);
         metadata(reader, List.of(table(FIRST), table(SECOND)));
@@ -453,7 +453,7 @@ class DamengCaptureScopePreparationTest {
     }
 
     private static Configuration.Builder configuration() {
-        return DamengConnectorConfigTest.configuration();
+        return DamengTestConfiguration.configuration();
     }
 
     private static Table table(TableId tableId) {

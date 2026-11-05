@@ -20,7 +20,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
 class DamengCaptureScopeTest {
-    private final DamengConnectorConfig original = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
+    private final DamengConnectorConfig original = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
 
     @ParameterizedTest
     @CsvSource({

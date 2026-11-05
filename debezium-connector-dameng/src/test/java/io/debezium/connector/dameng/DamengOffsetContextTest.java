@@ -22,7 +22,7 @@ import io.debezium.pipeline.txmetadata.TransactionContext;
 import io.debezium.relational.TableId;
 
 class DamengOffsetContextTest {
-    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
+    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
 
     @Test
     void shouldRoundTripRecoveryGenerationAndRejectInvalidRecoveryPositions() {
@@ -104,7 +104,7 @@ class DamengOffsetContextTest {
 
     @Test
     void shouldKeepMiningPositionIndependentAcrossMetadataTransactionChanges() {
-        final var metadataConfig = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        final var metadataConfig = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("provide.transaction.metadata", true).build());
         var offset = new DamengOffsetContext(metadataConfig, 100);
         for (int transaction = 1; transaction <= 3; transaction++) {
@@ -130,7 +130,7 @@ class DamengOffsetContextTest {
 
     @Test
     void shouldRestoreMiningAndMetadataPositionsIndependentlyWithinTransaction() {
-        final var metadataConfig = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+        final var metadataConfig = new DamengConnectorConfig(DamengTestConfiguration.configuration()
                 .with("provide.transaction.metadata", true).build());
         final var offset = new DamengOffsetContext(metadataConfig, 100);
         offset.setTransactionId("MINING_TX");

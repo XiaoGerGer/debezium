@@ -96,10 +96,6 @@ class DamengDatatypeProbeIT {
         }
     }
 
-    static Stream<TypeCase> boundaryTypes() {
-        return DamengDatatypesIT.boundaryTypes();
-    }
-
     @Test
     void shouldExposeDateTimeComponentsInDateColumn() throws Exception {
         final long start = connection.currentLsn();
@@ -129,7 +125,7 @@ class DamengDatatypeProbeIT {
     }
 
     @ParameterizedTest(name = "{0}")
-    @MethodSource("boundaryTypes")
+    @MethodSource("io.debezium.connector.dameng.DamengDatatypeCases#boundaryTypes")
     void shouldCompareJdbcAndArchivedCrudAgainstStoredBoundaries(TypeCase type) throws Exception {
         final var builder = config.getConfig().edit();
         type.settings().forEach(builder::with);

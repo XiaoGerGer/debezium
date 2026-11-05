@@ -11,6 +11,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -85,6 +86,11 @@ final class DamengDatatypeCases {
     }
 
     private DamengDatatypeCases() {
+    }
+
+    static Stream<TypeCase> boundaryTypes() {
+        final var selection = Pattern.compile(System.getProperty("dameng.datatype.case", ".*"));
+        return boundaries().filter(type -> selection.matcher(type.name()).find());
     }
 
     static Stream<TypeCase> boundaries() {

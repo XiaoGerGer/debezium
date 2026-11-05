@@ -39,7 +39,7 @@ import io.debezium.relational.Tables;
 
 class DamengIntervalTest {
     private final DamengValueConverters converters = new DamengValueConverters(
-            new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build()));
+            new DamengConnectorConfig(DamengTestConfiguration.configuration().build()));
 
     static Stream<Arguments> qualifiers() {
         return Stream.of(

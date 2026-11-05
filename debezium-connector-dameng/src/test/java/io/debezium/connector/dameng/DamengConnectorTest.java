@@ -24,7 +24,7 @@ class DamengConnectorTest {
     @Test
     void shouldProvideOneTaskAndProtectItsConfiguration() {
         final var connector = new DamengConnector();
-        final Map<String, String> configuration = new HashMap<>(DamengConnectorConfigTest.configuration().build().asMap());
+        final Map<String, String> configuration = new HashMap<>(DamengTestConfiguration.configuration().build().asMap());
         connector.start(configuration);
         configuration.put("database.hostname", "changed");
 
@@ -62,7 +62,7 @@ class DamengConnectorTest {
 
     @Test
     void shouldValidateAndCloseTheDatabaseConnection() throws Exception {
-        final var config = DamengConnectorConfigTest.configuration().build();
+        final var config = DamengTestConfiguration.configuration().build();
         try (var connections = mockConstruction(DamengConnection.class,
                 (connection, context) -> when(connection.connection()).thenReturn(mock(Connection.class)))) {
             final var result = new DamengConnector().validate(config.asMap());
@@ -76,7 +76,7 @@ class DamengConnectorTest {
 
     @Test
     void shouldReportDatabaseValidationFailureOnHostnameAndCloseTheConnection() throws Exception {
-        final var config = DamengConnectorConfigTest.configuration().build();
+        final var config = DamengTestConfiguration.configuration().build();
         try (var connections = mockConstruction(DamengConnection.class,
                 (connection, context) -> when(connection.connection()).thenThrow(new SQLException("primary unavailable", "08001")))) {
             final var result = new DamengConnector().validate(config.asMap());
@@ -90,7 +90,7 @@ class DamengConnectorTest {
 
     @Test
     void shouldRejectInvalidFieldsBeforeOpeningADatabaseConnection() {
-        final var config = DamengConnectorConfigTest.configuration().with("database.port", "not-a-port").build();
+        final var config = DamengTestConfiguration.configuration().with("database.port", "not-a-port").build();
         try (var connections = mockConstruction(DamengConnection.class)) {
             final var result = new DamengConnector().validate(config.asMap());
 

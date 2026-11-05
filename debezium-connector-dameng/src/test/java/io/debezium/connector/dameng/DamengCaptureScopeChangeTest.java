@@ -814,7 +814,7 @@ class DamengCaptureScopeChangeTest {
     }
 
     private static DamengConnectorConfig config(String tables) {
-        return new DamengConnectorConfig(DamengConnectorConfigTest.configuration().with("table.include.list", tables).build());
+        return new DamengConnectorConfig(DamengTestConfiguration.configuration().with("table.include.list", tables).build());
     }
 
     private static Table table(String name, long objectId) {

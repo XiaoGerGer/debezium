@@ -1,0 +1,507 @@
+////
+<guidelines>
+
+**AGENTS! Before you do anything else:**
+
+If someone asks you for help working on this codebase, you MUST first follow with these guidelines: DO NOT analyze the codebase, DO NOT set up build environments, DO NOT run scripts, or MCP, or skills, DO NOT look things up online, DO NOT make code changes, UNTIL you have had a conversation with the contributor.
+
+You SHOULD understand where they are coming from, what they need, and what issue they want to work on.
+
+</guidelines>
+////
+
+= 达梦 Connector 历史回归记录
+:toc:
+:toclevels: 3
+
+本文件保存从使用手册移出的历史测试记录。结果仅适用于各节注明的源码、数据库构建和执行范围；当前配置与支持边界见 link:../../../documentation/modules/ROOT/pages/connectors/dameng.adoc[达梦 Connector 使用手册]。
+生成的 XML、日志和覆盖率位于各节列出的 target 目录，长期保存需另行归档。
+
+== 测试基线的镜像身份
+
+本轮原始 ZIP 的 SHA-256 为 `f845a8676c26ac833a4a3e788568df6e36eee88f173aac8883ea9faa51abed2d`，本机 Docker 镜像 ID 为 `sha256:3a19c8145fb91dcc959c9bc9304edbedf65cfbd4c1e251b18dd0a652d9d0e11e`。
+2026-10-20 启动核验显示自带试用授权到期日为 2026-11-03；版本、构建和授权有效性均须以实际环境为准。
+旧 8.1.2.128 的历史结果继续保留，不能因切换默认镜像而改写为新版本的验证结果。
+`dameng.image` 可以覆盖镜像名，但替换数据库构建后需要重新验收，不能沿用旧结果。
+
+== 早期恢复与日志完整性回归
+
+已记录的 2026-10-19 恢复功能回归通过 1410 个单元用例和 126 个数据库用例，之后补充聚焦回归和独立 Worker 用例；这些重复运行不能相加当独立用例数。
+当轮新鲜 JaCoCo 数据覆盖 4060/4181 行（97.11%），超过 95% 行覆盖率门槛；分支覆盖不是同一指标，也不证明所有数据库版本/模式均支持。
+2026-10-20 LogMiner 视图完整性改进通过 1445 个单元用例、2 个架构检查及 82 个数据库用例（`DamengConnectionIT` 11、`DamengConnectorIT` 60、`DamengLogMiningWindowIT` 11），均无跳过。
+该轮重新采集的 JaCoCo 数据覆盖 4110/4242 行（96.89%），通过 95% 行覆盖率检查；验证包含 SQL NULL、分片缺失/重复/乱序、未知操作、落盘诊断保留及对象索引随 DDL 更新。
+对象查找回归验证稳定表模型下 100 条已知/未知对象交替的记录只遍历一次表集合；此结果不是端到端吞吐压测。
+
+== 文件预算与固定 10000 的本地对照（2026-10-21）
+
+在同一源码上按 fixed、archive_bytes、archive_bytes、fixed 顺序执行四轮独立容器测试。
+数据库为 8.1.3.162；Kafka Broker/Worker 为 3.9.1，单分区、单副本；Worker 容器限制 4 GiB、堆 Xms=1 GiB/Xmx=3 GiB，事务内存阈值 64 MiB，Producer batch.size=65536。
+每轮相同随机种子、5000 行初始数据、3 轮无间隔 BSEG 负载，共 32700 条 DML（2289 INSERT、29430 UPDATE、981 DELETE），消息最大约 8 KiB。
+耗时从开始生成到消费完全部消息，不含数据库/Worker 启动。四轮均通过逐条 before image、事件数量、全部 221 列最终状态及无尾随重复校验。
+
+[cols="2,1,1,1,1",options="header"]
+|===
+|策略 |第一次（秒） |第二次（秒） |平均（秒） |平均挖掘会话数
+|fixed，10000 LSN |19.525 |17.700 |18.613 |21.5
+|archive_bytes，64 MiB |19.590 |17.747 |18.669 |15.5
+|===
+
+文件预算会话数减少约 28%，但总耗时基本持平（均值约慢 0.3%，低于本次轮间波动，不能认定性能差异）。
+平均前向挖掘阶段由 2.881 秒降到 2.705 秒；平均历史重建由 3.165 秒增到 3.869 秒，分发阶段仍约 11 秒。
+采样到的临时落盘峰值：固定两轮均约 105 MiB，文件预算两轮约 193/188 MiB；采样不是完整磁盘峰值追踪。
+因此保留 64 MiB 作为初始软预算和 fixed 回退选项，不承诺比已调优的固定窗口更快。
+本次是单机数据库的有限突发负载；没有重新验收 Kafka 2.0、完整主备切换或生产库长时间持续负载。
+
+性能入口为 `DamengDatagenPerformanceIT`，通过 `dameng.perf.window.strategy`、`dameng.perf.window.max.bytes`、`dameng.perf.mining.batch.size` 选择对照策略。
+本机原始结果在 `debezium-connector-dameng/target/file-budget-benchmark/`，每轮包含 command.json、evidence.txt、samples.csv 和 JFR；这些为生成产物，clean 后需重跑。
+删除旧自适应模式后的回归执行 1529 个单元测试、28 项数据库测试，均通过且无跳过；使用独立覆盖率数据，模块行覆盖率 96.82%。验证日志及覆盖率文件位于 `debezium-connector-dameng/target/remove-adaptive-validation/`。
+
+== 主备采集验收范围（2026-10-21）
+
+使用 `dameng:8.1.3.162-20240621-rev232765`，服务器构建 `03134284194-20240621-232765-20108`、JDBC 驱动 `8.1.3.140`。
+真实备份还原的两个单实例成员使用 UTF-8、COMPATIBLE_MODE=0、CASE_SENSITIVE=1；没有使用两个独立初始化的数据库模拟物理主备。
+`DamengStandbyIT` 验证备库初始快照与 CRUD、主库信号表自动创建、两种增量快照水位策略、持久化快照完成位置、Task 重启、人工切换和备库重启，以及跨窗口事务落盘恢复、部分/完整回滚和 restart nonce。
+`DamengPrimaryStandbyIT` 还验证主库采集切换、切回、非强制接管，以及初始快照中途切换时主库读取/备库读取两条路径的恢复。
+初始快照被打断后允许重复发送已有行，不承诺 exactly-once。
+
+本轮 `BUILD SUCCESS`：1503 个单元用例、2 个架构检查和 118 个选定数据库集成调用全部通过，0 失败、0 错误、0 跳过。
+本轮独立采集的行覆盖率为 4354/4466，*97.49%*；分支覆盖率为 2769/3038，91.15%。95% 行覆盖率门槛保持启用，格式与 Checkstyle 通过。
+日志、仅本轮 XML 报告、覆盖率和执行清单保存在 `debezium-connector-dameng/target/standby-acceptance-20261021/`，测试说明中保留具体选择范围。
+
+单机 CASE_SENSITIVE=0/1 回归通过，不代表已经验证两种大小写模式与所有主备、字段、兼容模式和字符集的组合。
+复制延迟下并发修改与增量快照的完整故障注入矩阵尚未执行；DMDSC、强制有损接管仍不支持。
+本轮没有重跑完整字段边界矩阵、压测或独立 Kafka Connect Worker，也未重新构建或替换现有 Docker 镜像；<<dameng-regression-813162,升级回归>>中记录的字段和词法缺陷仍然有效，不能把本次主备验收当作整体生产验收。
+
+== 官方 SQL 审计与非表 DDL 验证补充
+
+2026-10-29 在 8.1.3.162 原生模式的官方语料实测中，`STAT ... ON` 的表、索引和 hint 形式均生成 DDL redo，审计时的解析器拒绝了这三种样本。当前已为独立 STAT 语句增加非表分类；这不放开表定义中未实现的 STORAGE/STAT 子句。
+`REVOKE ... CASCADE` 的表、列、视图、过程/函数/包、序列、域、同义词和目录授权回收也生成 DDL redo；审计时有 13 个样本因尾部语法被拒绝，后续 CLASS、TYPE 专项又验证了两条同类回收语句。非表 DDL 分类现已接受权限词汇及 `REVOKE ... CASCADE`，这些旧审计数字保留为当时的结果。
+同一历史审计源码还拒绝了 CLASS/TYPE 的创建、定义体、编译和删除共十条实际 DDL，以及 ROWID、LONG、BFILE 列的三条建表 DDL。当前为 SQL 程序对象增加的分类不能反推这十条历史样本已经通过重测；特殊列类型映射也未因此扩展。LIBRARY 语句和 JSON 类型声明在该次数据库测试中被数据库拒绝，尚不能据此判断 Connector 支持情况。
+默认配置下，未识别的对象类型即使不修改采集表的列结构，也仍可能使任务在相应日志位置停止。
+同版本的 `RESTORE TABLE` 实测还发现：目标数据已被备份数据替换，但恢复语句的 LSN 区间没有目标表的 DML redo，独立 marker INSERT 可以正常挖掘。不能依赖 LogMiner CDC 将这类表恢复产生的数据变化同步到下游；解析器未报错不代表恢复数据已被采集。
+物化视图专项的 15 个代表语句中，13 个被该数据库版本接受，`COMPILE` 和 `DROP MATERIALIZED VIEW LOG IF EXISTS` 被数据库拒绝。FAST 和完全刷新会产生后台表 DML；当时的分析器拒绝其中 13 条 MATERIALIZED/REFRESH DDL 记录。另三条内部表 TRUNCATE 仅在空历史模型探针中规划失败。后续默认过滤和语句分类用于跳过物化视图内部数据，不代表支持物化视图 CDC；旧审计结果保留为当时的证据。
+单实例状态专项验证了 34 条角色、状态、参数和本地归档代表语句，其中 27 条接受、7 条因状态前提被拒绝。新增第二个 LOCAL 归档目的地后，当前生产挖掘连接会重复注册同一日志的副本，报 `-2848 cannot add duplicate logfile`。限定原归档目录的独立 SQL LogMiner 诊断成功，不能据此认为 Connector 已支持多 LOCAL 归档；该问题尚未修复。
+`FORALL` 专项通过完整引擎验证了异常处理器提交后再抛错的情形：两个官网示例虽返回 JDBC 错误，已提交的 2 行和 3 行更新仍全部发出 CDC。另一个官网示例绑定错误码 `-25000`，该版本实际返回 `-24381`，因未进入预期处理分支而全部回滚，CDC 为 0；单独适配错误码的代表样本提交及发出 3 行更新。不能仅根据客户端收到错误判断事务全部回滚；原样示例和适配样本的证据分别保留。
+可回归测试和逐条证据索引见模块 `src/test/testing.adoc` 的官方 SQL 语料章节。历史审计结果不代表所有缺口均已修复。
+2026-10-30，`DamengNonTableDdlIT` 在指定 8.1.3.162 镜像、`COMPATIBLE_MODE=0` 下通过用户、目录、空 SCHEMA、STAT、TYPE、DOMAIN、CONTEXT、PACKAGE、SQL CLASS、PROFILE 十族回归。在线和停机阶段各执行 33 条语句，共读到 66 条实际 DDL redo，全部分类为 `NO_TABLE_CHANGE`；66 个后续 CDC marker、停机重放、两次历史恢复及恢复后的 UPDATE 均通过。范围不包含 Java CLASS 或级联删除。相关定向单元回归为 1,913 项，格式和 5 个相关 Java 测试文件的 Checkstyle 检查通过；这不是全部 SQL 或整个 Connector 的验收。运行方法和证据文件见模块测试手册。
+LIBRARY 的官网语法有分类单测，数据库可执行性独立诊断，不计入上述 CDC 回归。本次 8.1.3.162 原生模式同时拒绝带模式限定名的 `CREATE OR REPLACE LIBRARY` 和不带模式名的最小 `CREATE LIBRARY`，均返回 `-2007` 语法错误。结果保存在 `target/non-table-ddl-library-probe.json`，不执行目标函数库，也不据此宣称已验证 CDC。
+`COMPATIBLE_MODE=2` 的补充运行在初始化阶段被现有兼容配置注册表拒绝，未进入这套 DDL/CDC 回归；本轮没有改变兼容模式支持矩阵。
+没有用当前 JDBC 表结构或 Flashback 自动兜底的生产路径。默认配置下，解析失败后的 restart 会再次遇到同一位置；显式跳过的风险和限制见上文，处理方法见故障章节。
+
+== 测试结构调整与定向验证（2026-11-05）
+
+共享配置、DDL SQL 样本和字段输入分别放在 `DamengTestConfiguration`、`DamengDdlTestCases`、`DamengDatatypeCases`，测试类不再互相提供这些夹具。
+`DamengConnectorIT`、`DamengStreamingChangeEventSourceTest`、`DamengDdlStatementAnalyzerTest` 按行为使用 `@Nested` 分组，共用各自外层夹具。
+物化视图底层诊断、非表 DDL 数据库探测和 JsonConverter 特殊值诊断保留在 `*ProbeIT`，通过单独 profile 手动选择；真实业务 CDC 回归继续留在普通套件。
+
+此次结构调整验证通过 14236 项模块单元用例、2 项架构检查，以及两次独立选择的 19 项定向集成调用和 60 项完整 `DamengConnectorIT` 调用，均无失败、错误或跳过。格式化、Checkstyle 和所选构建检查通过。
+集成范围包括非表 DDL 回归/诊断、JsonConverter 诊断、LOCAL TIME ZONE 探测及字段零值回归；60 项 Connector 调用覆盖全部六个嵌套组。
+这次没有重跑全部 24 个普通 IT 类、完整字段矩阵、主备专项或性能实验，也没有生成新的全量覆盖率结论。集成结果可在 Failsafe XML 核对；这些计数不得与下文历史回归累计。
+
+[[dameng-case-sensitive]]
+== CASE_SENSITIVE=0 标识符适配
+
+`CASE_SENSITIVE` 是建库属性，不是 Connector 参数，也不能通过修改正在运行的任务把数据库切换为模式 0。
+Task 自动查询 `SF_GET_CASE_SENSITIVE_FLAG()`，结果仍进入 offset 的 compatibility_signature；重启不能把不同建库属性的历史位置混用。
+
+8.1.3.162 实测：模式 0 的 JDBC 元数据保留不少原始拼写，例如 Dbz_Mixed、Id，而非引号关键词 VaLuE 被保存为 VALUE；LogMiner 的 DDL 保留提交语句的原始拼写。
+因此模式 0 对 schema、表、列、主键列和约束统一使用大写作为 Connector 内部及消息中的标识符，历史 DDL 与 JDBC 使用同一规则。默认 Topic 中的 schema/table 部分和消息字段名也相应大写，topic.prefix 本身不变；`'AbC'` 等数据和默认值不改变大小写。
+例如物理表 `"Dbz_App"."Dbz_Case"`、列 `"VaLuE"` 对应 `prefix.DBZ_APP.DBZ_CASE` 与字段 `VALUE`。
+
+模式 0 的 include/exclude、列配置、增量快照 data-collections 和下游映射应使用这套规范名称；即使正则显式关闭忽略大小写，也按规范名称匹配。
+`signal.data.collection` 的具体表名会自动规范化，已有混合大小写信号表可复用；自动创建时也按统一身份识别，防止水位写进去了却没有被信号处理器认出。
+模式 1 的双引号名称保留大小写，非引号名称按现有规则转大写；模式 0 的新命名约定不会改变模式 1 的 Topic 或字段。
+本次也修正了信号表的两段名称解析：达梦统一按 schema.table 处理，不采用公共框架的 catalog.table 默认值。此前登录用户与配置 schema 不同且信号表不存在时，自动建表可能落在登录用户 schema；现在按指定 schema 建表，重启复用同一张表。
+建库属性与主备读写路由是两个独立能力。物理备库采集及主库信号写入已在 link:../../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-standby-capture[备库采集与主库信号写入] 实现；本节的 CASE_SENSITIVE 回归不代表其与所有主备、字段和兼容模式组合均已覆盖。
+
+专项测试入口（测试自己分别建库并确认实际标志为 0/1）：
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng process-sources verify -Pdameng-tests -Dit.test=DamengCaseSensitivityIT
+----
+
+该用例由 `dameng-tests` profile 自动发现。它在当前新镜像、COMPATIBLE_MODE=0、BACKSLASH_ESCAPE=0 下验证标识符路径，不表示其他兼容模式或字符集的完整字段矩阵均已验收。
+
+2026-10-20 适配完成后的相关回归：1456 项单元/架构检查和 30 项唯一集成调用全部通过，0 跳过。集成调用包括 JDBC 11 项、DDL 扩展 8 项、增量快照 7 项，以及 CASE_SENSITIVE=0/1 的元数据与完整引擎路径 4 项；补跑按用例替换，不累计重复执行次数。
+完整引擎路径覆盖严格大小写过滤、列排除、混合大小写 schema/table/column、默认值、主键与无主键、停机期间历史 DDL、建表/增列/列改名/删除主键/表改名、CRUD、信号表自动创建及重启复用、增量快照，以及字符串主键从 a 改成 A 后的删除/新增事件与分块补数。
+最终源码的行覆盖率为 4121/4269，*96.53%*，95% 门槛通过；测试容器均已清理。
+结果和逐项 XML 路径保存在 `target/case-sensitive-20261020/validation-summary.json`，最终 Maven 日志与覆盖率报告位于其 acceptance 子目录。
+此项适配通过不改变下一节升级回归中 66 项字段一致性、2 项词法及独立探针/JNI 的失败结论。
+
+
+[[dameng-regression-813162]]
+== 2026-10-20 DM 8.1.3.162 升级回归
+
+默认镜像切换为 `dameng:8.1.3.162-20240621-rev232765`，JDBC 实测版本 `8.1.3.162`，服务器构建 `03134284194-20240621-232765-20108`。
+驱动仍为 `8.1.3.140`，Connector/Kafka 编译依赖未变。普通数据库用例使用 GB18030、COMPATIBLE_MODE=0、LENGTH_IN_CHAR=0、RLOG_APPEND_LOGIC=2、RLOG_IGNORE_TABLE_SET=1、RLOG_LLOG_COMPRESS=0；物理主备 fixture 使用 UTF-8。
+本轮未重新运行非零 COMPATIBLE_MODE 的完整矩阵，不能由原生模式结果推导其兼容性。
+版本告警名单未改，8.1.3.162 启动时的“未测试版本”WARN 仍存在；该告警本身不终止任务。
+
+测试环境适配包括归档目录继承数据库目录属主、主备 fixture 显式接管容器入口和动态库路径，以及删除新版 dminit 不接受的 LENGTH_IN_CHAR 初始化参数。
+主备就绪检查改为主库 REALTIME 归档与双方 LOCAL 归档有效；新版备库未启用的反向发送状态为 null，不能要求双向发送均为 VALID。人工切换和 takeover 输入新版 dmmonitor 所需的 YES，并为监视器增加 90 秒超时和失败日志保存。
+首次归档目录权限失败的尝试保留在 `target/regression-dm813162-20261020`；第二轮与后续补跑保留在 `target/regression-dm813162-20261020-r2`。环境准备失败不能当作 CDC 断言结果，也不会删除记录后声称首轮通过。
+
+=== 完整执行结果
+
+[cols="3,1,1,4",options="header"]
+|===
+|范围 |通过/总数 |失败 |说明
+|单元与架构 |1451/1451 |0 |本轮全量执行。
+|数据库功能 |838/906 |68 |66 项字段一致性和 2 项词法失败；主备环境修复后 2 项恢复用例通过。
+|Kafka Connect |4/4 |0 |进程恢复、Broker 故障及消息校验通过。
+|内置生成器压测 |1/1 |0 |32700 次 DML，逐条 before 和 221 列最终状态一致；最终 6308 行。独立单副本 Kafka，Worker/Broker 3.9.1，不是 Kafka 2.0 验收。
+|独立数据库能力探针 |704/742 |38 |排除重复运行的主备恢复用例；字段 37 项和历史元数据 1 项失败。
+|SQL/JNI 严格对照 |0/1 |1 |预热轮原始记录多重集不一致，未执行完整计时轮次。
+|===
+
+所有上述范围均执行完毕，0 跳过；*整体回归未通过*。覆盖率独立门槛通过：本轮采集 4139/4242 行，97.57%。覆盖率不能替代正确性断言。
+最终唯一用例统计见 `target/regression-dm813162-20261020-r2/validation-summary.json`；原始首次结果及补跑 XML 均保留，最终统计仅替换修正 fixture 后的主备用例，未重复累计。
+
+JNI 使用本镜像的 libdmlogmnr_client.so、libdmdpi.so；镜像不含 Java 绑定，采用先前从另一份本地厂商安装包提取的 com.dameng.logmnr.jar，来源和校验和见 `target/dm813162-jni/metadata.json`。这不是同发行包配套组合，不能外推为所有 8.1.3.162 JNI 的结论。
+同一份冻结归档包含 100000 次 INSERT、50000 次 UPDATE、25000 次 DELETE 及 100 次回滚 UPDATE；SQL 与 JNI 都读出 176111 条原始记录，但逐字段多重集不同，严格断言停止。差异证据见 `jni/evidence/difference-0-jni-2.txt`。
+仅完成的预热轮 SQL 总耗时约 1.067 秒，JNI 约 4.139 秒，其中 getData 约 2.850 秒；因一致性失败且未完成多轮，不据此给出可替换生产 SQL 路径的性能结论。
+
+=== 字段一致性与原 81 项失败的对照
+
+DamengDatatypesIT 的 769 个调用执行完成：703 通过，42 个断言失败、24 个错误、0 跳过，共 66 个失败调用。
+新旧 703 项边界矩阵清单完全相同，断言未放宽。
+原 81 项失败中有 19 项转为通过，62 项仍失败；另有原来通过的 4 项 NaN 原始事件用例在写入时失败，因此净减少 15 项。
+
+[cols="4,1,5",options="header"]
+|===
+|原失败转为通过 |数量 |本轮边界
+|TIME(1..6) WITH TIME ZONE |6 |快照和流式 CRUD 小数秒及 JSON 往返均通过。
+|TIMESTAMP(7..9) 的部分值及 WITH TIME ZONE |9 |普通 TIMESTAMP 的 1969/2000 年值共 6 项，以及带时区类型共 3 项通过。不能推广到普通 TIMESTAMP 的全部年份。
+|CHAR(8 CHAR) 中文和 emoji |3 |7/8 个“梦”和 8 个 emoji 输入及 CDC 通过。
+|ROWID 普通列 |1 |从 JDBC 快照结构开始的 VALUE ROWID 指定字符串输入、NULL 转换和 CRUD 通过；独立探针的 CREATE TABLE 历史 DDL 解析仍拒绝 ROWID，因此不代表该类型完整生命周期已支持。
+|===
+
+[cols="4,1,5",options="header"]
+|===
+|仍失败或新增失败 |数量 |原因与影响
+|普通浮点流式精度 |30 |原始 Connect 值仍可能舍入、合并或归零，包含 21 个聚焦用例和 9 个矩阵用例；后者也含负零 JSON 差异，不重复计数。
+|仅负零 JSON 往返差异 |5 |原始 Connect 值保留负零，标准 JsonConverter 解码后符号丢失。
+|NaN 写入拒绝 |6 |4 个原始 Connect 场景为新增失败，另 2 个矩阵用例原已因 JSON 失败。本轮均在 JDBC INSERT 阶段报 Data overflow，尚未进入 CDC，不能算 NaN 的 JSON 问题已经修复。
+|NUMBER/DECIMAL/NUMERIC 的 ±1E125 |18 |当前数据库/驱动组合仍拒绝这些输入，未进入 Connector。
+|TIMESTAMP(7..9) 的 0001/9999 年 |6 |新版允许声明及写入，但默认 NanoTimestamp 的 INT64 epoch 纳秒范围不足。日志显示 long overflow，snapshot 和 streaming 的对应非空值变成 null；这是输出一致性缺陷，不能仅描述为测试断言空指针。
+|TIMESTAMP WITH LOCAL TIME ZONE |1 |当轮实现仍主动拒绝缺少可恢复时区语义的列；后续已改为显式有损 UTC 映射，见 <<dameng-local-time-zone-policy,当前策略>>。
+|===
+
+除此之外，词法组合新增 2 个失败：BACKSLASH_ESCAPE=1、NESTED_C_STYLE_COMMENT=0/1 时，普通字面量 `'A\0B'` 返回 `A0B`，不再满足旧版保留反斜杠的规则。
+失败发生在数据库字面量语义预检，后续 CDC 断言没有执行；不能据此声称这两种组合的 CDC 已验收，也不能只修改预期文本就认为解析适配完成。
+BACKSLASH_ESCAPE=0 的两组完整词法回归通过。
+
+=== 独立数据库能力探针
+
+DDL 扩展探针 2 项、DDL 语法探针 14 项通过。
+字段组件探针执行 724 项，687 通过，17 个断言失败、20 个错误、0 跳过；其中包括普通浮点/JSON、纳秒时间范围、LOCAL TIME ZONE、超大 NUMBER、NaN，以及完整引擎快照用例未覆盖到的 ROWID 历史建表解析失败。
+ROWID 的 JDBC 结构加 CRUD 可以通过，`CREATE TABLE ... VALUE ROWID` 的历史 DDL 仍报 `Unsupported DM column type ROWID`，不能把这两条路径混成全功能支持。
+历史元数据探针 1 项失败：改列名后对旧 LSN 的系统目录闪回查询返回 NEW_NAME，预期应为 OLD_NAME。此前旧构建的目录闪回结论不适用于本构建；生产 Connector 并未接入这种兜底。
+备库 LogMiner 探针 1 项通过：真实备份/恢复的主备对复制结果一致，241 条原始记录逐字段对比通过，事务重建得到 209 条已提交业务/DDL 记录；还验证重新连接、仅已提交模式、跨窗口未提交事务、备库重启和人工切换后的历史挖掘。
+该轮升级探针中，备库信号表创建及写入继续报 -710，当时生产 Connector 尚未开放 STANDBY。后续读写连接分离实现见 link:../../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-standby-capture[备库采集与主库信号写入]；升级探针本身不作为完整 Connector 的验收依据。
+主备 Connector 恢复补跑 2 项通过，覆盖快照中途切换、历史 DDL、切回及主库故障后的人工 takeover；这是连接当前主库的现有功能，与上述备库采集方案分别统计。
+
+逐项对照见 `target/regression-dm813162-20261020-r2/datatype-comparison.json`；新一轮原始错误、类型名称及参数序号见 database 下 XML 和 database-evidence/case-catalog.txt。
+后面的 81 项分析保留为旧 8.1.2.128 的历史记录，不代表新版本仍有同样的 81 项失败。
+
+[[dameng-official-pack1-regression]]
+=== 官方 8.1.3.162 pack1 镜像复测（2026-10-23）
+
+使用达梦官方提供的 `dm8_20250520_x86_rh7_64_rq_ent_8.1.3.162_pack1.tar`，SHA-256 为 `d822a5af3386a0c0cb257a2291cf57e0602e5f631a5b9b54cb2eeb4803e37bbb`。
+导入标签为 `dm8:dm8_20250520_rev234060_x86_rh7_64`；实际服务器构建为 `03134284194-20240703-234060-20108`，与上一轮 `20240621-232765` 构建不同，JDBC 驱动仍为 8.1.3.140。
+字段矩阵同样使用 GB18030、COMPATIBLE_MODE=0、CASE_SENSITIVE=1、RLOG_APPEND_LOGIC=2、RLOG_IGNORE_TABLE_SET=1 和 RLOG_LLOG_COMPRESS=0。
+
+`DamengDatatypesIT` 完整执行 769 项，703 通过、42 个断言失败、24 个错误、0 跳过。
+66 个失败调用的测试名称、失败类别和错误消息与上一轮逐项一致，没有新增或消失的字段失败；上表的六类原因仍适用。
+原始 XML 位于 `debezium-connector-dameng/target/official-pack1-20261023-datatypes/reports/`。
+
+后续测试分类调整：字段一致性目录只保留数据库已接受的输入，移除了 `3.5E38`、`1E309`、NaN、当前构建拒绝的 `±1E125` 以及其他专门验证数据库拒绝的输入。
+对当前 LogMiner 已知有损的严格浮点检查仍保留，但日常数据库回归跳过；显式传入 `-Ddameng.datatype.floating.diagnostics=true` 可重新执行并观察失败。
+当时曾对正负零采用数值相等比较；2026-11-05 的测试调整已恢复原始 Connect 值与 JDBC 实际存储位的严格比较，仅 JSON 往返允许零的符号位不同。以上 66 项是调整前的历史复测数据，不代表调整后整套回归已经通过。
+
+2026-10-26 使用同一官方 pack1 镜像重跑调整后的完整 `DamengDatatypesIT`：708 项中 691 项通过、7 项断言失败、0 项错误、10 项跳过。
+数据库拒绝写入的用例已不在当轮字段一致性目录中；保留的 7 项失败均发生在数据库接受输入之后，其中 6 项为 `TIMESTAMP(7..9)` 的 0001/9999 年值超出 Connector 默认纳秒时间表示范围，1 项为当轮明确拒绝的 `TIMESTAMP WITH LOCAL TIME ZONE`。这些是修改前的历史结果。
+跳过的 10 项是 9 个浮点字段矩阵和 1 个聚焦浮点方法；严格浮点诊断仍可通过 `-Ddameng.datatype.floating.diagnostics=true` 显式执行。
+
+针对其中 6 项年份越界，在官方 pack1 镜像上以 `time.precision.mode=isostring` 运行 `TIMESTAMP(7)`、`TIMESTAMP(8)`、`TIMESTAMP(9)` 定向回归，3 项全部通过。
+每种精度覆盖 0001 年、9999 年和两个中间值，逐一对照 JDBC 回读的实际存储值，检查快照、增量 INSERT/UPDATE/DELETE 前后镜像及 JSON 往返；事件逻辑类型为 `io.debezium.time.IsoTimestamp`。
+这验证了字符串映射避开 `INT64` 纳秒范围限制，并不证明数据库保留了输入字面量的 7 至 9 位小数秒。当时 `TIMESTAMP WITH LOCAL TIME ZONE` 仍被拒绝；后续策略见 <<dameng-local-time-zone-policy,当前策略>>。
+切换现有任务的 `time.precision.mode` 会改变时间字段的 Kafka Connect schema，消费者必须按新类型适配。
+
+2026-10-27 先将达梦普通 `TIMESTAMP(7..9)` 在当时默认的 adaptive 模式下改为固定 `IsoTimestamp` schema，而不是逐条记录在纳秒溢出时切换到微秒单位。一个字段的 Kafka Connect schema 必须对每条记录保持相同的单位和逻辑类型。
+官方 pack1 镜像的 12 个定向边界用例全部通过，覆盖三个精度各自的 0001、1969、2000 和 9999 年，逐一核对 snapshot、流式 CRUD 与 JSON 往返。历史的六项纳秒溢出失败不再适用于这一映射；该定向结果不代表完整字段矩阵或其他数据库集成测试已在此次修改后重新执行。
+升级已有任务时，这些字段从 `NanoTimestamp` INT64 变为 `IsoTimestamp` STRING，下游必须按新 schema 解析。显式配置 `time.precision.mode=nanoseconds` 仍选择原来的纳秒映射及其范围限制。
+
+随后将达梦 Connector 的默认 `time.precision.mode` 从 adaptive 改为 isostring，DATE、TIME、普通 TIMESTAMP 的所有声明精度都默认输出 ISO 字符串。显式配置 adaptive 的任务仍按原模式工作，但普通 `TIMESTAMP(7..9)` 保留上述 IsoTimestamp 安全映射。未显式设置该参数的已有任务升级后，日期和时间字段的 Kafka Connect schema 与值表示都会改变；消费者必须先适配。
+
+之后默认值从 isostring 改为 sqlstring。普通 DATE、TIME、TIMESTAMP 改为无 `T`/`Z` 的字符串，Connect schema 为无逻辑类型名称的 STRING；带时区类型和 LOCAL TIME ZONE 保持各自原有的 UTC 字符串表示。已有任务若依赖旧格式，应显式配置 `time.precision.mode=isostring`；默认值变更会再次改变普通时间列的 Kafka Connect schema 与字段值。
+
+另外 16 个数据库集成测试类执行 154 项，首轮 148 通过、5 个断言失败、1 个错误。
+其中 2 项是已知的 BACKSLASH_ESCAPE=1 字面量差异；2 项主备手动切换失败暴露了仅在备库挖掘模式创建的 `primaryConnection` 被手动切换模式解引用的问题，修复后 `DamengPrimaryStandbyIT` 3/3 通过。
+备库事件等待首轮失败，独立复测 `DamengStandbyIT` 5/5 通过，未稳定复现。
+快照过滤的 1 项错误是旧测试仍预期扩表必须失败；改为验证已删除的新纳入表不回放旧事件、保留表持续采集和再次重启后恢复，`DamengSnapshotFilterIT` 3/3 通过。
+首轮报告与针对性复测分别位于 `target/official-pack1-20261023-database-other/`、`target/official-pack1-20261023-targeted/` 和 `target/official-pack1-20261023-filter-fixed/`；这些是分轮结果，未声称在最后一次源码修改后重新执行了全部 923 项数据库测试。
+
+Kafka Connect 进程级测试使用本地 `hub.badxiao.top/library/eclipse-temurin:21-jre` 镜像和独立的 Kafka 4.3.0 测试 Broker；首轮 4 项中 3 项通过，Broker 故障场景在一次 15 秒 topic leader 管理查询时超时。
+在原有 2 分钟故障恢复期限内重试选主查询后，该场景独立复测通过。
+这验证了所用测试 Worker 的插件加载、偏移恢复和故障场景，不是 Kafka 2.0 环境验收。
+报告位于 `target/official-pack1-20261023-connect-local/` 和 `target/official-pack1-20261023-connect-retry/`。
+本轮未重新执行有限吞吐压测、独立能力探针或非零 COMPATIBLE_MODE 矩阵；不能由上述结果推出这些范围通过。
+
+== 2026-10-20 测试环境整理验证（旧 8.1.2.128）
+
+本轮将纯源码复制到另一绝对路径，没有携带 .git 或 target，重新构建并通过 1451 项单元与架构检查。
+另使用不含当前分支内部构件的独立 Maven 仓库，仅复用第三方/历史版本下载缓存，在离线模式下从源码补齐当前分支依赖及 assembly 构件。
+这验证了路径和内部构件依赖的移植，不等同于无需 JDK、Docker、镜像和第三方依赖的空环境运行。
+
+内置生成器经自有达梦、Worker 和单副本 Kafka 验证 32700 条 DML：INSERT 2289、UPDATE 29430、DELETE 981。
+逐条 before、全部 221 列最终状态和初始化重入均通过，最终 6308 行；生成器及 H2 未进入生产插件包。
+数据库完整回归执行 906 项，825 项通过、44 项断言失败、37 项错误、0 跳过，14 个测试类均执行。
+失败均位于严格字段一致性套件，未放宽断言或把它们改成忽略：
+
+[cols="4,1,5",options="header"]
+|===
+|边界 |用例数 |本轮表现
+|普通浮点及 JSON 负零/NaN |37 |包括 26 个聚焦浮点用例和 11 个矩阵用例；原始 LogMiner 精度限制及标准 JsonConverter 往返差异。
+|TIME(1..6) WITH TIME ZONE |6 |小数秒不能完整保留。
+|TIMESTAMP WITH LOCAL TIME ZONE |1 |当轮 Connector 明确拒绝未经验证的类型映射；这是修改前的历史结果。
+|无约束 NUMBER / DECIMAL / NUMERIC |18 |正负 1E125 在三个 decimal 模式下被基线数据库拒绝。
+|TIMESTAMP(7..9)，含 WITH TIME ZONE |15 |基线数据库拒绝高精度声明。
+|CHAR(8 CHAR) 多字节边界 |3 |基线数据库拒绝对应中文/emoji 输入。
+|ROWID 普通列声明 |1 |基线数据库拒绝该声明，不等同于伪列 ROWID 能力。
+|===
+
+本轮独立 JaCoCo 数据覆盖 4138/4242 行（97.55%），通过 95% 行覆盖率门槛；不能据此将上述失败标成通过。
+迁移目录中独立 Connect 进程的 4 项测试全部通过，使用 Temurin 21 基础镜像和从 Maven 解析的 Kafka 4.3.0，包含 Worker kill、发布中断、多个 Worker 及 Broker 故障恢复。
+独立 *ProbeIT 和厂商 JNI benchmark 本轮未执行；它们仍有单独入口和依赖说明。
+本轮证据汇总位于 `debezium-connector-dameng/target/portable-regression-20261020/validation-summary.json`，保留各阶段 XML、命令、容器日志及字段失败详情；不同目录中的重复单元运行未相加成独立用例数。
+当轮旧测试汇总入口的 7 项自检覆盖报告缺失、测试类缺失、跳过/错误、XML 损坏及阶段失败后继续执行。该入口已移除，当前以 Maven profiles 和 Surefire/Failsafe 报告核对执行范围与结果。
+当时的完整 suite 因上述严格字段断言返回非零。后续已调整用例分类、时间映射和 LOCAL TIME ZONE 策略，不能据此断言当前普通回归必然失败，也不能把移出普通回归或跳过的诊断项算作已修复。
+
+[[dameng-datatype-failures-20261020]]
+== 2026-10-20 字段边界失败分析
+
+本节保留 2026-10-20 对当轮 XML、失败堆栈、参数目录和测试源码的分析；当时的分析没有重新执行数据库测试，也没有修改实现、Kafka 依赖或断言。后续实现与用例调整另行注明。
+81 是失败的参数化测试实例数，不是 81 种字段类型，也不是 81 个独立根因。
+全部来自 `DamengDatatypesIT`：769 项执行，688 项通过，44 项 failure，37 项 error，0 跳过。
+其中一个实例可能同时检查多个输入、snapshot、INSERT、UPDATE 的 before/after、DELETE 及 JSON，并包含多个断言失败；不能把嵌套断言数再次加到 81 上。
+
+本次环境为 JDBC 数据库版本 `8.1.2.128`、完整构建 `08134283904-20220804-166351-20005`、驱动 `8.1.3.140`、GB18030。
+参数包括 `COMPATIBLE_MODE=0`、`LENGTH_IN_CHAR=0`、`NVARCHAR_LENGTH_IN_CHAR=1`、`RLOG_APPEND_LOGIC=2`。
+结论仅适用于这个组合，不自动推广到其他兼容模式、数据库构建或 Converter 版本。
+
+=== 按失败阶段归类
+
+预期值独立读取数据库实际存储结果，浮点比较实际二进制位，不是要求数据库存储后仍等于原始十进制输入文本。
+每行先核对 Connector 原始 Connect Struct，再使用 Kafka 4.3.0、`schemas.enable=true` 的标准 JsonConverter 编解码核对。
+测试中的 JSON 往返在进程内执行；该差异不需要经过 Kafka Broker 才能复现。
+
+[cols="1,3,1,4,4",options="header"]
+|===
+|分类 |字段或输入 |实例数 |最早失败位置 |生产含义
+|A |REAL / FLOAT / DOUBLE 普通值 |30 |流式原始 Connect 值已不一致；21 项聚焦用例和 9 项矩阵用例 |数值可被舍入或归零，影响 INSERT after、UPDATE before/after、DELETE before。9 项矩阵同时存在负零 JSON 问题，仍只计一次。
+|B |负零、NaN，仅 JSON 失败 |7 |原始 Connect 值通过；snapshot 和 streaming 的 JSON 解码结果不一致 |5 项负零、2 项 NaN。影响使用此解码路径的下游；不等于原始事件或 Broker 丢值。
+|C |TIME(1..6) WITH TIME ZONE |6 |流式原始 Connect 值丢小数秒；snapshot 检查通过 |时区时间的秒内精度丢失，前后镜像均受影响。
+|D |TIMESTAMP(6) WITH LOCAL TIME ZONE |1 |当轮 snapshot 建立输出 schema 时主动抛 DataException |当轮任务明确失败；后续改为有损 UTC 映射，不代表已恢复真实时间点。
+|E |NUMBER / DECIMAL / NUMERIC，正负 1E125 |18 |初始化测试数据 INSERT，Data overflow |数据库没有接受输入；Connector 尚未启动，无法判定这些值的 CDC 一致性。
+|F |TIMESTAMP(7..9)，含 WITH TIME ZONE |15 |CREATE TABLE，Precision is out of range |该构建未接受精度声明，尚未到数据写入或 CDC 阶段。
+|G |CHAR(8 CHAR)，7/8 个中文字符及 8 个 emoji |3 |初始化测试数据 JDBC INSERT，Param incompatible |输入没有成功存入，不能描述为 Connector 采集后截断中文。
+|H |普通列声明 ROWID |1 |CREATE TABLE，Invalid base class name[ROWID] |普通列类型声明受限；不代表 LogMiner 中用作行定位的 ROWID 伪列不可用。
+|===
+
+互不重复的阶段合计为：36 项流式原始值不一致、7 项仅 JSON 往返不一致、1 项主动拒绝、37 项数据库建表/写入拒绝，共 81 项。
+其中 A 的 9 项矩阵同时受 JSON 负零影响；若按影响范围统计，JSON 特殊值问题涉及 16 项，但不能再与上表相加。
+同样，A/C 的错误原始值进入 JSON 后也会失败，这不代表多出一个 JSON 根因。
+
+=== A/C：日志输出已经丢失精度
+
+当轮失败消息包含以下 JDBC 基线与实际流式值：
+
+[cols="3,3,3",options="header"]
+|===
+|用例 |JDBC 存储值 |流式 Connect 值
+|DOUBLE 普通小数 |1.23456789012345 |1.234568
+|DOUBLE 小非零值 |1.23456789E-7 |0.0
+|DOUBLE，1.0 的相邻较大值 |1.0000000000000002 |1.0
+|REAL 普通小数 |1.2345679 |1.234568
+|TIME(6) WITH TIME ZONE，归一 UTC |10:00:00.999999Z |10:00:00Z
+|===
+
+这 36 项中的原始 snapshot 检查没有不一致；浮点矩阵的 snapshot 负零失败仅属于 JSON 层。
+2026-10-12 的历史诊断观察到 SQL_REDO 输出已舍入浮点、去掉带时区 TIME 的小数秒。
+同一历史诊断尝试在线字典 `MINE_VALUE` 仍得到有损值，无字典逻辑列访问未获得替代值。
+本次没有重跑 MINE_VALUE/JNI 专项，历史报告的旧 target 目录也未在本次工作区保留，因此这些接口结论应与当前 XML 的数值差异证据区分。
+此处的限制是已验证 LogMiner 接口暴露的值，不能据此认定数据库存储或底层物理 REDO 本身也丢失了原值。
+
+仅改 Java 浮点解析、改用 BigDecimal、输出字符串或增加科学计数法支持，都不能从 `1.234568` 唯一恢复原来的 `1.23456789012345`。
+更换 Converter 也不能修复已经有损的原始 Connect 值；读取业务表当前行不能可靠还原历史 UPDATE 或已删除行。
+可行方向是获取并验证无损的数据库版本/日志接口，或在业务允许时重新设计源字段类型；`decimal.handling.mode=precise` 不会让已有 FLOAT 日志变无损。
+TIME(0) WITH TIME ZONE、无时区 TIME 与带时区 TIMESTAMP 必须分别看测试结果，不能把这 6 项概括成所有时间类型都不支持。
+
+=== B：标准 JSON 解码的特殊值差异
+
+5 项聚焦负零用例为 REAL、FLOAT(24)、FLOAT、FLOAT(53)、DOUBLE 的 `-0.0`；2 项 NaN 用例为 REAL 和 DOUBLE。
+负零经过编码的 JSON 包含 `-0.0`，但标准 JsonConverter 解码后成为 `+0.0`；NaN 编码为字符串 `"NaN"`，同一转换器解码成数值 0。
+当轮原始 Connector 特殊浮点 CRUD 回归另有 8 项，在当轮 XML 中均通过；当前仅保留 REAL、FLOAT(24)、FLOAT(53)、DOUBLE 四种类型的实际存储零值回归，已移除当前数据库拒绝的 NaN 写入输入。
+`DamengJsonConverterProbeIT` 独立验证标准转换器的现有行为；诊断测试通过不等于无损往返通过。
+
+负零与正零虽然按通常数值比较相等，但符号位、倒数和部分科学计算语义不同；NaN 变成 0 会把“非数值”误作真实零值。
+这是可以单独评估修复的转换/消费协议问题：在 Kafka 依赖版本保持不变的条件下，验证自定义 Converter 或下游显式解码协议，并检查 schema、存量消息和消费者兼容性。
+本次未实现或验证替代 Converter，不能宣称换一种格式就已解决。
+
+[[dameng-local-time-zone-policy]]
+=== D：LOCAL TIME ZONE 的当前策略与历史验证
+
+旧版 CREATE/INSERT 已成功，但 snapshot 在 `DamengValueConverters.schemaBuilder()` 主动拒绝 LTZ，底层原因为 `Unsupported Dameng TIMESTAMP WITH LOCAL TIME ZONE`。这是实现修改前的历史结果。
+历史跨会话诊断发现：快照随读取会话时区变化，而日志文本没有携带足够的原始写入时区信息，无法唯一恢复 instant。
+2026-10-26 在官方 8.1.3.162 pack1 构建 `03134284194-20240703-234060-20108` 上重新验证：两个写入会话分别设置 `+05:45` 和 `-12:59`，写入同一无偏移字面量 `2000-02-29 12:34:56.123456`。
+UTC 读取会话分别得到 `2000-02-29 06:49:56.123456` 与 `2000-03-01 01:33:56.123456`，即两个不同 instant；对应归档 `SQL_REDO` 均为同一个 `TIMESTAMP'2000-02-29 12:34:56.123456'`。
+挖掘会话设为 UTC 或 `+08:00` 时，两条 redo 的表达式都保持相同；另一组测试也确认同一行的 JDBC 读值会随读取会话时区变化。
+在线字典模式下，`DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, 'schema.table.VALUE')` 对这两条历史 INSERT 也都返回 `2000-02-29 12:34:56.123456`；挖掘会话设为 UTC 或 `+08:00` 结果相同。因此在已验证的 `SQL_REDO` 和 `MINE_VALUE` 路径中，都没有得到可区分这两个 instant 的列值。
+后续对照加入第三条：在 `-12:59` 写入会话用 `2000-02-28 17:50:56.123456` 表示第一条的同一个 UTC 时间点。归档 `SQL_REDO` 和 `MINE_VALUE` 仍返回这个不同的本地时间文本，说明已测输出不是统一的 UTC 时间。第四条在 `+05:45` 会话写入带显式 `-12:59` 偏移的 `2000-02-29 12:34:56.123456`；挖掘结果为 `2000-03-01 07:18:56.123456`，说明输出也不是简单复制 INSERT 原文，而是呈现写入会话的本地时间。
+`MINE_VALUE` 的 JDBC 元数据为 `VARCHAR`，`getObject()` 返回 `String`。将该字符串再读成 `Timestamp` 只会引入客户端时区解释，不会恢复写入时区。上述实验确定的是公开 LogMiner 查询的时间基准，未直接解码归档文件的原始二进制编码；不能断言物理 redo 内部一定按写入会话时区存储。
+`DamengDatatypeProbeIT.shouldExposeAmbiguousLocalTimezoneRedoAcrossWriterSessions` 将这种歧义作为回归断言。结论限于本构建已测的归档 `SQL_REDO` 和在线字典 `MINE_VALUE` 路径，不排除未来数据库版本或其他接口提供可恢复的原始时间点。
+当前实现按用户选择接受这种语义损失：只对 `TIMESTAMP WITH LOCAL TIME ZONE` 将流式本地时间文本当作 UTC，并将 Connector 的 JDBC 会话设为 UTC 以固定 snapshot 读取基准。输出是带 `Z` 的 `io.debezium.time.ZonedTimestamp` 字符串，不声明流式输出是真实 instant。普通 `TIMESTAMP` 和 `TIMESTAMP WITH TIME ZONE` 维持原有映射。
+在官方 8.1.3.162 pack1 上，完整引擎定向测试覆盖同表三种时间类型的 snapshot、INSERT、UPDATE、DELETE：`+05:45` 写入的 LTZ 在快照为 `2000-02-29T06:49:56.123456Z`，流式为 `2000-02-29T12:34:56.123456Z`；另外两列未被套用 LTZ 规则。下游恢复需要每条写入对应的会话时区，任务配置一个固定默认时区不能保证所有历史记录正确。
+
+若未来要求无损支持，仍需验证能取得每条历史记录原始 instant 或写入会话时区的数据库接口，并覆盖不同写入会话、显式偏移、夏令时及重启回放。
+
+=== E/F/G/H：数据库未接受测试声明或输入
+
+E 的 18 项等于 3 种类型名称 × 3 种 decimal.handling.mode × 正负两个值。
+配置仅影响 Connector 的表示方式，无法改变启动前的 INSERT 结果；本轮 SQL 科学计数值被拒绝，错误根因为 `Data overflow`。
+历史分路径诊断还记录 JDBC setBigDecimal 拒绝同样数值，但本次没有重新执行该诊断。
+不能把官网数值表达式的计算范围直接等同于该旧构建的列存储范围。
+
+F 的 15 项等于每种精度下 4 个普通 TIMESTAMP 输入独立用例、1 个带时区用例，共 3 组。
+四个输入含公元 1 年、1969 年末、闰日及 9999 年；这次全部在建表阶段失败，尚不能判断对应日期/小数秒转换的结果。
+升级后即使接受声明，还要检查 Connector 纳秒时间戳的 INT64 可表示范围；当前测试用独立 BigInteger 期望值防止溢出被误判为通过。
+
+G 的输入是 `梦` 重复 8 次、重复 7 次，以及 `😀` 重复 8 次。
+报告中的 emoji `length=16` 来自 Java UTF-16 长度，实际是 8 个 Unicode 码点，不是写入了 16 个 emoji。
+现有字符集和长度参数下 JDBC 报 `Param incompatible`；历史 SQL 字面量路径也记录列超长。
+目前不能仅凭这些信息断言是驱动、服务器实现还是某个参数单独负责，应在升级后重测两条写入路径及显式 CHAR/BYTE 语义。
+
+H 的建表语句使用 `VALUE ROWID`，与查询或日志 WHERE 中的 ROWID 行定位语义不同。
+不能通过删除这项失败就把普通 ROWID 类型列标成支持，也不能据此否定无主键表采集。
+
+37 项都尚未进入这些值的 CDC 验收。升级后需先确认原声明/输入被接受，再检查 snapshot、归档 CRUD、before/after、JSON 及相关重启/历史结构回放。
+缩小输入、截短中文或把精度改成 6 会变成另一个用例，不能算修复原来的边界。
+
+=== 后续处理顺序与验收口径
+
+先处理 A/C 的流式值失真，因为它们可能正常发布消息却给出错误数值；确认业务是否使用相关字段，并优先验证升级构建或无损接口。
+B 可以作为独立开发项评估，保持 Kafka 版本不变也能研究转换器/消费者解码，但需要实际往返验收。
+D 当前已采用上述有损 UTC 映射，不再主动拒绝；无损恢复仍需历史时区信息。E/F/G/H 应按具体构建复核：部分高精度时间、中文 CHAR 和 ROWID 输入在新版已通过，ROWID 历史 DDL 等未解决边界仍需分别验证。
+测试报告可进一步区分“声明/输入未接受”“显式不支持”“原始事件不一致”“序列化往返不一致”，但这不是把失败改成成功的理由。
+当前已将能力探针、性能实验与普通回归拆开，并将已知有损浮点检查设为显式诊断。必须继续保留严格检查和限制说明，诊断未运行或被跳过不代表一致性通过。
+97.55% 行覆盖率说明代码执行覆盖程度，不表示这 81 项一致性和能力问题已解决。
+
+=== 81 项定位索引
+
+下表的 F[n] 对应 `shouldPreserveStoredFloatingPointBitsInSnapshotAndStreaming(String, String)[n]`，
+M[n] 对应 `shouldPreserveTypeBoundariesAndNullCrudImages(TypeCase)[n]`，均属于 `DamengDatatypesIT`。
+索引以本次 XML 与 case-catalog 为准，未来增删参数后须重新映射；名称、输入和分类才是跨版本追踪依据。
+A～H 对应前面的分类及失败阶段。
+
+浮点矩阵的“13 值”依次为负上界、负最小正规数、负最小次正规数、普通负小数、负零、正零、最小次正规数、最小正规数、1 的相邻较小值、1、1 的相邻较大值、普通正小数、正上界。
+普通小数为正负 `1.23456789012345` 经对应 Float/Double 参数转换后的值；REAL/FLOAT(1)/FLOAT(24) 使用 Float，其余使用 Double。
+单精度上界为 `3.4e38f`，双精度上界为 `Double.MAX_VALUE`，最小值和相邻值取对应 Java 类型常量/nextUp/nextDown。
+TIME(p) WITH TIME ZONE 的 3 值为 `00:00:00.<p个9> +14:00`、`23:59:59.<p个9> -12:59`、`12:34:56.123456 +05:45`。
+TIMESTAMP(p) WITH TIME ZONE 的 2 值为 `1969-12-31 23:59:59.<p个9> +14:00` 和 `2000-02-29 00:00:00.<p个9> -12:59`。
+矩阵用例设计包含独立 NULL 行，并对接受的输入继续检查值与 NULL 互转及删除镜像；建表或输入被拒绝的实例尚未执行到这些检查。
+
+// datatype-failure-index-start
+[cols="1,7,1",options="header"]
+|===
+|索引 |字段与输入/配置 |分类
+|F[1] |REAL，JDBC 参数 1.23456789012345 |A
+|F[2] |REAL，JDBC 参数 -1.23456789012345 |A
+|F[3] |REAL，JDBC 参数 0.000000123456789 |A
+|F[6] |REAL，JDBC 参数 -0.0 |B
+|F[7] |FLOAT(24)，JDBC 参数 1.23456789012345 |A
+|F[8] |FLOAT(24)，JDBC 参数 -1.23456789012345 |A
+|F[9] |FLOAT(24)，JDBC 参数 0.000000123456789 |A
+|F[12] |FLOAT(24)，JDBC 参数 -0.0 |B
+|F[13] |FLOAT，JDBC 参数 1.23456789012345 |A
+|F[14] |FLOAT，JDBC 参数 -1.23456789012345 |A
+|F[15] |FLOAT，JDBC 参数 0.000000123456789 |A
+|F[18] |FLOAT，JDBC 参数 -0.0 |B
+|F[19] |FLOAT(53)，JDBC 参数 1.23456789012345 |A
+|F[20] |FLOAT(53)，JDBC 参数 -1.23456789012345 |A
+|F[21] |FLOAT(53)，JDBC 参数 0.000000123456789 |A
+|F[24] |FLOAT(53)，JDBC 参数 -0.0 |B
+|F[25] |DOUBLE，JDBC 参数 1.23456789012345 |A
+|F[26] |DOUBLE，JDBC 参数 -1.23456789012345 |A
+|F[27] |DOUBLE，JDBC 参数 0.000000123456789 |A
+|F[30] |DOUBLE，JDBC 参数 -0.0 |B
+|F[32] |DOUBLE，JDBC 参数 2.2250738585072014E-308 |A
+|F[33] |DOUBLE，JDBC 参数 4.9E-324 |A
+|F[34] |DOUBLE，JDBC 参数 1.0000000000000002 |A
+|F[35] |DOUBLE，JDBC 参数 0.9999999999999999 |A
+|F[37] |REAL，JDBC 参数 1.1754944E-38 |A
+|F[38] |REAL，JDBC 参数 1.4E-45 |A
+|M[165] |NUMBER/precise/input=1E125 |E
+|M[166] |NUMBER/precise/input=-1E125 |E
+|M[172] |NUMBER/string/input=1E125 |E
+|M[173] |NUMBER/string/input=-1E125 |E
+|M[179] |NUMBER/double/input=1E125 |E
+|M[180] |NUMBER/double/input=-1E125 |E
+|M[186] |DECIMAL/precise/input=1E125 |E
+|M[187] |DECIMAL/precise/input=-1E125 |E
+|M[193] |DECIMAL/string/input=1E125 |E
+|M[194] |DECIMAL/string/input=-1E125 |E
+|M[200] |DECIMAL/double/input=1E125 |E
+|M[201] |DECIMAL/double/input=-1E125 |E
+|M[207] |NUMERIC/precise/input=1E125 |E
+|M[208] |NUMERIC/precise/input=-1E125 |E
+|M[214] |NUMERIC/string/input=1E125 |E
+|M[215] |NUMERIC/string/input=-1E125 |E
+|M[221] |NUMERIC/double/input=1E125 |E
+|M[222] |NUMERIC/double/input=-1E125 |E
+|M[227] |REAL，13 值矩阵；另有负零 JSON 差异 |A
+|M[228] |FLOAT(1)，13 值矩阵；另有负零 JSON 差异 |A
+|M[229] |FLOAT(24)，13 值矩阵；另有负零 JSON 差异 |A
+|M[230] |FLOAT(25)，13 值矩阵；另有负零 JSON 差异 |A
+|M[231] |FLOAT，13 值矩阵；另有负零 JSON 差异 |A
+|M[232] |FLOAT(53)，13 值矩阵；另有负零 JSON 差异 |A
+|M[233] |FLOAT(126)，13 值矩阵；另有负零 JSON 差异 |A
+|M[234] |DOUBLE，13 值矩阵；另有负零 JSON 差异 |A
+|M[235] |DOUBLE PRECISION，13 值矩阵；另有负零 JSON 差异 |A
+|M[236] |REAL，JDBC NaN |B
+|M[237] |DOUBLE，JDBC NaN |B
+|M[250] |TIME(1) WITH TIME ZONE，3 值矩阵 |C
+|M[252] |TIME(2) WITH TIME ZONE，3 值矩阵 |C
+|M[254] |TIME(3) WITH TIME ZONE，3 值矩阵 |C
+|M[256] |TIME(4) WITH TIME ZONE，3 值矩阵 |C
+|M[258] |TIME(5) WITH TIME ZONE，3 值矩阵 |C
+|M[260] |TIME(6) WITH TIME ZONE，3 值矩阵 |C
+|M[296] |TIMESTAMP(7)，TIMESTAMP'0001-01-01 00:00:00' |F
+|M[297] |TIMESTAMP(7)，TIMESTAMP'1969-12-31 23:59:59.9999999' |F
+|M[298] |TIMESTAMP(7)，TIMESTAMP'2000-02-29 12:34:56.123456789' |F
+|M[299] |TIMESTAMP(7)，TIMESTAMP'9999-12-31 23:59:59.9999999' |F
+|M[300] |TIMESTAMP(7) WITH TIME ZONE，2 值矩阵 |F
+|M[301] |TIMESTAMP(8)，TIMESTAMP'0001-01-01 00:00:00' |F
+|M[302] |TIMESTAMP(8)，TIMESTAMP'1969-12-31 23:59:59.99999999' |F
+|M[303] |TIMESTAMP(8)，TIMESTAMP'2000-02-29 12:34:56.123456789' |F
+|M[304] |TIMESTAMP(8)，TIMESTAMP'9999-12-31 23:59:59.99999999' |F
+|M[305] |TIMESTAMP(8) WITH TIME ZONE，2 值矩阵 |F
+|M[306] |TIMESTAMP(9)，TIMESTAMP'0001-01-01 00:00:00' |F
+|M[307] |TIMESTAMP(9)，TIMESTAMP'1969-12-31 23:59:59.999999999' |F
+|M[308] |TIMESTAMP(9)，TIMESTAMP'2000-02-29 12:34:56.123456789' |F
+|M[309] |TIMESTAMP(9)，TIMESTAMP'9999-12-31 23:59:59.999999999' |F
+|M[310] |TIMESTAMP(9) WITH TIME ZONE，2 值矩阵 |F
+|M[315] |TIMESTAMP(6) WITH LOCAL TIME ZONE，TIMESTAMP'1969-12-31 23:59:59.123456' |D
+|M[333] |CHAR(8 CHAR)，JDBC string(length=8):梦梦梦梦梦梦梦梦 |G
+|M[334] |CHAR(8 CHAR)，JDBC string(length=7):梦梦梦梦梦梦梦 |G
+|M[335] |CHAR(8 CHAR)，JDBC string(length=16):😀😀😀😀😀😀😀😀 |G
+|M[341] |普通列 VALUE ROWID；计划输入 AAABAAAAACAAAAAAAy（建表即失败） |H
+|===
+// datatype-failure-index-end
+
+证据基目录为 `debezium-connector-dameng/target/portable-regression-20261020/`。
+`validation-summary.json` 是完成各阶段后的汇总；根目录早期 `summary.json` 不代表后续阶段的最终状态。
+`database/detailed-results.json` 保留全部失败消息和堆栈；`database/reports/TEST-io.debezium.connector.dameng.DamengDatatypesIT.xml` 用于核对实例和失败层次。
+`database/database-evidence/case-catalog.txt` 用于参数索引映射，`environment-mode-0.txt` 用于环境限定。
+target 是构建输出，发布时应另行归档证据，避免后续 clean 清理后失去原始记录。

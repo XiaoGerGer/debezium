@@ -31,7 +31,7 @@ class DamengCaptureScopeManifestTest {
     private static final List<String> FIELDS = List.of(
             "database.include.list", "database.exclude.list", "schema.include.list", "schema.exclude.list",
             "table.include.list", "table.exclude.list", "signal.data.collection", "table.ignore.builtin", "database.dbname");
-    private final DamengConnectorConfig original = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build());
+    private final DamengConnectorConfig original = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
 
     @Test
     void shouldRoundTripManifestAndKeepItsSignatureBoundToEveryValue() {
@@ -51,7 +51,7 @@ class DamengCaptureScopeManifestTest {
     }
 
     private static Stream<Arguments> invalidManifests() throws Exception {
-        final var valid = DamengCaptureScope.manifest(new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build()));
+        final var valid = DamengCaptureScope.manifest(new DamengConnectorConfig(DamengTestConfiguration.configuration().build()));
         final var cases = Stream.<Arguments> builder();
         cases.add(Arguments.of("{}")).add(Arguments.of("not-json"));
         for (var field : FIELDS) {

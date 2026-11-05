@@ -18,860 +18,96 @@ You SHOULD understand where they are coming from, what they need, and what issue
 
 == 概览
 
-本手册适用于 `3.6-xinchuang` 分支、版本 `3.6.4-xingchuang-kafka2.0`，内容核对日期为 2026-10-21。
-数据库准备、兼容矩阵、采集机制、事件格式、类型映射、部署、参数、监控和故障处理均集中在本文件。
-代码测试和历史调研报告作为工程证据保留，日常部署和运维不需要按报告逐篇查找使用方法。
+本手册适用于 `3.6-xingchuang` 分支、版本 `3.6.4-xingchuang-kafka2.0`，核对日期为 2026-11-05。
+Connector 通过 JDBC 读取结构和快照，通过 `DBMS_LOGMNR` 挖掘归档 REDO，发布已提交的行级变更。
 
-Connector 使用 JDBC 获取表结构和快照数据，通过达梦 `DBMS_LOGMNR` 挖掘归档 REDO，向 Kafka 发布行级变更。
-支持采集可写单机、主备环境中的当前主库，以及显式配置的物理备库；备库采集要求目标数据库构建支持该接口，信号写入仍连接主库，详见 <<dameng-standby-capture,备库采集与主库信号写入>>。
-只创建一个 Task，`tasks.max` 大于 `1` 会报错。
-默认 `snapshot.mode=no_data`，首次启动只建立结构和 LSN 基线，不扫描存量行；需要存量数据时显式使用 `initial`，或稍后触发增量快照。
-已有 offset 时正常恢复原位置，`no_data` 不表示每次重启都从最新位置开始。
+部署前先确认四点：
 
-交付语义为至少一次，重启后可能重发尚未确认 offset 的事件；当前不声明 Kafka Connect Source Exactly-once 支持。
-数据库的一个事务可以包含很多条行级变更，一条更新 100 行的 SQL 通常产生 100 个更新事件，另可能有事务元数据事件。
-事件只在事务提交后发布；回滚内容不应发布。Kafka 跨 Topic、跨分区的消费顺序和原子可见性仍需由下游设计。
+* 仅支持 `COMPATIBLE_MODE=0`，单个 Connector 只运行一个 Task。
+* 默认 `snapshot.mode=no_data`，不扫描存量行；需要首次全量时设置 `initial`。
+* 交付语义为至少一次，重启可能重发未确认的事件，下游需支持幂等处理。
+* 浮点精度、行外 LOB 和 LOCAL TIME ZONE 有已知限制，见 <<dameng-data-types,类型映射>>。
 
-== 工作原理
+首次部署按 <<dameng-database-setup,数据库准备>>、<<dameng-deployment,部署与验证>> 操作。
+已有任务调整表范围见 <<dameng-capture-scope-changes,扩缩表>>，故障或升级见 <<dameng-recovery,恢复>>。
+
+=== 采集与恢复位置
 
 [source,text]
 ----
-Kafka Connect Worker
-  -> DamengConnector：插件发现、配置、创建唯一 Task
-  -> DamengConnectorTask：JDBC、offset、schema history、队列和服务
-  -> ChangeEventSourceCoordinator：协调快照、持续采集和信号处理
-       -> 初始快照：共享锁 -> 选择 LSN -> 结构/可选数据 -> 释放锁
-       -> 持续采集：归档检查 -> LogMiner 窗口 -> 事务缓存/回滚重建
-                    -> 历史结构解码 -> EventDispatcher -> 事件队列
-       -> 增量快照：主键分块读取 + 信号水位 + CDC 去重
-  -> Task.poll() -> Worker Converter/SMT/Producer -> Kafka 业务 Topic
-  -> Worker 确认进度 -> Kafka Connect offset 存储
+初始快照：共享表锁 → 选择 LSN → 读取结构和可选存量行 → 释放锁
+持续采集：归档 REDO → LogMiner → 事务缓存 → 历史结构解码 → Kafka
+增量快照：主键分块读取 + 源表信号水位 + CDC 去重
 ----
 
-Worker 管理插件、Task 生命周期、REST API、序列化和 Kafka 发送；Broker 存储 Kafka 消息。
-协调器不等于新的 Worker 或 Broker，它在 Task 内组织快照、streaming 和信号流程。
-增量快照使用独立 JDBC 连接，但不因此变成多个 Task 或多表并行快照。
+事件在事务提交后发布，回滚行不发布。跨 Topic、跨分区的顺序和原子可见性由下游处理。
+source partition 为 `{"server":"<topic.prefix>"}`，Worker 结合 Connector 名称查找 offset。正常恢复须保留名称、`topic.prefix`、offset 和独占的 schema history。
 
-=== 分区、offset 和历史结构
-
-Connector 的 source partition 是逻辑来源标识 `{"server":"<topic.prefix>"}`，不是 Kafka Topic 分区。
-Worker 按 Connector 名称和 source partition 找回 offset；不要在恢复时随意改变 Connector 名称、`topic.prefix` 或 history Topic。
-offset 记录安全重放 LSN、变更 LSN、提交 LSN、事务内记录序号、事务身份、数据库身份和结构解释签名。
-这些值用于历史重放，不是可以任意编辑的“从这里继续”的游标。
-
-数据库当前 JDBC 表结构可能晚于待处理日志。
-Connector 先从 schema history 恢复日志位置对应的表定义，再按 REDO 中的 `OBJ#` 和 `COL n` 解码；不能拿当前列顺序解释旧日志。
-快照记录对象编号与结构，后续受支持的 DDL 更新历史模型。映射按不可变表定义缓存，DDL 更新时失效，避免重复解析同一结构。
-原生模式、词法、标识符和大小写设置进入 `compatibility_signature`；过滤范围进入 `capture_scope`。
-旧 offset 缺失签名或兼容条件不一致时拒绝普通恢复。支持的表过滤范围调整通过独立的范围变更记录恢复，详见 <<dameng-capture-scope-changes,调整采集表范围>>和 <<dameng-recovery,恢复与升级>>。
-
-=== 适用范围
-
-本实现不提供 Oracle XStream、OpenLogReplicator、RAC/PDB、Oracle Flashback、Infinispan/Ehcache 事务缓存或在线字典采集模式切换。
-JNI/C Logmnr 曾用于性能探测，当前产品路径仍为 JDBC 系统包。
-并行初始快照、阻塞快照、自定义 snapshotter、主动丢弃事务信号，以及手工注入结构修复历史 DDL 的流程均未作为达梦已验证能力提供。
-通用配置字段出现在 REST 配置元数据中，不意味着相应流程已在达梦实现或验收。
+schema history 保存日志位置对应的表定义与对象编号，避免用当前 JDBC 列顺序解释旧日志。
+offset 中的 `compatibility_signature` 记录兼容和词法环境，`capture_scope` 记录过滤范围；缺失或不兼容时拒绝普通恢复，不应手工补造。
 
 [id="dameng-support-matrix"]
-== 兼容模式、版本和部署支持矩阵
-
-本节适用于 `3.6-xinchuang` 分支的 `3.6.4-xingchuang-kafka2.0`，核对日期为 2026-10-21。
-矩阵描述当前 Connector 的实现边界和已有测试结果，不代表达梦数据库产品本身的完整能力。
-部署时需要同时满足数据库构建、JDBC 驱动、兼容模式、相关参数和部署模式的条件；三张矩阵不能任意交叉组合成已经验证的环境。
-
-“已验证”仅指记录中的场景通过测试；“组件探测”仅指直接调用 JDBC、LogMiner 或解析器；“未验证”不等于已经证明不可用。
-数据库能执行 SQL、Connector 允许启动、端到端 CDC 数据一致性通过，是三个不同的判断。
-字段精度、LOB 和 DDL 等限制仍以 <<dameng-connector,Connector 使用说明>>为准。
+== 支持范围
 
 [id="dameng-compatible-mode-matrix"]
-=== COMPATIBLE_MODE 支持矩阵
+=== 兼容模式
 
-模式名称依据 https://eco.dameng.com/document/dm/zh-cn/pm/physical-storage.html[达梦数据库参数说明]。
-“兼容”是达梦提供的相应数据库语义兼容模式，不表示可以使用该数据库的 Debezium Connector，也不表示兼容其全部语法。
-当前生产注册表只有原生模式 `0` 的实现。
+仅支持服务器实际的 `COMPATIBLE_MODE=0`（达梦原生模式）。其他模式和未知模式均拒绝启动，不回退到原生规则。
+`dameng.compatible.mode` 是测试属性；JDBC 的 `compatibleMode` 驱动选项也不能覆盖服务器检查。
+数据库端的日志和词法参数要求见 <<dameng-database-setup,数据库准备>>。
 
-[cols="1,2,3,4",options="header"]
-|===
-|COMPATIBLE_MODE |数据库模式 |当前 Connector 行为 |已有测试与边界
-|`0` |达梦原生模式 |已实现，满足参数条件后允许启动 |已执行 snapshot、streaming、DDL、事务、恢复及增量快照回归。仍存在下述版本和字段限制，不能宣称全字段无损。
-|`1` |SQL92 |未实现，拒绝启动 |有历史 JDBC/LogMiner 字段组件探测，整体矩阵未通过，未完成该模式的完整 Connector 验收。
-|`2` |部分兼容 Oracle |未实现，拒绝启动 |有历史组件探测；DATE、空串、数值声明等模式语义仍需实现和验收，不能直接沿用原生规则。
-|`3` |部分兼容 SQL Server |未实现，拒绝启动 |有历史组件探测，未完成完整 Connector 验收。
-|`4` |部分兼容 MySQL |未实现，拒绝启动 |有历史组件探测；数据库对超长输入的转换或截断须对照实际存储值，不能据此判定 Connector 已兼容。
-|`5` |兼容 DM6 |未实现，拒绝启动 |有历史组件探测，未完成完整 Connector 验收。
-|`6` |部分兼容 Teradata |未实现，拒绝启动 |有历史组件探测，未完成完整 Connector 验收。
-|`7` |部分兼容 PostgreSQL |未实现，拒绝启动 |历史测试所用旧构建在配置该模式时初始化失败，未进入字段测试；需要支持该模式的数据库构建重新验证。
-|`8` |部分兼容 DB2 |未实现，拒绝启动 |历史测试所用旧构建在配置该模式时初始化失败，未进入字段测试；需要支持该模式的数据库构建重新验证。
-|其他非负整数 |未来新增或当前未知模式 |可表示并诊断；无注册实现时拒绝启动 |没有默认回退到模式 `0` 的行为；不得把当前列举的 `0` 至 `8` 当作永久完整范围。
-|===
-
-模式 `1` 至 `8` 的历史探测记录来自 2026-10-12 的同一个旧 DM8 构建；执行范围和失败边界见模块测试说明 `debezium-connector-dameng/src/test/testing.adoc`。
-该轮全模式矩阵整体失败，组件测试结果不能作为开放非零模式的依据。
-`dameng.compatible.mode` 是测试环境参数，不是生产任务配置，不能用它覆盖服务器的实际 `COMPATIBLE_MODE`。
-DM JDBC 的 `compatibleMode` 驱动选项也不等同于服务器参数，不能用来绕过 Connector 模式检查。
-
-模式 `0` 还需满足以下解释日志的条件；归档和权限条件见 <<dameng-database-setup,数据库端配置>>。
-
-[cols="2,2,4",options="header"]
-|===
-|参数 |当前接受值 |验证范围
-|`LENGTH_IN_CHAR` |`0` |字节长度语义；其他值或缺失时拒绝。
-|`CASE_SENSITIVE` |`0` 或 `1` |初始化属性。模式 0 统一输出大写标识符；模式 1 保留 JDBC/双引号标识符的大小写，同表列名仅大小写不同仍拒绝。
-|`BACKSLASH_ESCAPE`、`NESTED_C_STYLE_COMMENT` |代码范围校验各接受 `0` 或 `1` |8.1.2.128 原生模式的四种组合曾通过。8.1.3.162 的 `BACKSLASH_ESCAPE=1` 改变了字面量语义，两组测试失败；该构建应使用 `BACKSLASH_ESCAPE=0`，不能把启动范围校验当作兼容验收。`BACKSLASH_ESCAPE=0` 时两种嵌套注释设置均通过。
-|`IDENTIFIER_MODE` |缺失、`0`、`1` |测试构建没有此参数，已验证缺失时的行为；显式 `0`、`1` 的解析规则有单元测试，尤其 `1` 尚需支持该参数的目标数据库做端到端验收。
-|===
-
-当前语义设置会保存在 offset 的 `compatibility_signature` 中。
-主备成员应保持一致，并在整个需重放的日志区间内保持不变；改模式后沿用旧 offset 不属于受支持的升级路径。
+本实现使用 JDBC LogMiner，不提供 JNI 生产适配器、XStream、OpenLogReplicator、Oracle RAC/PDB 或 Flashback。
+并行初始快照、阻塞快照、自定义 snapshotter、主动丢弃事务和手工注入历史 DDL 未提供。
 
 [id="dameng-database-version-matrix"]
-=== 数据库与 JDBC 版本测试矩阵
+=== 数据库与驱动
 
-数据库产品版本、服务器完整构建号和 JDBC 驱动版本分别记录。
-启动时打印的 JDBC 数据库版本不能代替完整构建号，也不能仅凭镜像标签中的年份判断数据库新旧。
-
-[cols="2,3,2,5",options="header"]
-|===
-|数据库版本 |服务器构建 |JDBC 驱动 |测试状态与结论
-|JDBC 返回 `DM DBMS` / `8.1.2.128`，主版本 `8`、次版本 `1`
-|`08134283904-20220804-166351-20005`
-|`DmJdbcDriver18` / `8.1.3.140`
-|历史回归基线。已执行原生模式下的快照、CDC、DDL、事务、恢复、增量快照及主备切换场景；具体功能的测试时间和范围不同。GB18030 用于字段一致性等测试，UTF-8 用于备库挖掘探测，不能据此认为每种字符集都执行了全部场景。
-|JDBC 返回 `DM DBMS` / `8.1.3.162`，主版本 `8`、次版本 `1`
-|`03134284194-20240621-232765-20108`
-|`DmJdbcDriver18` / `8.1.3.140`
-|2026-10-20 切换后的默认测试版本，来自用户提供的 `dm8_20240715_x86_rh6_rq_single.tar.zip`。完整回归结果见 <<dameng-regression-813162,8.1.3.162 回归>>；不能仅凭版本号将社区的其他构建或备库示例认定为已验收组合。
-|其他 DM8 版本、补丁构建，或相同 JDBC 数据库版本但不同构建
-|待记录
-|其他版本或组合待验证
-|不在当前明确验证的组合内。需要目标环境测试；未知 JDBC 数据库版本只产生 WARN，不因版本名单本身停止启动，其他模式、角色、归档和语义检查仍然生效。
-|===
-
-当前默认测试镜像为 `dameng:8.1.3.162-20240621-rev232765`，离线导入方式见测试章节。
-旧基线镜像为 `hub.badxiao.top/xuxuclassmate/dameng:latest`；2026-10-15 备库探测记录的镜像摘要为 `sha256:c4088323442747a45d58bd33ef59e657c9b85f9e7dd956ba60b36d04a35b141d`。
-`latest` 是可变标签；记录实际镜像身份、服务器构建和驱动，才能复核测试环境。
-先前标为 `2026` 的另一镜像不纳入当前验收基线，不能把它当作较新数据库版本的验证证据。
-
-旧基线的已知限制包括 REAL/FLOAT/DOUBLE 的 LogMiner 文本精度损失、带时区 TIME 的小数秒缺失，以及无法无损还原 `TIMESTAMP WITH LOCAL TIME ZONE` 的历史时间点；当前有损映射见 <<dameng-local-time-zone-policy,当前策略>>。
-完整行外 BLOB/CLOB 流式采集也未支持；占位值不代表完整 LOB 内容。
-部分 DDL 语法只有解析器单测或仍不支持。
-这些限制不因版本被列为“已测试”而消失；具体字段与 DDL 行为见 <<dameng-connector,Connector 使用说明>>。
-
-`DamengDatabaseVersion` 当前匹配的是 JDBC 返回的产品名、产品版本和主次版本，不校验完整构建号、驱动版本、字符集或全部参数组合。
-因此无版本 WARN 不等于完整环境通过验收；版本读取失败也只 WARN。
-升级数据库或驱动后，应重新核对实际存储值、snapshot 和 streaming 的一致性，并执行历史 DDL、事务回滚、重启恢复及目标部署模式的测试。
-
-官方社区线索见 https://eco.dameng.com/community/article/2b327cc00893e4f86a3c400afd60bd76[达梦日志挖掘 LOGMNR 功能介绍]。
-文章示例与项目测试是不同证据，数据库具备备库接口也不等于 Connector 已完成备库适配。
-
-[id="dameng-deployment-mode-matrix"]
-=== 达梦部署模式支持矩阵
-
-本表描述数据库拓扑和实际采集节点，不是 Kafka Connect Worker 的部署方式。
-当前生产采集接口为 JDBC `DBMS_LOGMNR`，不是 JNI/C Logmnr；后者的专项性能探测不表示存在可用的 Connector 适配器。
-
-[cols="2,2,2,5",options="header"]
-|===
-|数据库部署与采集位置 |角色条件 |支持状态 |配置、测试与边界
-|单机，直接连接可写实例 |`MODE$=NORMAL`，`STATUS$=OPEN` |已实现并有集成回归 |配置 `database.hostname` / `database.port`。要求归档连续，数据库身份不变。
-|主备，直接连接固定主库地址 |`PRIMARY` / `OPEN` |允许采集当前主库；不提供跨成员恢复保证 |单地址模式没有主备恢复锚点。不能仅改地址或使用透明路由，就把另一个成员当作原单机继续重放。
-|主备，无 VIP，通过成员地址列表连接当前主库 |`PRIMARY` / `OPEN`，单实例成员 `N_EP=1` |已实现并验证人工切换场景 |配置 `database.failover.hosts`。测试覆盖 switchover、切回、终止主库后的非强制人工 takeover，以及快照中途切换后的恢复。由 DBA / Data Guard 升主和隔离旧主，Connector 负责重连与历史连续性校验。
-|主备，在物理备库采集，主库写入信号 |读取 `STANDBY` / `OPEN`，写入 `PRIMARY` / `OPEN`，`N_EP=1` |通过 database.standby.hosts 显式启用 |要求数据库构建支持备库 DBMS_LOGMNR，并提供 SLSN 与 RPKG_LSN。旧 8.1.2.128 的 ADD_LOGFILE 报 `-710`；本分支针对 8.1.3.162 实现读写连接分离，范围和测试见下述备库采集章节。备库不执行信号表 DDL/DML。
-|DMDSC，包括 DSC 成员组成的主备拓扑 |不能仅凭 `PRIMARY` / `OPEN` 判断 |当前不支持 |现有主备身份模型要求 `N_EP=1`，没有多节点日志合并与恢复验收；不能通过选择一个节点或绕过检查宣称支持。
-|主备使用 VIP、代理或自动故障切换管理系统 |切换后仍须唯一 `PRIMARY` / `OPEN` |不是已验证的部署组合 |现有验收限于成员地址列表与人工角色切换。需要额外验证路由、连接失效、隔离旧主和历史连续性；Connector 不执行升主或脑裂仲裁。
-|多可写主库、分布式多源采集，或人为拼接不同分支归档 |超出现有单一来源主库模型 |当前不支持 |没有全局顺序、身份链和恢复实现。强制有损 takeover、脑裂也不属于已验证恢复范围。
-|===
-
-`MOUNT`、`SUSPEND` 等非 `OPEN` 状态不是可采集状态；配置成员列表时也不接受 `NORMAL` 代替 `PRIMARY`。
-服务器返回的角色和状态只是必要条件，不能替代归档范围、数据库家族、来源链和已应用 LSN 的校验。
-主备恢复的配置与操作说明见 <<dameng-primary-standby-recovery,无 VIP 主备恢复>>。
-
-备库失败的结论限定于上表的数据库构建与 JDBC 系统包调用，不应表述为“达梦所有版本的备库都不能挖掘日志”。
-备库采集由主库负责创建和写入信号表、写入增量快照开启/关闭水位；备库负责 LogMiner，以及初始快照和增量快照所需的 JDBC 查询。
-读写连接、备库回放屏障、来源身份校验及切换后的角色路由见 <<dameng-standby-capture,备库采集>>。数据库版本、归档保留和可用备库仍须满足该章节的条件。
-
-=== 测试依据与更新规则
-
-模式注册与检查依据为 `DamengCompatibilityRegistry`、`DamengNativeCompatibilityProfile`、`DamengDatabaseVersion` 和 `DamengConnection` 的当前实现。
-数据库测试记录在仓库的 `debezium-connector-dameng/src/test/testing.adoc`；当前字段、兼容模式和备库支持边界以本手册相应章节为准。
-主备 Connector 恢复用例为 `DamengPrimaryStandbyIT`，读写分离的备库采集用例为 `DamengStandbyIT`。
-`DamengStandbyLogMinerProbeIT` 是接口诊断用例，在旧构建验证失败边界，在新构建验证直接 JDBC 挖掘；接口诊断不能代替 Connector 的快照、CDC 和切换回归。
-
-后续更新矩阵时，应同时记录测试日期、Connector 版本、服务器完整构建、JDBC 数据库及驱动版本、字符集、参数、部署拓扑和具体通过或失败的场景。
-不能用单元测试覆盖率、能启动、组件探测成功或其他版本的社区示例替代目标组合的端到端验收。
-
-[id="dameng-snapshots"]
-== 快照与信号
-
-=== 初始快照和 no_data
+以下组合使用 `DmJdbcDriver18 8.1.3.140` 执行过回归；具体失败和定向复测保存在模块 `src/test/regression-history.adoc`，不表示所有字段和部署组合均已通过。
 
 [cols="2,4,4",options="header"]
 |===
-|snapshot.mode |没有可恢复 offset 时 |已有已完成快照的 offset 时
-|`no_data`（默认） |读取结构、选择当前 LSN，再持续采集；不发存量行 |恢复旧位置，仍要求所需归档存在。
-|`initial` |读取结构和存量行，再持续采集 |恢复旧位置，不自动再次全量。
-|`initial_only` |读取结构和存量行后结束快照执行，不进入 CDC |不提供持续采集；Task 状态不应当作数据仍在变化的证明。
-|`never` |`no_data` 的旧别名，仍需结构基线 |与 `no_data` 相同。
+|JDBC 数据库版本 |服务器完整构建 |用途
+|`8.1.2.128` |`08134283904-20220804-166351-20005` |历史基线。
+|`8.1.3.162` |`03134284194-20240621-232765-20108` |当前默认测试镜像 `dameng:8.1.3.162-20240621-rev232765`。
+|`8.1.3.162`（官方 pack1） |`03134284194-20240703-234060-20108` |补充字段、数据库和独立 Worker 回归。
 |===
 
-未完成的初始快照可能在恢复时重新执行并重发已经输出的行。
-Connector 先发现并锁住捕获表，选择 `V$RLOG.CUR_LSN`，读取结构，按模式决定是否扫描行。
-选择 LSN 后再次检查匹配过滤器的新表；如发现新表，补锁并重新选择 LSN，再检查一次。最终检查之后的新表通过 DDL 流处理。
-整个快照事务结束并成功 rollback 后才释放共享表锁。此处 rollback 用于结束只读快照事务，不是回滚业务事务。
-普通查询不使用 Oracle `AS OF SCN`；一致性依赖这些锁，因此 `no_data` 建立结构基线也会短暂锁表。
-
-`snapshot.max.duration.ms` 默认 10 分钟，覆盖锁等待、结构/数据读取和队列阻塞。
-超时中断快照并请求 JDBC abort，Task 失败，不会通过跳过表继续；实际断开会话及释放锁依赖驱动和数据库。
-主备模式在完成标记之前再次核对主库身份；切换打断初始快照后在新主库重新快照。
-当前仅允许 `snapshot.locking.mode=shared`、`snapshot.max.threads=1`。
-`snapshot.lock.timeout.ms` 的继承字段没有接入达梦锁语句，实际应结合 `database.query.timeout.ms` 和总快照预算设置超时。
-
-=== 快照范围与采集范围
-
-`schema.include.list`、`table.include.list` 等决定总体采集范围；表过滤针对完整 `schema.table`，列过滤针对 `schema.table.column`，不是 `database.schema.table`。
-规则是正则表达式，需要字面点号时在 JSON 中写 `APP\\.CUSTOMERS`。
-include 和 exclude 对应项不能同时配置。
-`snapshot.include.collection.list` 只减少初始快照输出行的表，不缩小这些已捕获表的结构 history，也不改变 streaming 或增量快照的选择范围。
-`snapshot.select.statement.overrides` 和每表 SQL 只过滤初始快照行，不能过滤之后的 CDC。
-
-结构发现完成时，日志打印结构采集表和数据快照表。
-每个没有匹配任何可见表的 `table.include.list` 表达式会 WARN，但不会因此停止，因为规则可能针对未来新表。
-应检查表名大小写、其他过滤规则、元数据可见性和 SELECT 权限；WARN 本身不能证明是哪一种原因。
-普通重启直接恢复 streaming 时不会重新执行完整快照发现检查。
-
-初始 history 当前只包含采集过滤器选中的表，`schema.history.internal.store.only.captured.tables.ddl=false` 不会扩展为所有库表结构。
-已捕获表被 rename 到范围外后仍保留后续 DDL，以支持之后改回名称；从未拥有历史定义的表不能仅靠 rename 进入捕获范围。
-在过滤器不变时，运行中或停机期间创建、删除后重建的匹配表，可以通过仍保留的 DDL 采集。
-已有完整 offset 和 history 时，可以修改表过滤范围后重启，具体边界和限制见 <<dameng-capture-scope-changes,调整采集表范围>>。不能直接用当前 JDBC 结构解释新增表的旧日志。
-
-[id="dameng-capture-scope-changes"]
-=== 调整采集表范围
-
-在初始快照已完成且保留完整 offset、schema history 和所需归档的条件下，可以 PUT 完整 Connector 配置，修改 schema/table include/exclude 过滤规则后重启。
-原有表继续使用原来的恢复位置；扩表不会把整个 Connector 推到数据库最新 LSN，也不会重新执行所有表的初始快照。
-`initial` 和 `no_data` 在已有已完成 offset 时遵循相同的范围调整流程。`initial` 只控制首次初始化，不表示每次新增表都自动扫描存量行。
-
-每次允许的过滤规则变更都会选定并持久化当前启动 LSN `S`，包括纯缩表、正则变化但没有当前可见新增表的情况。这些没有新增表的调整不获取业务表共享锁。
-对于此前未捕获且 JDBC 当前可见的已有表，Connector 只保护本次新增表，等待其已有写事务结束，选定启动 LSN，获取当前结构和对象编号，并在释放共享锁前持久化范围变更与结构基线。
-主备部署在主库保护新增表并选择边界，等备库重放到该边界后读取结构；不能用尚未追平的备库结构建立基线。
-对于本次由“不匹配旧过滤器”变为“匹配新过滤器”的表，`LSN <= S` 的历史行变更和 DDL 始终过滤；这个边界不局限于建立了 JDBC 基线的表名清单。
-因此扩大正则后，当前已删除或不可见表的旧 `CREATE TABLE` 不会被误认为本次新增表。以后在 `S` 之后创建且匹配新规则的表，仍可由受支持的 `CREATE TABLE` DDL 建立结构并进入采集。
-已有完整基线的新增表在边界之后正常进入 CDC。等待旧表追赶积压期间，新表的结构基线保持待启用，挖掘跨过边界时才安装。
-重启复用已持久化的边界，不通过重新选择更晚的 LSN 丢弃停机期间的变化。
-
-如果 schema history 已知某张本次新加入的表，但 JDBC 当前看不到该表，范围调整会明确失败，不能沿用它的旧结构继续 CDC。应先确认表是否存在、同一 CDC 账号的元数据与 SELECT 权限，再恢复可见性并重新提交配置。
-每条 `table.include.list` 规则如果没有匹配任何 JDBC 可见表，也会记录 WARN，提示检查表名、大小写、过滤范围和元数据/SELECT 权限。WARN 只能指出规则当前没有选中可见表，不能证明表不存在还是权限不足；如果一条正则同时匹配其他可见表，Connector 无法从无字典 redo 中推断被隐藏的表名。扩表前应使用采集账号验证新增表的元数据与 SELECT 可见性。
-如果新增表的对象编号与另一个历史表名相同，可能是旧配置尚未处理完重命名日志，范围调整也会拒绝。先用原过滤配置追平重命名，再修改范围；不能让两个表名同时绑定同一物理对象。
-
-扩表默认不补已有存量。确认新表启用后，可以按需发送该表的增量快照信号，要求信号表已配置且目标表满足增量快照条件。
-增量快照补的是当前仍存在的行，不能补回启动边界之前已经删除的行、中间更新或历史事务。
-扩表只保证新表在边界之后的采集，不补齐此前被排除的跨表事务。
-
-缩表从新配置生效后停止输出被移除表，未发送的历史积压也不再补采；已经进入发送流程或已写入 Kafka 的记录不会撤回。
-同一事务中仍保留表的变更继续输出，事务提交、回滚、全局恢复位置和原始事件序号不因过滤其他表而被跳过或重新编号。
-被移除表的增量快照待处理列表、当前窗口和游标同时清理，其他保留表的快照继续恢复。
-缩表保留历史结构记录；以后重新加入该表时按新的启动边界处理，不重放被排除期间的变化。下游保留的旧数据如需清理，应另行对账或重建。
-缩表减少事件处理与发送量，但事务识别和日志挖掘仍有公共成本，数据库挖掘负载不一定同比下降。
-
-以下变更不作为普通扩缩表处理，仍会拒绝：
-
-* 初始快照尚未完成时修改范围，应等待快照完成后再调整。
-* 改变数据库选择、`table.ignore.builtin` 或 `signal.data.collection`。
-* 从过滤规则中移除已配置的信号表。信号表承担快照命令和水位，不是可以任意缩减的业务表。
-* 缺失旧范围描述、兼容签名、offset 或 history，无法证明原来的结构与恢复条件。
-
-旧版本 offset 如果没有 `capture_scope_manifest`，必须先使用原过滤配置运行，等待新版本保存带范围描述的 offset，再修改过滤规则。不能同时升级并直接更换过滤范围，也不要手工填造 manifest。
-
-不要使用 `recovery.restart.nonce` 代替普通扩表。nonce 用于明确放弃整个 Connector 的历史积压，范围调整只为新增表建立边界。
-
-=== 增量快照机制
-
-增量快照按主键范围分块，默认每块最多 1024 行。
-每个块通过源信号表的开启/关闭水位与 CDC 交错：读取块内行，观察水位之间的日志变更，移除被更新或删除的旧快照行，再输出剩余 `op=r` 记录。
-进度随 offset 保存，重启后可恢复。日志追赶慢会延长块完成时间，未观察到关闭水位时不能把缓存行提前当成最终结果发布。
-它不持有初始快照那种贯穿全流程的共享表锁，也不保证所有表处于同一个全库时刻。
-当前验收以声明主键的表为基础；普通无主键 CDC 支持不等于无主键增量快照支持。
-执行期间须保持表结构稳定，`incremental.snapshot.allow.schema.changes` 必须为 `false`。
-
-[id="dameng-signals"]
-=== 信号表配置、创建和触发
-
-设置 `signal.data.collection=APP.DBZ_SIGNAL`，将信号表纳入捕获规则，并确保其产生逻辑日志。
-每个独立 Connector 使用独立信号表，避免多个实例读取相同命令或互相消费水位。
-已有 offset 时不能直接添加或改名信号表绕过 capture_scope 检查，建议首次创建 Connector 时就配置。
-
-Task 在校验配置和 offset 后、发现快照表前检查信号表，不存在则自动创建；schema 必须已存在。
-自动创建需要相应 CREATE TABLE 权限。现有表不改结构、不清空记录，但必须可读，恰好具有按顺序排列的 `ID`、`TYPE`、`DATA` 三个 VARCHAR/NVARCHAR 列。
-创建或结构校验失败会阻止启动。Connector 还需插入水位的权限，`insert_delete` 策略需要 DELETE 权限。
-不授予 DDL 权限时可由 DBA 预创建：
-
-[source,sql]
-----
-CREATE TABLE APP.DBZ_SIGNAL (
-    ID VARCHAR(64) PRIMARY KEY,
-    TYPE VARCHAR(64) NOT NULL,
-    DATA VARCHAR(2000)
-);
-GRANT SELECT, INSERT, DELETE ON APP.DBZ_SIGNAL TO CDC_USER;
-----
-
-使用有写权限的账号提交一次性、唯一 ID 的命令：
-
-[source,sql]
-----
-INSERT INTO APP.DBZ_SIGNAL VALUES (
-    'customers-snapshot-001',
-    'execute-snapshot',
-    '{"type":"incremental","data-collections":["APP.CUSTOMERS"]}'
-);
-COMMIT;
-----
-
-检查 Task 日志、快照通知/指标和业务 Topic 的 `op=r`，不要仅凭 INSERT 成功认定快照完成。
-停止整个运行中的增量快照可使用公共信号动作：
-
-[source,sql]
-----
-INSERT INTO APP.DBZ_SIGNAL VALUES (
-    'customers-stop-001', 'stop-snapshot', '{"type":"incremental"}'
-);
-COMMIT;
-----
-
-停止动作不撤回已经发布的行。`pause-snapshot`、`resume-snapshot`、`additional-conditions` 和 Kafka/JMX/file 信号通道来自公共框架，但尚无本模块与源表基本流程同等范围的端到端验收，应先在目标环境验证。
-即使使用其他触发通道，当前达梦增量快照仍需要源信号表协调水位，不能只配 Kafka 信号 Topic 就省略它。
-
-[id="dameng-logminer"]
-== 日志挖掘、事务缓存与性能
-
-=== 挖掘窗口和保存点
-
-Connector 读取已归档的日志，未归档尾部造成的延迟不能靠扩大窗口消除。
-每轮检查身份、兼容环境和所需归档，启动 LogMiner、读取窗口、处理事务并分发；不是严格每 poll.interval.ms 完成一次。
-新配置默认使用 archive_bytes：按完整归档文件 LEN 的 64 MiB 软预算选择前向窗口，LSN 跨度随文件边界变化。
-也可显式选择 fixed 固定 LSN 窗口。LSN 跨度是位置差，不是行数、SQL 数或字节数。
-
-未完成事务跨窗口保留，普通窗口只读新增范围。
-早先窗口的事务遇到 COMMIT、XA COMMIT 或 operation 36 时，在发布该窗口事务之前按完整安全范围重建缓存，替换包括落盘内容在内的临时行像，排除后来确认回滚的 DML。
-重建从所有待处理事务的最老安全位置开始，不只从触发事务开始；同窗口多个边界合并重建，不同窗口仍可能重复读历史。
-每次读取窗口固定一份当前 Task 的分发进度；启动恢复后的首轮重放和事务重建读取也使用该进度。
-读到 COMMIT 或 XA COMMIT 后，提交位置和事务 ID 排序早于该进度的事务立即释放缓存及临时文件，不再保留到整轮读取结束。
-与进度相同的事务继续交由分发流程完成事务内续传和事务元数据收尾；未提交事务和提交位置更晚的事务继续保留。
-这不会提前提交 Kafka offset 或缩短所需归档范围；单笔历史事务在读到提交记录前仍会占用缓存，仍可能触及资源限制。
-
-当前支持 SAVEPOINT 的有效结果恢复。测试版本的 operation 36 同时用于用户保存点、普通 UPDATE/DELETE 内部标记及回滚相关操作，不能仅凭该码拒绝 SAVEPOINT。
-ROLL_BACK 表示这条记录已被回滚，不表示它本身是一条回滚命令。早期保存点回滚也可能标记 START，因此 START 的回滚标记不足以认定整个事务终止。
-测试版本的完整回滚需结合已回滚 START、没有幸存行、terminal operation 36 的 ROLL_BACK=1 / RS_ID=-1；结果不明确的事务继续保留历史。
-事务按提交顺序发布。长事务即使已落盘，仍会固定安全重放起点，数据库必须保留该范围的归档。
-
-=== LogMiner 记录完整性与诊断
-
-`V$LOGMNR_CONTENTS.SCN` 表示达梦日志的 LSN。
-`OPERATION_CODE` 按照 https://eco.dameng.com/document/dm/zh-cn/pm/dm8-admin-manual-appendix2.html[达梦官方动态视图手册] 中 `V$LOGMNR_CONTENTS` 的定义映射为 `EventType`：
-`1=INSERT`、`2=DELETE`、`3=UPDATE`、`4=BATCH_UPDATE`、`5=DDL`、`6=START`、`7=COMMIT`、
-`13=LOB_NEW`、`14=LOB_DATA`、`15=PRE_COMMIT`、`36=ROLLBACK`、`37=SEQ MODIFY`、`38=XA_COMMIT`、`255=UNSUPPORTED`。
-识别操作类型不表示已经支持处理该类型；捕获范围内未处理的操作仍会报错。
-未列出的操作码映射为 `UNSUPPORTED`，日志记录和临时事务文件保留原始编号，用于分片校验和错误诊断。
-读取时显式检查必需数值字段 `SCN`、`OPERATION_CODE`、`ROLL_BACK`、`SSN`、`CSF` 的 SQL NULL，避免 JDBC 将缺失值解释为 0。
-`ROLL_BACK` 和 `CSF` 只接受 0、1。DML 首片必须具有有效 `DATA_OBJ#`；事务标记的对象 ID 可以为空。
-窗口从事务中途开始时 `START_SCN` 可为空；未提交或已回滚记录的 `COMMIT_SCN` 可为空，不据此误判事务已完成。
-
-长 SQL 按 `SCN`、`XID`、`OPERATION_CODE`、`RS_ID` 组装。
-已验证的 DM 8.1.2.128 构建中，首片 `SSN=0`，后续片逐片加 1，末片 `CSF=0`。
-同版本不同测试实例分别观察到 2000、4000 字符的分片长度，不能把 `SQL_REDO VARCHAR(4000)` 的列宽当成固定分片大小；组装不依赖固定长度。
-连接器检查该序列，并拒绝缺片、重复片、乱序片、缺失 SQL 文本或冲突的对象身份、对象版本、回滚标记；后续片可以省略对象元数据，组装结果保留首片元数据。
-升级数据库后应复跑长 SQL 和元数据回归，确认分片规则未变。
-读取校验失败时，该挖掘窗口不会发布事务或推进安全重放位置。
-
-已知历史表通过 `DATA_OBJ#` 索引查找，索引随快照、历史恢复和 DDL 更新失效，避免逐行扫描全部表。
-普通 DML 的未知对象可属于未捕获表，保持原有过滤行为。
-遇到未实现操作（包括 255）时，历史身份明确且已排除的表可过滤；捕获表或无法确定所属表的异常操作停止任务，不静默跳过。
-诊断包含 LSN、XID、RS_ID、SSN、`DATA_OBJ#`、`DATA_OBJV#`、`RBASQN`、`RBABLK`、`RBABYTE`；这些字段随事务临时落盘保留，不附带 SQL 内容。
-可空诊断数值以 -1 表示缺失；0 是合法对象版本和日志位置，不能用作缺失标记。
-
-`DATA_OBJV#` 目前仅用于诊断和同一 SQL 分片之间的一致性检查，不用来推算表结构。
-2026-10-20 在 DM 8.1.2.128 上实测：CREATE/ALTER/DROP 的版本字段可为空，首次 DML 版本为 0，改列名后由 0 变为 2，TRUNCATE 后版本不变，删除重建后重新从 0 开始；重复挖掘同一区间的结果一致。
-因此不能假定每条 DDL 将版本增加 1，也不能用它替代 schema history。
-
-官方将 `STATUS`、`INFO`、`SAFE_RESUME_SCN` 定义为保留且为空的字段，连接器不套用 Oracle 的 STATUS 错误码规则。
-查询只增加本地测试版本已具备的经典字段，不依赖较新手册中的 `SUBTAB_ID`、`SRC_RAFT_ID`。
-字段定义参见 https://eco.dameng.com/document/dm/zh-cn/pm/dm8-admin-manual-appendix2.html[达梦官方动态视图文档]；挖掘接口参见 https://eco.dameng.com/document/dm/zh-cn/pm/dbms_logmnr-package.html[DBMS_LOGMNR 文档]。
-
-=== 内存与临时文件
-
-所有事务共享默认 64 MiB 的估算缓存阈值，超出时将最大的驻留事务写入临时文件，后续行追加。
-事务身份和起点等元数据始终留在内存，包含已提交待分发事务，计入内存阈值和默认 1000000 条事务限制；元数据耗尽仍会失败。
-提交时顺序读取文件，不要求整个大事务重新装入内存。文件带帧长度和校验，损坏、截断、权限或 I/O 错误均停止任务。
-默认每次运行临时文件上限 1 GiB，文件位于独立 `dameng-tx-*` 目录；日志记录事务 ID、起点、路径，不打印 SQL 内容。
-分发、确认完整回滚、重建和正常/错误清理会删除对应文件。强制 kill 可能遗留目录，只能在确认对应运行已结束后清理。
-配额不包含其他 Task、其他进程或遗留目录，因此还需监控文件系统剩余容量；文件含源数据，应限制访问。
-
-临时文件不是持久恢复状态。新 Task 忽略旧文件，从已保存 offset 重放归档；不能因落盘成功就提前删除旧归档。
-单条 SQL_REDO 的连续片段必须先在内存拼接，默认 payload 上限 16 MiB，按 UTF-16 计数，拼接前校验；单条无连续片段的 SQL 也受限制。
-JDBC 输入、StringBuilder、最终 String 和临时副本还占用额外堆。编解码复用的每个字节/字符缓冲各最多保留 64 KiB，大记录使用临时数组。
-事务阈值不包括事件队列、JDBC 和转换开销，不应等于整个 JVM 的 Xmx。
-旧 `log.mining.buffer.max.bytes`、`log.mining.buffer.max.records` 已废弃并忽略；累计挖掘工作量不再是停止条件。
-
-=== 文件预算窗口与调优
-
-`log.mining.window.strategy=archive_bytes` 从下一条待扫描 LSN 所在文件开始，按顺序累加 `V$ARCH_FILE.LEN`，达到 `log.mining.window.max.bytes` 后停止扩展结束位置。
-结束位置还受到本轮归档上界限制；备库同时受 SLSN 和 RPKG_LSN 的安全回放上界限制。到尾部立即处理可读部分，不等文件写满、不等凑齐预算。
-这是固定文件字节预算，窗口随文件范围变化；没有通过耗时或吞吐试探自动增减字节预算。
-
-官网将 LEN 定义为日志长度，单位字节；FREE 为写日志偏移。
-8.1.3.162 实测已关闭小文件 LEN=32768、FREE=32768，活动归档 LEN=67108864、FREE=49152，说明活动文件可能预分配。
-预算使用整个 LEN，包含已扫描部分和预分配空间，不代表实际读取字节、缓存内存或本轮 DML 数据量。
-单文件超过预算仍读取其安全范围；最后一个文件及共享 inclusive 边界所需文件也可能让总长度超过预算。
-选中文件 LEN 缺失或非正值时停止，提示核查 V$ARCH_FILE 或显式选择 fixed；不以 LSN 差伪造字节数。
-归档缺口、身份或主备历史异常仍按现有安全检查停止。
-跨文件数值不连续时，只允许下一文件的正 PREV_LSN 精确等于请求起点减一来证明连续；若重启请求包含缺失的前驱记录本身，仍拒绝继续。
-
-正常扫描从 scannedThrough 继续，不因长事务固定 replayLsn 而反复读旧范围，也不因文件名未变而自动扩预算。
-需要事务重建时，仍完整读取 replayLsn 到本轮结束位置，允许超出前向预算。
-整轮扫描与必要重建结束后才分发，因此扩大预算可能提高吞吐，也可能增加消息延迟与临时磁盘占用。
-JMX 暴露预算、所选文件总 LEN 和文件数；启动 INFO 打印策略及配置，DEBUG 打印每轮范围、文件数和总长度。
-
-[source,json]
-----
-"log.mining.window.strategy": "archive_bytes",
-"log.mining.window.max.bytes": "67108864"
-----
-
-回退对照可显式设置 `log.mining.window.strategy=fixed`、`log.mining.batch.size=10000`。
-旧耗时反馈 adaptive 模式已删除，strategy 只接受 archive_bytes 或 fixed，未指定时默认 archive_bytes。
-升级前删除 `log.mining.window.adaptive.enabled`（无论 true/false）、`log.mining.batch.size.min`、`log.mining.batch.size.max` 和 `log.mining.window.target.ms`。
-这些旧参数不再注册为配置项；残留任意一项都会在配置校验或任务启动时明确报错并提示迁移，即使已指定新的 strategy 也必须删除。
-原来使用 adaptive.enabled=false 的任务若要保持固定窗口，改为 `log.mining.window.strategy=fixed` 并保留 `log.mining.batch.size`。
-
-==== 文件预算与固定 10000 的本地对照（2026-10-21）
-
-在同一源码上按 fixed、archive_bytes、archive_bytes、fixed 顺序执行四轮独立容器测试。
-数据库为 8.1.3.162；Kafka Broker/Worker 为 3.9.1，单分区、单副本；Worker 容器限制 4 GiB、堆 Xms=1 GiB/Xmx=3 GiB，事务内存阈值 64 MiB，Producer batch.size=65536。
-每轮相同随机种子、5000 行初始数据、3 轮无间隔 BSEG 负载，共 32700 条 DML（2289 INSERT、29430 UPDATE、981 DELETE），消息最大约 8 KiB。
-耗时从开始生成到消费完全部消息，不含数据库/Worker 启动。四轮均通过逐条 before image、事件数量、全部 221 列最终状态及无尾随重复校验。
-
-[cols="2,1,1,1,1",options="header"]
-|===
-|策略 |第一次（秒） |第二次（秒） |平均（秒） |平均挖掘会话数
-|fixed，10000 LSN |19.525 |17.700 |18.613 |21.5
-|archive_bytes，64 MiB |19.590 |17.747 |18.669 |15.5
-|===
-
-文件预算会话数减少约 28%，但总耗时基本持平（均值约慢 0.3%，低于本次轮间波动，不能认定性能差异）。
-平均前向挖掘阶段由 2.881 秒降到 2.705 秒；平均历史重建由 3.165 秒增到 3.869 秒，分发阶段仍约 11 秒。
-采样到的临时落盘峰值：固定两轮均约 105 MiB，文件预算两轮约 193/188 MiB；采样不是完整磁盘峰值追踪。
-因此保留 64 MiB 作为初始软预算和 fixed 回退选项，不承诺比已调优的固定窗口更快。
-本次是单机数据库的有限突发负载；没有重新验收 Kafka 2.0、完整主备切换或生产库长时间持续负载。
-
-性能入口为 `DamengDatagenPerformanceIT`，通过 `dameng.perf.window.strategy`、`dameng.perf.window.max.bytes`、`dameng.perf.mining.batch.size` 选择对照策略。
-本机原始结果在 `debezium-connector-dameng/target/file-budget-benchmark/`，每轮包含 command.json、evidence.txt、samples.csv 和 JFR；这些为生成产物，clean 后需重跑。
-删除旧自适应模式后的回归执行 1529 个单元测试、28 项数据库测试，均通过且无跳过；使用独立覆盖率数据，模块行覆盖率 96.82%。验证日志及覆盖率文件位于 `debezium-connector-dameng/target/remove-adaptive-validation/`。
-
-==== 吞吐与下游调优
-
-先比较普通挖掘、重建、分发和队列等待，定位慢在哪一段。
-增加缓存和磁盘只能降低落盘压力或承接突发，不能修复持续低于源端生成速度的下游吞吐。
-生产者 buffer wait 高、每请求约一条记录且请求延迟低时，可评估增大 producer.batch.size；请求本身慢时检查 Broker 磁盘、网络和限流。
-已有本地 221 列、65400 事件对比中，16 KiB 改为 64 KiB producer batch 曾将耗时从 32.2 秒降至 17.9 秒，buffer wait 从 22.1 秒降至 0；这是该次负载结果，不是所有环境的默认建议。
-压缩需要权衡 CPU 和带宽，linger.ms 受延迟预算约束。调优保持确认和顺序保证，并复核吞吐、延迟、重试、内存和数据一致性。
-
-[id="dameng-ddl"]
-== DDL、结构演进与支持边界
-
-DDL 由 ANTLR 词法和语法解析器生成解析树，再据此分析语句影响范围、构建历史表模型变更。
-表定义、列及约束变更、重命名和 LIKE 从解析树读取；CTAS 从解析树识别目标表，列结构由目标表在线字典提供。DML 仍使用原有 LogMiner DML 解析器。
-字符串和 `0x` 二进制默认值也使用 ANTLR 分词，手写的 DDL 词法解析器已移除。
-ANTLR 对影响行结构的表 DDL 解析列、约束和相关子句；对已知不改变行结构的索引、普通视图、序列、同义词、权限和注释，识别对象类型及完整语句边界即可，不充当数据库的 SQL 合法性检查器。
-普通视图和 CTAS 的查询体检查词法、括号及语句边界，不完整解析查询表达式；JOIN、UNION、CTE、子查询和分析函数不依赖 Connector 的列类型推导。CTAS 保留建表头部和表类型识别，不能吞掉追加的表 DDL。程序定义检查声明头和程序体边界，不完整验证 SPL。
-词法保留原始位置和字面值，识别双引号转义、N 字符串、Q 引用、`--`、`//`、`/* ... */` 注释和 hint；删注释不合并两侧单词。
-`NESTED_C_STYLE_COMMENT=0` 在第一个结束标记结束，=1 迭代平衡嵌套层数。
-旧 8.1.2.128 原生构建在 BACKSLASH_ESCAPE 的两种值下都保留普通/N/Q 字符串反斜杠，现有实现据此不进行 MySQL 式转义。
-8.1.3.162 在 BACKSLASH_ESCAPE=1 时语义已有变化，例如普通字面量 `'A\0B'` 返回 `A0B`；该组合尚未完成适配，应使用 0。
-未加引号名转大写；引用名在 IDENTIFIER_MODE=0 或旧库缺失该参数时保留大小写，=1 按已实现规则转大写，但显式模式仍需目标版本验收。
-
-先验证完整输入再应用捕获过滤，不能让前面的 GRANT、索引或过程掩盖后面的表 DDL。
-已知索引、序列、视图、同义词、权限、COMMENT 和可识别的平衡 BEGIN/END 程序体可按不改变行结构处理。非表 DDL 的内部选项和表达式不逐项验证，但不能吞掉分号后的语句、未配对括号或缺少分隔符的后续表 DDL；未知对象类型仍拒绝。
-新增的非表对象分类包括用户、目录、上下文、外部函数库、域、PROFILE、空模式和独立 `STAT` 统计语句。
-`ARRAY INDEX`、`CREATE/DROP [PUBLIC] LINK`、`CREATE/DROP OPERATOR`、`CREATE/ALTER/DROP CONTEXT INDEX`、`ALTER DATABASE/SYSTEM/SESSION`、`CREATE/ALTER/DROP TABLESPACE` 和 `SET` 也按已知语句家族识别。
-全文索引使用独立语法分支，识别索引名及 `ON` 目标表，支持创建时的 `IF NOT EXISTS` 和删除时的 `IF EXISTS`；不把 `INDEX` 当成应用上下文名称。
-OPERATOR 名称允许官网定义的符号形式；LINK 连接串中的分号仍属于字符串。上下文、LIBRARY、DOMAIN 和 PROFILE 创建语句的尾部不校验类型或选项的完整合法性，名称和语句边界仍必须可识别。
-目录支持 `CREATE [OR REPLACE] DIRECTORY [IF NOT EXISTS] <目录名> AS '<路径>'` 和 `DROP DIRECTORY [IF EXISTS] <目录名>`，目录名不带模式限定。
-CREATE 必须包含完整的 `AS` 和路径字符串；支持绝对路径和相对路径，但不检查操作系统路径是否存在。字符串内的分号或 DDL 文本属于路径，真实的后续表 DDL 不能被一起跳过。
-`DROP TABLESPACE` 依据官网只能删除未使用表空间的限制处理；`DROP DATAFILE` 属于 `ALTER TABLESPACE` 子句，不能作为独立语句跳过。
-TABLESPACE 按官网《数据定义语句》3.4.1～3.4.3 显式解析：CREATE 支持 `IF NOT EXISTS`、多数据文件、`MIRROR`、`AUTOEXTEND`、`CACHE`、加密、ASM 条带与副本选项、HUGE 路径、`FILE LIMIT` 和 `STORAGE(ON ...)`；ALTER 支持状态切换、表空间及数据文件重命名、添加/删除文件、调整大小和自动扩展、缓存、`OPTIMIZE`、HUGE 路径及文件数限制；DROP 支持 `IF EXISTS`。
-缺失必需子句、未知尾部、追加 DML 或执行语句不能被当作 TABLESPACE 操作一起跳过；`INCLUDING CONTENTS`、`CASCADE` 等非达梦表空间删除子句仍拒绝。文件大小、算法可用性及部署条件由数据库校验。
-当前官网的裸 `UNLIMITED`、`CACHE = KEEP`、`FILE LIMIT` 纳入语法测试；8.1.3.162 实测拒绝这些写法，但接受 `MAXSIZE UNLIMITED` 和 `CACHE = "KEEP"`。ASM/DSC/DPC 选项的语法覆盖不代表已在相应集群环境完成验收。
-这些分类只表示不更新历史行结构，不表示数据库角色切换、归档配置或系统参数调整不会影响 CDC 运行。
-8.1.3.162 原生模式实测 `CREATE/DROP OPERATOR @^` 会生成 DDL redo，在线采集、停机重放及历史恢复均通过；含有表的表空间删除返回 -3412，原表数据保留，删除表后可正常删除表空间。
-同版本的 `SET SCHEMA`、`ALTER SESSION SET NLS_DATE_FORMAT` 和 `SET TIME ZONE` 样本执行成功但没有新增 redo；这些语句的分类单测不能等同于实际 DDL 日志验收。
-语法依据为达梦官网 https://eco.dameng.com/document/dm/zh-cn/pm/definition-statement.html[数据定义语句]、https://eco.dameng.com/document/dm/zh-cn/pm/package.html[包]、https://eco.dameng.com/document/dm/zh-cn/pm/class-type.html[类类型]、https://eco.dameng.com/document/dm/zh-cn/pm/custom-type.html[自定义类型]及 https://eco.dameng.com/document/dm/zh-cn/pm/external-function.html[外部函数]章节。
-这些语句分类为 `NO_TABLE_CHANGE`：不修改采集表模型，不为它们创建表结构 history 记录，继续处理后续 CDC。
-回收站清理支持 `PURGE RECYCLEBIN`、`PURGE DBA_RECYCLEBIN`、`PURGE TABLE [模式名.]表名`、`PURGE INDEX [模式名.]索引名` 和 `PURGE TABLESPACE 表空间名 [USER 用户名]`，均分类为 `NO_TABLE_CHANGE`。
-这些语句只清理已进入回收站的对象，不删除后来创建的同名表，也不查询在线字典来更新历史模型。`PURGE TABLE/INDEX` 的 redo 可以携带非零对象编号，不能按编号是否为零决定跳过；`DROP TABLE ... PURGE` 仍按删表更新历史。
-语法覆盖依据为 8.1.3.162 原生模式的实机验证；`RECYCLEBIN=1` 用于准备有回收对象的测试场景，Connector 不会修改该参数。缺少必需名称、未知尾部和追加表 DDL 或 DML 仍拒绝。
-`CREATE SCHEMA` 只接受不含内嵌对象定义的形式；`DROP USER`、`DROP SCHEMA` 和 `DROP DOMAIN` 的默认删除行为或显式 `RESTRICT` 按非表操作处理。
-达梦成功执行的 RESTRICT 删除不能级联移除依赖对象，因此重放 redo 时不查询当前在线目录来推断历史时点是否安全；后来的同名对象状态也不会改变这条历史语句的含义。
-这些对象的 `DROP ... CASCADE` 完整识别后进入专用的级联删除策略，默认拒绝，可用 `cascade.drop.ignore=true` 显式忽略，详见下述限制。PROFILE 的 CASCADE 只解除用户与 profile 的关联，继续按非表对象操作处理。
-`STAT` 覆盖表、列、索引以及采样率、SIZE、GLOBAL 和前置 hint 的已实现形式；它更新优化器统计信息，不重建行结构。
-SQL 编写的 PACKAGE、CLASS、TYPE 声明及其定义体、受支持的 COMPILE 和 DROP 只检查声明头、配对结构和完整输入边界，不在 Connector 中执行其程序内容。
-TYPE/CLASS 及其 BODY 的默认删除和显式 `RESTRICT` 删除按非表操作处理。
-`DROP TYPE BODY ... CASCADE` 也按非表操作处理，因为它只删除实现并保留类型、依赖表及其数据；删除必需的方法实现后，对象列读取可能报错，需重建类型体后恢复。
-TYPE/CLASS 自身的 `CASCADE` 删除及 `DROP CLASS BODY ... CASCADE` 仍拒绝。
-依据官网《类类型》12.3，被表列或其他类成员引用的类必须指定 CASCADE 才能删除；《自定义类型》13.5.1 对对象类型采用相同规则。
-DM 8.1.3.162、原生兼容模式下实测：被表列引用的 OBJECT、VARRAY、TABLE OF 类型的替换、默认删除和 `RESTRICT` 删除被数据库拒绝，`DROP TYPE ... CASCADE` 则会删除依赖表；删除类型体后重建实现，依赖表和原有记录仍在。
-因此不需要查询当前目录来判断历史默认删除是否安全。识别域、类型或类的定义不等于支持使用这些对象作为采集列类型。
-过程、函数参数支持 `IN`、`OUT`、`IN OUT`、`OUT IN` 和 `INOUT`。`AFTER TIMER ON DATABASE` 定时触发器识别调度段与声明、程序体边界，调度选项的合法性由数据库检查；未配对括号、缺少程序体结束标记以及尾随表 DDL 仍拒绝。定义触发器本身不执行程序体，其日后执行产生的行或表 DDL 日志仍按各自记录处理。
-Java CLASS 增加 `CREATE [OR REPLACE] JAVA [PUBLIC] [ABSTRACT] [FINAL] CLASS` 和 `ALTER JAVA CLASS ... COMPILE [DEBUG]` 分类，定义体按花括号确定内部和外部的分号边界。源文本仍受当前词法支持范围限制，不代表完整 Java 语言兼容。
-权限、注释和程序定义统一进入 `nonTableStatement`；分类成功后仍执行预建表物化视图等表影响检查。
-COMMENT 按官网《SQL 语言手册》3.15 识别 `COMMENT ON TABLE/VIEW/SEQUENCE [模式名.]对象名 IS '注释'` 及 `COMMENT ON COLUMN [模式名.]表或视图名.列名 IS '注释'`。新增、覆盖注释使用同一语句，没有独立的 CREATE/ALTER/DROP COMMENT；DM 8.1.3.162 原生模式已验证表、视图及其列使用 `IS ''` 清空注释。该构建不支持官网列出的 COMMENT ON SEQUENCE，也不接受 IS NULL 和 N 字符串；解析器保留 SEQUENCE 官网语法及既有 NULL/N 字符串兼容，不表示数据库各版本均可执行。对象名层级、必需的 IS 和注释值、语句尾部均有结构校验；COMMENT 解析后跳过，不更新历史列结构或事件 schema 的描述，也不会吞掉尾随的表 DDL/DML。
-`GRANT/REVOKE` 区分数据库或角色权限、对象权限和模式权限，解析权限列表、对象类型、接收者及各自的转授权选项。对象权限覆盖 `ALL [PRIVILEGES]`、`OFF`、`SELECT FOR DUMP`，GRANT 支持 SELECT/INSERT/UPDATE/REFERENCES 的列清单；REVOKE 不支持按列回收。
-数据库或角色权限使用 `WITH ADMIN OPTION` 和 `ADMIN OPTION FOR`；对象权限使用 `WITH GRANT OPTION` 和 `GRANT OPTION FOR`，回收可带 `RESTRICT/CASCADE`。数据库或角色权限的 REVOKE 不接受这两个回收选项。权限名称是否存在、是否适用于目标对象以及授权者是否有权操作仍由数据库检查。
-模式权限测试遵循官网《自主访问控制》3.3.4，包括原文的 `GRANT ADMIN FOR`；模式授权要求开启 `GRANT_SCHEMA`，本次未完成启用该参数后的实库验收，这部分用例表示官网语法覆盖。DM 8.1.3.162 实测 `REVOKE REFERENCES ... CASCADE` 保留依赖表、外键和数据，CASCADE 回收的是权限。此类语句不更新采集表结构，但回收 CDC 账号所需权限仍可能影响采集运行。
-位图连接索引的创建和删除按 `NO_TABLE_CHANGE` 处理，自动生成的 `BMJ$_` 辅助表由默认内置过滤排除，不建立其表结构 history。
-独立 `CHECK` 工具命令、`CONSTRUCTOR` 成员片段、PostgreSQL `CREATE/DROP EXTENSION` 和独立 `DROP PARTITION/SUBPARTITION` 不当作达梦非表 SQL。`CALL/EXEC/DECLARE`、`RESTORE` 也不因前缀就被认定无表影响；数据库执行这些命令产生的实际行或表 DDL 日志按各自记录处理。
-普通视图的 `CREATE [OR REPLACE] [FORCE] VIEW [IF NOT EXISTS]` 可识别为不改变表结构；物化视图仍受后述支持边界约束。
-普通物化视图的 `CREATE/ALTER/DROP MATERIALIZED VIEW`、`REFRESH MATERIALIZED VIEW` 和 `CREATE/DROP MATERIALIZED VIEW LOG` 识别类型及完整语句边界后跳过，不解析其结果列，也不建立辅助表结构 history。
-物化视图按官网《物化视图》7.1～7.4、7.9 识别列名清单、`BUILD IMMEDIATE/DEFERRED`、分区/表空间/STORAGE、`REFRESH` 或 `NEVER REFRESH`、`ENABLE/DISABLE QUERY REWRITE`，以及 ALTER 的 `COMPILE`。刷新定义覆盖 `FAST/COMPLETE/FORCE`、`ON DEMAND/COMMIT`、`START WITH/NEXT`、`WITH PRIMARY KEY/ROWID`、`USING DEFAULT/TRUNCATE/DELETE`；独立 REFRESH 的 USING 仅跟随 COMPLETE 或 FORCE，DROP 支持 `IF EXISTS`。
-CREATE 必须有 AS 和查询，ALTER 必须有修改选项，缺失子句或尾随业务表 DDL/DML 不会被整体跳过。查询、分区和 STORAGE 的内部内容保留括号与语句边界检查，由数据库校验完整语义和选项合法性；不在 Connector 中执行查询或刷新。`OR REPLACE`、创建时的 `IF NOT EXISTS`、DROP 的 `CASCADE/RESTRICT` 不属于该官网物化视图语法。
-默认内置过滤排除 `MTAB$_`、`MLOG$_` 表的快照和增量数据；内部 `TRUNCATE TABLE MTAB$_...` 同样跳过，同事务中的业务表变更继续处理。该行为不需要开启 `schema.history.internal.skip.unparseable.ddl`。
-这项过滤覆盖达梦自动命名的内部表，不覆盖使用已有普通表的预建表物化视图。`FOR ... ON PREBUILT TABLE` 仍明确拒绝；已存在的预建表应由业务表过滤配置显式排除。
-物化视图 DDL 后附普通表 DDL 仍按复合语句拒绝，不通过前缀匹配直接跳过整个输入。
-MySQL 可执行注释拒绝，PostgreSQL dollar string 和 MySQL # 注释不作为原生语法处理。
-受支持的 CREATE/ALTER/DROP/TRUNCATE/RENAME 在历史模型副本上先验证，成功后通过 history 管道应用；`CREATE TABLE IF NOT EXISTS` 和 `DROP TABLE IF EXISTS` 会按实际表名解析。默认解析失败不应用该语句、不越过该位置。
-直接解析多语句脚本时，ANTLR 按程序定义边界处理内部的分号，整段脚本成功后才应用表模型变更；流式 LogMiner 单条记录仍遵循单表语句及程序定义独占记录的限制。
-实测 8.1.3.162 在 `COMPATIBLE_MODE=0` 和 `2` 下，`CREATE TABLE IF NOT EXISTS` 首次建表会生成一条保留该子句的 DDL `SQL_REDO`；对已存在的表重复执行成功，但 `CUR_LSN` 不变、没有新增 DDL 记录，表对象编号也不变。此结论尚未扩展到其他模式或数据库版本。
-错误提供 LSN、对象身份及可用的字符/行/列位置。捕获 DDL 缺失或使用非正 DATA_OBJ# 会失败。
-DDL 语法分析、历史结构规划或 DML SQL 解析失败并终止 task 时，额外输出包含完整 `LogMinerRow` 和异常堆栈的 ERROR 日志，包括 SQL_REDO、事务号、LSN、表及用户、分片标记、时间戳、对象版本和归档物理位置。SQL_REDO 使用分片拼接后实际送入解析器的完整内容，不截断；内存缓冲和落盘回读使用同一诊断路径。配置为忽略的 DDL 仍按原有 WARN 路径处理。
-
-普通 TABLE 按官网《SQL 语言手册》3.5.1.1、3.5.2.1、3.5.3、3.5.4 处理，不能统一跳过。CREATE、列增删改、表及列重命名、DROP 更新历史表结构；主键增删还会改变事件键。ADD/DROP COLUMN 支持可选 COLUMN、IF NOT EXISTS/IF EXISTS 和加列分组；条件加列保留已存在列的定义，只添加缺失列。MODIFY 保留未指定的列属性。列重命名支持 RENAME COLUMN 和 ALTER [COLUMN] ... RENAME TO，两者都更新主键列名。
-CREATE、ADD COLUMN 和 MODIFY 的列定义支持裸 `ENCRYPT` 透明存储加密标记，保留列类型、长度、默认值、可空性和注释；该标记不写入逻辑列模型。带算法、密钥或 MANUAL 等扩展加密选项仍不支持。此处覆盖 DDL 解析和历史模型处理，不代表已完成加密列的端到端 CDC 验收。
-约束支持 PRIMARY KEY、[NOT] CLUSTER PRIMARY KEY、UNIQUE、CLUSTER UNIQUE KEY，以及已解析的 USING INDEX TABLESPACE、GLOBAL、ENABLE、VALIDATE/NOVALIDATE 选项。外键的 MATCH、PENDANT、WITH INDEX、ON UPDATE/DELETE 等选项不改变列模型；由这些约束实际触发的行变化仍处理各自的 DML 日志。UNIQUE、外键和 CHECK 不直接改变 CDC 行结构，但保留约束名称用于后续 RENAME/DROP CONSTRAINT；非唯一 CLUSTER KEY 仅为物理索引，不记作唯一约束或事件主键。
-DM 8.1.3.162 原生模式实测，DROP PRIMARY KEY / DROP CONSTRAINT 删除主键后，原主键列恢复可空，包括曾显式指定 NOT NULL 的列。删除复合主键中的一列则移除整个主键，剩余列保留非空属性；历史模型按这些结果更新，同时清除主键约束名称。DROP CONSTRAINT 的 INDEX、DROP INDEX、KEEP INDEX 组合纳入官网语法覆盖，其中该旧构建只执行 DROP INDEX，拒绝裸 INDEX 和 KEEP INDEX；语法覆盖不等于所有版本可执行。
-整表 TRUNCATE 保留列和约束，并输出 TRUNCATE 数据事件；DROP/REUSE STORAGE 和 UPDATE/IGNORE GLOBAL INDEXES 不改变此行为。TRUNCATE CASCADE 可能同时清空引用表，当前明确拒绝，不能只输出目标表的清空事件。DISABLE 约束及启停约束的状态转换仍不支持，避免把失效主键继续作为有效事件键；未知或未实现的 TABLE 子句同样拒绝。
-
-行存储分区表按官网《SQL 语言手册》3.5.1.4、3.5.2.2 解析。支持单层 HASH/RANGE/LIST、数值/日期 interval、多级子分区及模板，以及空间限制、逻辑日志和 `AUTO_INCREMENT [=] 起始值` 尾部选项；CTAS 使用目标表在线字典并受下述时间一致性限制，临时表不采集行数据，HUGE 和分布式表不因分区语法支持而自动获得支持。分区界限及物理布局不写入列模型，列、约束和整表 CREATE/ALTER/DROP 沿用普通表的历史结构处理。
-DM 8.1.3.162 原生模式实测，分区 DML 的 `DATA_OBJ#` 指向根表，跨分区行迁移仍表现为 UPDATE。合并、拆分分区的 DDL 跳过，其后的搬迁 INSERT/DELETE 不过滤、不去重，按普通行事件发送。
-`DROP PARTITION/SUBPARTITION` 和 `TRUNCATE PARTITION/SUBPARTITION` 默认明确报错，因为这些操作可能移除数据而没有逐行 DELETE redo。公开配置 `partition.drop.ignore` 默认为 `false`；设为 `true` 时忽略完整解析的分区删除、分区清空语句，包括 `TRUNCATE TABLE ... PARTITION ...`。ERROR 日志包含具体操作类型、LSN、对象编号、完整 `SQL_REDO`，并提示设置 `partition.drop.ignore=true` 可以忽略该语句继续 CDC。开启后以 WARN 记录被忽略的 SQL 和原因，保留根表模型并继续处理后续 DML。它不补发下游删除事件，被删除或清空分区的旧数据需要下游自行处理。
-专用开关关闭时，即使 `schema.history.internal.skip.unparseable.ddl=true`，已识别的分区删除、清空也不会被跳过。该开关不允许残缺或复合语句，也不授权 `EXCHANGE PARTITION/SUBPARTITION`；忽略分区清空不会输出整表 TRUNCATE 事件。DM 8.1.3.162 实测分区清空 DDL 的 `DATA_OBJ#` 可以指向子分区对象，策略判断按 SQL 在对象过滤前完成。切换开关后可以从尚未越过的错误位置重启继续，已持久化越过的分区删除、清空不会自动补发。
-
-`EXCHANGE PARTITION/SUBPARTITION` 完整解析后，在该条 redo 的 LSN 分别判断分区根表与 `WITH TABLE` 对端表是否需要处理。两端均无需处理时直接跳过；判断包括当前采集过滤、保留的历史模型和两端各自的采集激活 LSN 边界。任意一端仍需处理时，公开配置 `partition.exchange.ignore` 默认为 `false`，记录 ERROR 并停止，提示涉及的表、分区、LSN、事务 ID、DATA_OBJ#、完整 SQL 和开启参数的风险。仍保留在历史模型中的已排除表按需要维护处理；内置排除表沿用既有排除规则。
-设为 `true` 后以 WARN 忽略该条 EXCHANGE，保留历史模型和对象 ID 映射，不写该语句的 schema history，不补发交换造成的行 INSERT/DELETE，也不输出整表 TRUNCATE。下游可能缺失交换进入的行或保留已交换出去的行，后续解码仍可能失败或产生错误数据。忽略不绕过后续 DML 和身份校验，也不自动校准下游。offset 沿用正常事务和确认机制；持久化越过后关闭参数不会重放交换或修复旧数据。
-DM 8.1.3.162 原生模式探针实测 EXCHANGE 的 `DATA_OBJ#` 指向对端表，不能只据此排除根表的影响；交换本身没有完整逐行 DML，后续两端 DML 仍按各自表 ID 归属。`WITH TABLE` 未限定 schema 时可能使用会话 schema，而 DDL 的 `SEG_OWNER` 指向根表 schema，因此不使用它猜测对端。未限定的根表可由 `SEG_OWNER` 补齐；未限定的对端必须由匹配对象 ID 和表名的历史模型确认。无法确认任意一端身份时始终报错，即使开启专用忽略或通用 DDL 跳过；建议在 SQL 中显式限定两端 schema。
-该参数只覆盖完整识别的单条 EXCHANGE，不授权残缺语句、未知尾部或复合语句。`partition.drop.ignore` 和 `cascade.drop.ignore` 不控制 EXCHANGE。专用策略优先于 `schema.history.internal.skip.unparseable.ddl`，此前依赖通用跳过开关忽略采集相关 EXCHANGE 的用户，现在必须显式启用 `partition.exchange.ignore`。
-
-`DROP USER/SCHEMA/DOMAIN/TYPE/CLASS ... CASCADE` 完整解析后产生专用的级联删除错误，在表过滤之前处理。公开配置 `cascade.drop.ignore` 默认为 `false`：记录 ERROR 并停止，提示设置 `cascade.drop.ignore=true`；开启后记录 WARN 并忽略该条 DDL，继续处理后续日志。错误和警告包含操作、目标对象、LSN、事务 ID、DATA_OBJ#、完整 SQL 和后果说明。即使发起对象所在模式不采集，也不能由此推断依赖表不在采集范围内。
-忽略时保留现有历史表结构和对象 ID 映射，不写该语句的 schema history，不补发受影响表的删除或 schema 事件，也不查询当前在线字典猜测历史依赖关系。下游数据可能残留；历史模型中可能保留已被删除的表，同名 CREATE/CTAS 仍可能因表已存在而报错，对象 ID 复用也可能造成冲突或错误解码。该设置只允许跳过指定 DDL，不保证后续 CDC 一定成功或数据正确，不绕过后续 DML、表身份或其他结构校验。
-该开关仅覆盖以上五族对象删除，不按 CASCADE 关键字泛化处理，不允许残缺语句、未知尾部或单条 LogMiner 记录中的复合语句。`DROP TABLE ... CASCADE CONSTRAINTS` 继续按删表更新历史；`DROP TYPE BODY ... CASCADE`、`DROP PROFILE ... CASCADE` 保持原处理。`DROP CLASS BODY ... CASCADE`、`TRUNCATE ... CASCADE` 和外键 `ON DELETE CASCADE` 不由此开关放开或改变。
-级联删除专用策略优先于 `schema.history.internal.skip.unparseable.ddl`。此前通过通用跳过开关越过这些语句的用户，现在必须显式启用 `cascade.drop.ignore`。offset 按正常事务和确认机制推进，忽略不代表立即持久化；持久化越过后再关闭开关不会自动重放、补发删除或修复历史模型，必要时需重新校准下游数据并重建采集基线。
-DM 8.1.3.162 原生模式独立探针验证了以上五族级联删除的原始 SQL_REDO；USER、SCHEMA、TYPE 和 CLASS 样本删除了依赖表，DOMAIN 样本保留了表和原有行。TYPE 的直接和间接依赖删除不会逐表输出 DROP TABLE。具体影响依赖语句和对象关系，错误提示因此使用“可能删除依赖对象”。
-
-`schema.history.internal.skip.unparseable.ddl` 默认为 `false`。显式设为 `true` 时，流式处理会跳过 DDL 语句分析或历史表模型规划阶段的解析/不支持错误，并以 WARN 记录 LSN、DATA_OBJ#、原始 SQL 和失败原因。已识别的分区删除/清空、分区交换和上述对象级联删除分别由专用参数控制。
-跳过时保留原历史表模型，不为该语句写入 schema history，不从当前 JDBC 元数据补齐结构；后续记录继续处理，offset 按正常确认机制推进。仅跳过语句不保证 offset 已立即持久化。
-该参数不跳过 SQL 缺失、已识别捕获表 DDL 的无效对象编号、归档读取失败、DML 解析错误，也不绕过捕获范围或身份边界校验。未知对象的 DDL 不一定有合法表对象编号，仍可能在语句分析阶段被显式跳过。重启仍从结构化 `TableChanges` 恢复历史模型，不重新解析被跳过的 DDL，也不会补回它造成的结构变化；offset 已持久化越过该位置后，再设回 `false` 也不会自动重放该语句。
-
-[WARNING]
-====
-跳过 DDL 可能丢失真实表结构变化，使后续行日志无法解析，或按旧列位置/类型输出错误数据。
-该参数用于运维明确接受上述风险后的继续采集，不代表支持被跳过的语法，也不保证数据一致性；确认语句确实不影响采集表结构后再启用。
-====
-
-[cols="3,5",options="header"]
-|===
-|类别 |当前边界
-|普通表结构变化 |支持解析器已实现的列、主键和约束变化；未知子句失败。快照保存命名主键、UNIQUE、外键、CHECK 元数据供后续 DROP CONSTRAINT 历史重放。
-|物理选项 |逐项识别常见 STORAGE、TABLESPACE、USING LONG ROW，以及 HASH/RANGE/LIST、interval 和多级子分区声明、模板及 ROW MOVEMENT；不任意丢弃未知 SQL 尾部。
-|CTAS |命中采集范围且需要建立历史结构时，通过 JDBC 读取目标表在线字典，保存实际列顺序、类型和属性；无需源表历史结构，源表可在创建目标后修改或删除。复制行产生 INSERT 日志。临时表 CTAS 只保留非行表身份。
-|CTAS 限制 |字典获取失败不受 `schema.history.internal.skip.unparseable.ddl` 控制。首次消费 CTAS 时，目标表须仍存在且保持创建时结构。读取前后核对在线对象 ID 与 redo 的 `DATA_OBJ#`；不存在、同名重建或读取失败会报错，并保留失败 DDL 的处理位置。后续 ALTER 可能不改变对象 ID，因此结构超前无法完整检测，消费延迟短也不能消除此风险。
-|LIKE |继续从历史位置的已知源表复制列结构，不继承主键、默认值、identity 或注释，保留来源可空性；源表必须已在 history。
-|非表对象 |已识别的用户、目录、上下文、LIBRARY、DOMAIN、PROFILE、空 SCHEMA、STAT、LINK、OPERATOR、表空间和程序对象可分类为不改变采集表结构。具体语法边界和删除限制见上文；数据库拒绝的语法不能算作 Connector 已验证支持。
-|多表复合 DDL |单条 LogMiner DDL 最多一个受支持表语句。CREATE SCHEMA 内嵌 CREATE TABLE/VIEW/GRANT 仍不支持。USER/SCHEMA/DOMAIN/TYPE/CLASS 级联删除默认拒绝，可显式设 cascade.drop.ignore=true 跳过整条语句；保留旧模型且不补发依赖表删除，不代表完整支持级联结构更新。
-|特殊表与列 |临时表和外部表仅保留类型、对象编号及生命周期元数据，自动跳过数据快照、增量快照及行事件，不发布它们的 schema 事件；不需要设置 skip.unparseable.ddl。临时表已识别的 CREATE/ALTER/TRUNCATE/DROP/RENAME 不阻断业务表 CDC，删除后同名重建的普通表恢复正常采集。HUGE 表及虚拟/生成列仍拒绝。DM 8.1.3.162 原生模式实测两种 ON COMMIT 策略的临时表只有 CREATE/ALTER/DROP DDL，没有 INSERT/UPDATE/DELETE SQL_REDO，提交或会话关闭清空也不产生逐行 DELETE；虚拟列 redo 值为 NULL。
-|分区维护 |分区根表按普通表保存列结构和对象编号。合并、拆分、增加分区、修改模板/列表值、分区改名/移动和 ROW MOVEMENT 解析后跳过 DDL；其后 INSERT/UPDATE/DELETE 照常输出，包括搬迁产生的重复 INSERT。删除或清空分区默认拒绝，可用 `partition.drop.ignore=true` 显式忽略。EXCHANGE 分别检查两端处理范围，采集或历史相关时默认拒绝，可用 `partition.exchange.ignore=true` 显式忽略，不补发交换造成的数据变化。
-|DEFAULT ON NULL |解析器有支持和单测，但基线旧数据库拒绝该语法，尚非目标数据库端到端验收结论。
-|JSON CHECK |支持字符串列的 `IS [NOT] JSON`，可带 `STRICT` / `LAX`（也可加括号）及 `WITH/WITHOUT UNIQUE KEYS`；不代表新增 JSON/JSONB 物理类型映射。
-|隐式辅助表 |高级日志的 `WITH/WITHOUT/TRUNCATE ADVANCED LOG` 仍明确拒绝，不能按普通单表 ALTER 跳过。位图连接索引 DDL 跳过，其 `BMJ$_` 辅助表默认排除。
-|===
-
-`CREATE [GLOBAL] TEMPORARY TABLE` 保存 `dameng.table.kind=TEMPORARY` 和对象编号，跳过行采集。
-历史中的临时表标记用于识别后续 ALTER、TRUNCATE、RENAME 和 DROP；重启时从 schema history 恢复，不能用当前目录替代旧表身份。同名重建为普通表后，按新对象和新列结构采集。语法仍完整解析，未知子句或混入业务表 DDL 的复合记录不会因临时表而被跳过。
-
-外部表依据官网《数据定义语句》3.5.1.2、3.5.3 解析 `CREATE EXTERNAL TABLE [IF NOT EXISTS]`、控制文件或 `DATAFILE` 两种 `FROM` 子句，以及列注释、`LOCATION`、`PARMS` 选项。
-`CHARACTER_CODE` 接受字符串，例如 `'GBK'`、`'UTF-8'`、`'SINGLE_BYTE'`、`'EUC-KR'`。外部表只读，不允许 INSERT/UPDATE/DELETE 或 TRUNCATE；外部文件内容变化不是数据库行 CDC。
-外部表的创建和删除保留 `TABLE` 分类及表标识，由采集过滤器排除且没有历史模型时跳过。
-命中采集范围的外部表只保存 `dameng.table.kind=EXTERNAL` 和 `dameng.object.id`，不读取外部文件、不生成行事件 schema，也不发布其 schema change 事件。
-初始快照及扩大采集范围时通过 `SYS.SYSOBJECTS.INFO3` 的低 8 位值 `13` 识别外部表；边界前后校验对象身份，发生变化则终止并要求重试。
-标记持久化到 schema history，重启后直接恢复。流式 CREATE、表重命名和 DROP 更新这份历史，处理历史 DROP 不查询当前字典；DROP 后同名重建的普通表按新的对象 ID 正常采集。
-外部表除重命名外的 ALTER、TRUNCATE，以及从仅保留身份的外部表推导普通表列结构的 LIKE，仍明确拒绝。CTAS 读取实际目标表结构，不推导源表列。
-DM 8.1.3.162 实测拒绝外部表重命名；上述重命名历史维护由解析器和流处理单测覆盖，不代表该数据库版本支持执行。
-删除语法是 `DROP TABLE [IF EXISTS] [<模式名>.]<表名>`，SQL_REDO 没有 `EXTERNAL` 标记，不能统一分类为 `NO_TABLE_CHANGE`，否则会漏掉普通采集表的删除。
-DM 8.1.3.162 原生模式实测控制文件、数据文件建表和上述四种字符集均成功并生成 DDL redo；当前官网的 `ON <RAFT组名>`、`MISSING FIELD VALUES ARE NULL` 和分隔符拼接表达式被该版本拒绝，相关单测只验证官网语法解析边界。
-
-常量默认值按历史列类型转换；复合默认表达式不在 Connector 中执行。
-二进制列的 `0x` 常量支持大小写、前导零和奇数位数字；奇数位按达梦行为在左侧补 `0`，定长 `BINARY(n)` 默认值在右侧补零到列长度，转换结果继续遵循 `binary.handling.mode`。
-存入默认表达式前，将已识别注释替换为空格，保留其他字面内容；原始 DDL 仍保存在结构记录中。
-流式 COMMENT 不更新事件 schema 的注释描述。
-
-2026-10-29 在 8.1.3.162 原生模式的官方语料实测中，`STAT ... ON` 的表、索引和 hint 形式均生成 DDL redo，审计时的解析器拒绝了这三种样本。当前已为独立 STAT 语句增加非表分类；这不放开表定义中未实现的 STORAGE/STAT 子句。
-`REVOKE ... CASCADE` 的表、列、视图、过程/函数/包、序列、域、同义词和目录授权回收也生成 DDL redo；审计时有 13 个样本因尾部语法被拒绝，后续 CLASS、TYPE 专项又验证了两条同类回收语句。非表 DDL 分类现已接受权限词汇及 `REVOKE ... CASCADE`，这些旧审计数字保留为当时的结果。
-同一历史审计源码还拒绝了 CLASS/TYPE 的创建、定义体、编译和删除共十条实际 DDL，以及 ROWID、LONG、BFILE 列的三条建表 DDL。当前为 SQL 程序对象增加的分类不能反推这十条历史样本已经通过重测；特殊列类型映射也未因此扩展。LIBRARY 语句和 JSON 类型声明在该次数据库测试中被数据库拒绝，尚不能据此判断 Connector 支持情况。
-默认配置下，未识别的对象类型即使不修改采集表的列结构，也仍可能使任务在相应日志位置停止。
-同版本的 `RESTORE TABLE` 实测还发现：目标数据已被备份数据替换，但恢复语句的 LSN 区间没有目标表的 DML redo，独立 marker INSERT 可以正常挖掘。不能依赖 LogMiner CDC 将这类表恢复产生的数据变化同步到下游；解析器未报错不代表恢复数据已被采集。
-物化视图专项的 15 个代表语句中，13 个被该数据库版本接受，`COMPILE` 和 `DROP MATERIALIZED VIEW LOG IF EXISTS` 被数据库拒绝。FAST 和完全刷新会产生后台表 DML；当时的分析器拒绝其中 13 条 MATERIALIZED/REFRESH DDL 记录。另三条内部表 TRUNCATE 仅在空历史模型探针中规划失败。后续默认过滤和语句分类用于跳过物化视图内部数据，不代表支持物化视图 CDC；旧审计结果保留为当时的证据。
-单实例状态专项验证了 34 条角色、状态、参数和本地归档代表语句，其中 27 条接受、7 条因状态前提被拒绝。新增第二个 LOCAL 归档目的地后，当前生产挖掘连接会重复注册同一日志的副本，报 `-2848 cannot add duplicate logfile`。限定原归档目录的独立 SQL LogMiner 诊断成功，不能据此认为 Connector 已支持多 LOCAL 归档；该问题尚未修复。
-`FORALL` 专项通过完整引擎验证了异常处理器提交后再抛错的情形：两个官网示例虽返回 JDBC 错误，已提交的 2 行和 3 行更新仍全部发出 CDC。另一个官网示例绑定错误码 `-25000`，该版本实际返回 `-24381`，因未进入预期处理分支而全部回滚，CDC 为 0；单独适配错误码的代表样本提交及发出 3 行更新。不能仅根据客户端收到错误判断事务全部回滚；原样示例和适配样本的证据分别保留。
-可回归测试和逐条证据索引见模块 `src/test/testing.adoc` 的官方 SQL 语料章节。历史审计结果不代表所有缺口均已修复。
-2026-10-30，`DamengNonTableDdlIT` 在指定 8.1.3.162 镜像、`COMPATIBLE_MODE=0` 下通过用户、目录、空 SCHEMA、STAT、TYPE、DOMAIN、CONTEXT、PACKAGE、SQL CLASS、PROFILE 十族回归。在线和停机阶段各执行 33 条语句，共读到 66 条实际 DDL redo，全部分类为 `NO_TABLE_CHANGE`；66 个后续 CDC marker、停机重放、两次历史恢复及恢复后的 UPDATE 均通过。范围不包含 Java CLASS 或级联删除。相关定向单元回归为 1,913 项，格式和 5 个相关 Java 测试文件的 Checkstyle 检查通过；这不是全部 SQL 或整个 Connector 的验收。运行方法和证据文件见模块测试手册。
-LIBRARY 的官网语法有分类单测，数据库可执行性独立诊断，不计入上述 CDC 回归。本次 8.1.3.162 原生模式同时拒绝带模式限定名的 `CREATE OR REPLACE LIBRARY` 和不带模式名的最小 `CREATE LIBRARY`，均返回 `-2007` 语法错误。结果保存在 `target/non-table-ddl-library-probe.json`，不执行目标函数库，也不据此宣称已验证 CDC。
-`COMPATIBLE_MODE=2` 的补充运行在初始化阶段被现有兼容配置注册表拒绝，未进入这套 DDL/CDC 回归；本轮没有改变兼容模式支持矩阵。
-没有用当前 JDBC 表结构或 Flashback 自动兜底的生产路径。默认配置下，解析失败后的 restart 会再次遇到同一位置；显式跳过的风险和限制见上文，处理方法见故障章节。
-词法依据为 https://eco.dameng.com/document/dm/zh-cn/pm/dm_sql-introduction.html[SQL 介绍]、https://eco.dameng.com/document/dm/zh-cn/sql-dev/practice-strings.html[字符串]和 https://eco.dameng.com/document/dm/zh-cn/pm/definition-statement.html[DDL 文档]。
-
-[id="dameng-topics"]
-== Topic 与消息用途
-
-默认 Topic 命名保留实际 schema/table 名称大小写。原生模式未加引号的标识符通常为大写，例如 `dameng.APP.CUSTOMERS`。
-以下以 `topic.prefix=dameng` 为例；自定义 TopicNamingStrategy 或 SMT 会改变相应业务 Topic 路由。
-
-[cols="2,3,4",options="header"]
-|===
-|用途 |默认名称或配置 |内容与要求
-|业务变更 |`dameng.APP.CUSTOMERS` |每表一个 Topic；包含该表快照和 CDC 事件。
-|结构变更事件 |`dameng` |供消费者读取的结构通知，默认 `include.schema.changes=true`。关闭不会停止内部历史记录。
-|内部 schema history |`schema.history.internal.kafka.topic` 指定 |恢复历史结构和紧急恢复基线。每个 Connector 独占，单分区、完整保留，不配置 compaction。
-|事务元数据 |`dameng.transaction` |启用 `provide.transaction.metadata=true` 后发布 BEGIN/END。
-|心跳 |`__debezium-heartbeat.dameng` |启用心跳后发布；帮助提交安全 offset，不代表业务表发生变化。
-|Worker 内部配置、offset、状态 |Worker 的 `config.storage.topic`、`offset.storage.topic`、`status.storage.topic` |由 Kafka Connect 管理，可由同一 Worker 集群的多个 Connector 共享。不能与 schema history 混用。
-|通知 |`notification.sink.topic.name` |启用 sink 通知通道时使用；不是业务 CDC 或 schema history。
-|===
-
-schema history 的分区数和保留规则关系到恢复正确性。业务 Topic 的分区数不增加达梦 Task 数；多分区也不提供表级全局顺序。
-字段名调整改变事件 schema，不会重命名数据库列。Topic 路由 SMT 只作用于发出的记录，不替代内部 history 配置。
-
-[id="dameng-events"]
-== 数据变更事件
-
-下面展示默认 envelope 的 JSON 形态，省略部分可选字段。示例数值仅用于说明，不是实测 LSN。
-`JsonConverter` 的 `schemas.enable=false` 时直接得到下面的业务对象；设为 `true` 时外层包含 `schema` 和 `payload`。
-Connect 的字段类型与最终 JSON、Avro 或其他序列化形式需要分开理解。
-
-=== Key、Value 与 source
-
-假设 `APP.CUSTOMERS(ID INT PRIMARY KEY, NAME VARCHAR(100))` 新增一行。
-Key 为：
-
-[source,json]
-----
-{"ID": 1}
-----
-
-Value 为：
-
-[source,json]
-----
-{
-  "before": null,
-  "after": {"ID": 1, "NAME": "Alice"},
-  "source": {
-    "version": "3.6.4-xingchuang-kafka2.0",
-    "connector": "dameng",
-    "name": "dameng",
-    "ts_ms": 1792368000000,
-    "snapshot": "false",
-    "db": "DAMENG",
-    "schema": "APP",
-    "table": "CUSTOMERS",
-    "lsn": 1000,
-    "change_lsn": 1100,
-    "commit_lsn": 1200,
-    "event_serial_no": 0,
-    "transaction_id": "example-transaction"
-  },
-  "op": "c",
-  "ts_ms": 1792368000100,
-  "transaction": null
-}
-----
-
-[cols="2,5",options="header"]
-|===
-|字段 |含义
-|`before` / `after` |行级变更前后镜像；NULL 行镜像与某列值为 NULL 不同。行外 LOB 可能使用不可用占位值。
-|`op` |`r` 快照读取、`c` 插入、`u` 更新、`d` 删除、`t` 清空表。
-|`source.name` / `source.db` |逻辑来源 `topic.prefix` / 配置的 `database.dbname`。后者不是 PDB、schema 或 JDBC URL 的路由参数。
-|`source.schema` / `source.table` |历史位置对应的逻辑表标识。
-|`source.lsn` |安全重放起点，可能被长事务固定；不是已经挖到的最大 LSN。
-|`source.change_lsn` |这条变更对应的日志位置。
-|`source.commit_lsn` |事务提交位置；同事务的多条变更可能相同。
-|`source.event_serial_no` |事务内记录序号，从零开始，可因过滤而不连续；不是 Kafka offset，也不等同于 transaction.total_order。
-|`source.transaction_id` |达梦日志事务标识。不能假设跨数据库重建或所有恢复世代永久唯一。
-|`source.snapshot` |是否来自快照；可能为 `true`、`last`、`incremental` 或 `false`，按实际快照阶段解释。
-|`source.ts_ms` / 顶层 `ts_ms` |来源时间 / Connector 构造事件的时间；公共 envelope 还可提供 `ts_us`、`ts_ns`。它们不是 Kafka 消费确认时间，时钟差和来源时间粒度影响延迟计算。
-|`transaction` |启用事务元数据时的事务 ID 和事件顺序；默认未启用。
-|===
-
-复合主键的 Key 包含全部主键列。唯一索引或 UNIQUE 约束不会自动当作主键。
-无主键表支持普通 snapshot 和 CDC，默认 Key 为 null；用 `message.key.columns` 可以指定业务键，但必须自行保证非空、唯一和稳定。
-这不会创建数据库主键，也不等于该表具备已验证的增量快照条件。
-
-=== 操作类型和下游处理
-
-[cols="1,3,3,4",options="header"]
-|===
-|op |before |after |说明
-|`r` |null |当前行 |初始/增量快照读取，不表示数据库刚刚 INSERT。
-|`c` |null |新增行 |INSERT 的提交结果。
-|`u` |旧行 |新行 |更新的行级镜像；一条批量 SQL 可能产生多个事件。
-|`d` |旧行 |null |删除事件，消费者应按 Key 删除其副本。
-|`t` |null |null |TRUNCATE 表级事件，Key 为 null；默认 `skipped.operations=t` 不发布。需要时显式设置 `skipped.operations` 为空字符串。
-|===
-
-以下展示 update、delete 和 truncate 的 envelope 片段，实际消息还包含 source 和时间字段：
-
-[source,json]
-----
-[
-  {"before":{"ID":1,"NAME":"Alice"},"after":{"ID":1,"NAME":"Bob"},"op":"u"},
-  {"before":{"ID":1,"NAME":"Bob"},"after":null,"op":"d"},
-  {"before":null,"after":null,"op":"t"}
-]
-----
-
-默认 `tombstones.on.delete=true`：有 Key 的 DELETE 后再发送相同 Key、Kafka value 为 null 的 tombstone，供 compacted Topic 清理旧值。
-tombstone 不是 `{"after":null}`，也没有 envelope。无 Key 表无法依赖主键压缩清理。
-主键更新产生旧 Key 的 delete、可选 tombstone、新 Key 的 create，公共发射器还提供新旧 Key 关联 header。
-中途重启可能重发旧 Key 的 delete。下游应使用幂等写入/删除，不要只靠统计消息数推断数据库当前行数。
-TRUNCATE 没有逐行 Key，多分区消费时不能假定其与所有分区内消息具有全局顺序。
-
-=== 结构变更事件与内部 history
-
-启用 `include.schema.changes` 时，结构变更 Topic 的 Key 包含 `databaseName`，Value 包含 `source`、`ts_ms`、`databaseName`、`schemaName`、`ddl` 和 `tableChanges`。
-`tableChanges` 描述 CREATE、ALTER、DROP 等结构变化，包含列、主键和表标识等结构化信息；它不是一条业务行。
-初始结构快照也会生成结构事件，DDL 文本可能为空。消费者应读取结构化定义，不能假定每条记录都有可执行 SQL。
-
-[source,json]
-----
-{"databaseName":"DAMENG"}
-----
-
-单次加列事件的字段片段示意：
-
-[source,json]
-----
-{
-  "databaseName": "DAMENG",
-  "schemaName": "APP",
-  "ddl": "ALTER TABLE APP.CUSTOMERS ADD EMAIL VARCHAR(200)"
-}
-----
-
-内部 history 保存恢复所需的完整结构、位置和达梦对象属性；结构变更 Topic 是面向消费者的通知，两者不可互相替代。
-不要从业务结构事件手工拼出 history，也不要清空 history 后保留旧 offset 继续采集。
-
-=== 事务元数据
-
-设置 `provide.transaction.metadata=true` 后，事务 Topic 发布如下形式的边界消息，业务事件附带 transaction 字段：
-
-[source,json]
-----
-[
-  {"status":"BEGIN","id":"example-transaction","ts_ms":1792368000000,"event_count":null,"data_collections":null},
-  {"status":"END","id":"example-transaction","ts_ms":1792368000100,"event_count":2,
-   "data_collections":[{"data_collection":"APP.CUSTOMERS","event_count":2}]}
-]
-----
-
-[source,json]
-----
-{"id":"example-transaction","total_order":1,"data_collection_order":1}
-----
-
-`total_order` 是已发出的事务数据事件顺序，`data_collection_order` 是该表在事务内的事件顺序，均从 1 开始。
-计数反映捕获范围和事件处理路径，不等于数据库原始事务修改的所有行数，也不包含 tombstone 作为新的行变更。
-达梦 BEGIN 的时间来自所处理的日志行，END 使用 Connector 处理时间；不能将两者差直接当作数据库事务执行时长。
-事务元数据提供下游重组依据，但不会让多个业务 Topic 的消息自动原子可见。
-
-[id="dameng-data-types"]
-== 数据类型映射
-
-以下为原生模式的默认映射。以实际 JDBC 物理类型和历史 DDL 为依据，不能只按另一数据库同名声明推断。
-JSON 中 bytes 常呈 Base64；Decimal 的 JSON 表示还取决于 Converter 设置，不能把 Connect BYTES 直接理解为业务字符串。
+同一 JDBC 版本可能对应不同构建，部署时应同时记录完整构建、驱动、字符集和数据库参数。
+版本告警名单目前只登记 `8.1.2.128`，因此 `8.1.3.162` 仍会 WARN；未知或读取失败的版本元数据不单独阻止启动。
+
+[id="dameng-deployment-mode-matrix"]
+=== 部署拓扑
 
 [cols="3,2,5",options="header"]
 |===
-|达梦类型/物理类型 |Connect 类型 |逻辑含义与限制
-|BOOLEAN、单比特 BIT |BOOLEAN |true/false；多比特声明须按实际物理映射验收。
-|TINYINT、SMALLINT |INT8、INT16 |分别对应 8/16 位整型，输入边界以达梦实际接受范围为准。
-|INT/INTEGER、BIGINT |INT32、INT64 |保持整型值；消费端不要用不能精确表示大整数的浮点类型接收 BIGINT。
-|REAL / 物理 REAL 的 FLOAT(p) |FLOAT32 |日志文本可能损失精度，见下文。
-|DOUBLE / 物理 DOUBLE 或 FLOAT |FLOAT64 |FLOAT(p) 声明在不同模式/参数下可能映射不同，不按名字固定为单精度。
-|DECIMAL(p,s)、NUMERIC(p,s)、NUMBER(p,s) |BYTES |默认逻辑类型 `org.apache.kafka.connect.data.Decimal`，保留 scale；string/double 模式改为 STRING/FLOAT64。
-|未限定精度的 NUMBER/NUMERIC/DECIMAL |STRUCT |物理 DECIMAL/NUMERIC 元数据长度非正时，precise 下为 `io.debezium.data.VariableScaleDecimal`，包含 scale 和非标度 value；不将不同 scale 强行统一。
-|CHAR、NCHAR、VARCHAR、VARCHAR2、NVARCHAR 等字符列 |STRING |CHAR/NCHAR 保留定长空格；按历史字节长度和字符集补齐 LogMiner 省略的 padding。
-|BINARY、VARBINARY、RAW |BYTES |或按 binary.handling.mode 输出 Base64、URL-safe Base64、hex 字符串。仅二进制列将日志 `'0x'` 解为空数组，文本列仍为文字。
-|DATE |STRING |默认无逻辑类型名称，例如 `1965-02-03`；显式选择 isostring 时使用 `io.debezium.time.IsoDate` 和末尾 `Z`，adaptive 时输出距 1970-01-01 的 INT32 天数。
-|TIME(p) |STRING |默认无逻辑类型名称，例如 `12:34:56.123456`；小数秒以实际存储值为准。显式 isostring 使用 `io.debezium.time.IsoTime`。
-|TIMESTAMP/DATETIME |STRING |默认无逻辑类型名称，例如 `2026-09-24 12:34:56.123456`。普通 TIMESTAMP 没有源时区，输出不附加时区。显式 isostring 使用 `io.debezium.time.IsoTimestamp` 的 `T`/`Z` 形式。达梦在显式 adaptive 与 adaptive_time_microseconds 模式下，对声明精度 7～9 的普通 TIMESTAMP 也固定使用 IsoTimestamp，以避开 INT64 纳秒范围限制。
-|TIME WITH TIME ZONE |STRING |`io.debezium.time.ZonedTime`，归一到 UTC 时刻，跨午夜不附加日期；旧 8.1.2.128 小数秒受限，8.1.3.162 的 TIME(1..6) WITH TIME ZONE 严格矩阵已通过。
-|TIMESTAMP WITH TIME ZONE |STRING |`io.debezium.time.ZonedTimestamp`，保留瞬时和小数秒，归一 UTC，不保留最初写入的偏移格式。
-|INTERVAL |STRING |`io.debezium.time.Interval` version 1，保留年/月或日/时间单位及精确十进制秒。
-|CLOB / BLOB |STRING / BYTES |快照可读取完整内容；流式行外值不完整时输出不可用占位值，非完整 LOB CDC。
-|TIMESTAMP WITH LOCAL TIME ZONE |STRING |仅此类型输出 `io.debezium.time.ZonedTimestamp` 的 UTC 格式字符串。初始及增量快照使用 UTC 读取会话；流式归档 LogMiner 的本地时间文本直接按 UTC 解释，不保证还原真实 instant。
-|复杂对象、集合及无已验证映射的类型 |不支持 |明确报 schema 错误，不静默丢列。公共转换器中出现 XML/ROWID 等分支不代表达梦已完成其 CDC 验收。
+|拓扑 |支持状态 |要求
+|单机直连 |支持 |`NORMAL/OPEN`，配置 hostname/port。
+|固定地址连接主库 |支持当前成员采集 |`PRIMARY/OPEN`；单地址 offset 不提供跨成员恢复保证。
+|成员列表连接主库 |支持人工切换 |配置 `database.failover.hosts`，成员 `N_EP=1`；DBA 负责切换和隔离旧主。见 <<dameng-primary-standby-recovery,主备恢复>>。
+|物理备库采集 |支持指定构建 |配置 `database.standby.hosts`；备库提供 LogMiner、SLSN、RPKG_LSN，主库负责信号写入和快照锁。见 <<dameng-standby-capture,备库采集>>。
+|VIP、代理、自动故障切换 |未验收 |现有回归使用成员地址列表和人工切换。
+|DMDSC、多可写主库、分布式多源 |不支持 |未实现多节点日志合并与恢复。
 |===
 
-=== Decimal、时间和默认值
+只采集 `OPEN` 实例。主备成员须属于同一物理数据库家族，保持唯一可写主库、连续归档和一致的词法参数。
+旧 8.1.2.128 在备库注册 LogMiner 归档时返回 `-710`；8.1.3.162 的备库采集已有回归。强制有损 takeover 和脑裂恢复不在支持范围。
 
-decimal.handling.mode=precise 保留固定 scale 或 VariableScaleDecimal；string 避免下游十进制类型限制；double 可能损失有效位。
-达梦默认 `time.precision.mode=sqlstring`，DATE、TIME、普通 TIMESTAMP 使用无 `T`/`Z` 的 SQL 风格字符串；字符串不表示 UTC 时间点，也没有 Kafka Connect 时间逻辑类型名称。带时区类型与 LOCAL TIME ZONE 的独立语义见上表。显式 `isostring` 保留以前的 ISO 8601 `T`/`Z` 格式；显式选择 adaptive、adaptive_time_microseconds、microseconds 或 nanoseconds 时，普通时间字段按该模式的数字单位输出；显式纳秒仍受 INT64 范围限制。
-`time.precision.mode=connect` 使用 Kafka Connect Date/Time/Timestamp，只保证毫秒；其他公共模式的单位见参数说明。
-TIMESTAMP(7..9) 等高精度声明、超大 NUMBER 和中文 CHAR 长度边界在旧构建上存在声明或驱动/存储限制。
-8.1.3.162 复测后，中文 CHAR 边界、ROWID 普通列用例及部分高精度时间通过；超大 NUMBER 和默认纳秒时间映射的极端年份在修改前仍失败。当前 `TIMESTAMP(7..9)` 默认使用字符串映射；版本差异和历史结果见 <<dameng-regression-813162,新版本回归>>。
-日期按原始日历文本解析，避免旧 JDBC java.sql.Date/Timestamp 丢失 BCE 年代；接受日志中不补零的年份，不使用 JVM locale 猜测格式。
-LogMiner TO_DATE/TO_TIMESTAMP/TO_TIMESTAMP_TZ 仅解析已支持的 ISO 格式，例如 YYYY-MM-DD、YYYY-MM-DD HH24:MI:SS.FF6 和带 TZH:TZM 的形式。
-不支持表达式或格式会失败，CURRENT_TIMESTAMP 等表达式默认值不会在 Connector 中当场求值来伪造历史值。
+[[dameng-case-sensitive]]
+=== 标识符大小写
 
-INTERVAL 覆盖 13 种 year/month 和 day/time qualifier，leading precision 1～9、fractional seconds 0～6。
-`INTERVAL '12-3' YEAR TO MONTH` 输出 `P12Y3M0DT0H0M0S`；负日时间可输出 `P0Y0M-2DT-3H-4M-5.123456S`。
-保留零分量并去除秒小数末尾零，不将月近似换算成天，也不将完整范围挤入可能溢出的微秒整数。
-列默认 leading precision 为 2，字面值默认 9；非法范围、子字段或精度拒绝，不悄悄舍入。
+`CASE_SENSITIVE` 是建库属性，Connector 自动读取：
 
-=== 已知一致性边界
+* `0`：schema、表、列和约束统一为大写；Topic 中的 schema/table 和消息字段名也使用大写，数据值不变。
+* `1`：非引号名转大写，双引号名保留大小写。同表列名仅大小写不同仍拒绝。
 
-81 项失败实例的分类、生产影响、处理条件及逐项索引见 <<dameng-datatype-failures-20261020,字段边界失败分析>>。
-
-测试构建将 REAL/FLOAT/DOUBLE 的 SQL_REDO 输出为六位小数，小非零值可能变成零，相邻浮点值可能合并。
-带时区 TIME 的日志可能只保留秒，即使 JDBC 快照有小数秒。在线字典 MINE_VALUE 也观察到相同损失；无字典接口不能按文档逻辑列名可靠读取替代值。
-日志已缺失的信息无法从文本推回，也不能用当前表行修复旧更新或已删除行。
-精确一致性要求涉及这些字段时，必须验证能保留原值的数据库构建和接口。
-
-原始 Connect 浮点值保留负零；历史测试观察到旧 8.1.2.128 可写入 NaN，但 8.1.3.162 配合当前 JDBC 驱动会在 NaN 写入时返回 Data overflow。当前数据库 CDC 一致性用例已移除 NaN 写入输入。
-已验证的 Kafka 4.3.0 schema-enabled JsonConverter 在往返解码中可能丢失负零；旧版本 NaN 编成字符串后数值解码为零的问题，不能用新版拒绝写入来宣称修复。
-这是序列化往返问题，不是原始 Connector 值相同；其他 Converter/Worker 版本须分别验收。
-LOCAL TIME ZONE 采用显式有损的 UTC 假设：快照在 UTC 读取会话下得到数据库换算后的时间，归档 LogMiner 则暴露写入会话的本地时间并直接标为 UTC。写入会话不是 UTC 时，二者可能表示不同时间；该字段不适合直接用于跨阶段去重或真实时间点计算。Connector 不提供原写入会话时区；下游必须从外部掌握相关时区才能尝试恢复，不能仅凭消息中的 `Z`。UPDATE/DELETE 的历史 before 值是否能用当前操作会话时区修正也未验证。
-历史 DDL 保留该列的独立类型身份；普通 TIMESTAMP 与 TIMESTAMP WITH TIME ZONE 不采用这项假设。
-
-流式 `OUT_CLOB` / `OUT_BLOB` 或被省略的 LOB before-image 使用 unavailable.value.placeholder，BLOB 标记经过 UTF-8 和所选二进制模式编码。
-显式 SQL NULL 保持 null；消费者应区分缺失值、NULL 和真实字段内容。
-
-=== 自定义转换器
-
-`converters` 扩展数据库类型到 Connect 值；Worker 的 key.converter/value.converter 把 Connect 记录序列化；SMT 在 Worker 流程中变换记录，三者用途不同。
-达梦没有照搬 Oracle 的 NUMBER(1)→Boolean、NUMBER→Zero Scale、RAW→String 专用转换器。
-需要时自行提供 SPI 实现，配置别名和 `<alias>.type`，验证 Key、schema、snapshot、streaming、默认值和历史恢复一致性。
-转换器不能恢复数据库日志已经舍弃的浮点位或时区信息。
+过滤正则、列配置和增量快照表名须使用上述名称。`signal.data.collection` 自动规范化，并始终按 `schema.table` 解析。
+例如模式 0 下的 `"Dbz_App"."Dbz_Case"`、列 `"VaLuE"` 对应 Topic `prefix.DBZ_APP.DBZ_CASE` 和字段 `VALUE`。
 
 [id="dameng-database-setup"]
-== 数据库端配置与权限
+== 数据库准备
 
-本文供数据库管理员在部署 {prodname} 达梦 Connector 前核查数据库。
-以下要求针对初始快照和持续 LogMiner 采集，适用于单机或由管理员人工切换的主备部署。
-部署前先核对 <<dameng-support-matrix,兼容模式、版本测试与部署模式矩阵>>，确认实际构建、驱动及采集节点是否在已验证范围内。
-旧 DM8 `08134283904-20220804-166351-20005` 与新测试基线 `03134284194-20240621-232765-20108` 均使用 `DmJdbcDriver18` `8.1.3.140` 回归；通过范围和失败项见版本测试矩阵，不能将“执行过测试”等同于全部验收通过。
-Connector 每次启动 Task 时，通过 JDBC 标准 `DatabaseMetaData` 接口读取并以 INFO 记录数据库产品名、版本字符串和主次版本。
-两个测试构建分别返回 `DM DBMS` / `8.1.2.128` 和 `DM DBMS` / `8.1.3.162`，主版本均为 `8`、次版本均为 `1`；数据库版本与 JDBC 驱动版本不同。
-未匹配代码中已测试版本名单，或无法读取版本元数据时，仅打印 WARN 并继续启动。
-JDBC 版本匹配不能唯一识别数据库构建，也不代表所有数据一致性测试都已通过。
-Connector 不会自动修改数据库参数或启用归档。
+由 DBA 配置归档、日志参数和 CDC 账号；Connector 不自动修改这些设置。
+先按 <<dameng-support-matrix,支持范围>> 核对构建、驱动及部署拓扑，再检查以下实际生效值。
 
 === 必需参数和归档
 
@@ -882,12 +118,12 @@ Connector 不会自动修改数据库参数或启用归档。
 |`RLOG_APPEND_LOGIC` |`2` |UPDATE 和 DELETE 的逻辑日志包含完整的非 BLOB/CLOB 列值，供 Connector 还原行像。值为 `1` 时，有主键表的日志可能只包含主键和更新列。
 |`RLOG_IGNORE_TABLE_SET` |`1` 或 `0` |`1` 维持全表逻辑日志行为；`0` 时由任务配置者手动为每张采集表开启表级逻辑日志，Connector 在启动时打印 WARN 并继续。其他值会使流式任务拒绝启动。
 |`RLOG_LLOG_COMPRESS` |存在时为 `0` |压缩逻辑日志可能使 INSERT 的值无法完整挖取。旧版本没有该参数时，Connector 接受其缺失。
-|`COMPATIBLE_MODE` |`0` |当前仅注册原生模式策略。启动从数据库读取实际值并选择策略；其他值、缺失或格式非法均被拒绝。标识不限制最大为 8，未来通过新增策略与验收扩展支持。
+|`COMPATIBLE_MODE` |`0` |仅支持原生模式，其他值或缺失时拒绝。
 |`LENGTH_IN_CHAR` |`0` |使用已验证的字节长度语义。其他值或查询不到该参数都会被拒绝。
-|`BACKSLASH_ESCAPE` |8.1.3.162 使用 `0` |旧 8.1.2.128 的 0、1 均通过；新 8.1.3.162 的 1 改变字面量语义，相关回归失败，尚待适配。代码目前的范围校验仍接受 0、1；其他值或缺失会被拒绝。
+|`BACKSLASH_ESCAPE` |8.1.3.162 使用 `0` |值为 1 的新版本字面量语义尚未适配；代码范围检查仍接受 0、1。
 |`NESTED_C_STYLE_COMMENT` |`0` 或 `1` |`0` 在第一个 `*/` 结束块注释；`1` 按嵌套层数匹配结束。其他值或缺失会被拒绝。
-|`CASE_SENSITIVE` |`0` 或 `1` |数据库初始化属性，通过 `SF_GET_CASE_SENSITIVE_FLAG()` 查询。模式 0 将 schema、表、列、约束和信号表身份规范为大写；模式 1 保持现有语义。同表列名仅大小写不同仍拒绝，避免公共列模型合并字段。
-|`IDENTIFIER_MODE` |缺失、`0` 或 `1` |旧测试库没有该参数，引用名保留大小写。`0` 保留引用名大小写；`1` 按官网规则转大写。`1` 仅完成解析器单测，部署前仍需在目标数据库版本验收；其他值拒绝。
+|`CASE_SENSITIVE` |`0` 或 `1` |通过 `SF_GET_CASE_SENSITIVE_FLAG()` 读取，命名规则见 <<dameng-case-sensitive,大小写>>。
+|`IDENTIFIER_MODE` |缺失、`0` 或 `1` |缺失/0 保留引用名大小写，1 转大写；显式模式仅有解析单测，需目标库验证。
 |===
 
 `RLOG_APPEND_LOGIC` 与 `RLOG_LLOG_COMPRESS` 的 LogMiner 行为见 https://eco.dameng.com/document/dm/zh-cn/pm/dbms_logmnr-package.html[达梦 DBMS_LOGMNR 文档]。
@@ -899,20 +135,13 @@ Connector 不会自动修改数据库参数或启用归档。
 ALTER TABLE BIZ.ORDERS ADD LOGIC LOG;
 ----
 
-Connector 只打印启动警告，不查询或验证各表的日志设置，也不会代替 DBA 开启日志。缺失表级日志时，任务可能继续运行却静默漏掉变更；事后启用日志无法补回之前未写入的变更。
-使用自动创建信号表时，应在该表创建后、发送信号前启用其表级逻辑日志。
-`COMPATIBLE_MODE` 和 `LENGTH_IN_CHAR` 的目标值仍是 Connector 的启动条件，见 <<dameng-connector,Connector 说明>>。
-即使暂不采集 BLOB/CLOB，也要保留以上非 LOB 行像设置。
-词法参数在主备节点上必须一致，并在需要重放的归档区间内保持不变。
-当前参数不能证明旧 DDL 生成时的词法设置；修改这些设置前应另行规划历史衔接，不能仅重启任务后沿用旧 offset。
-Connector 将这些实际设置保存为 offset 的 `compatibility_signature`，启动恢复 history 前和运行期间会核对，变化时停止。
-旧版没有该签名的 offset 也会拒绝恢复；升级需规划新 Connector 身份、新 offset/history 和初始快照，不能手工给旧 offset 补一个当前签名。
-检查不能恢复历史参数，也不能发现两次检查之间修改后又改回的情况，因此不能替代数据库侧的参数变更管理。
-只有确认临时参数下没有生成受影响的历史，才能改回原值后继续旧 offset；否则应重新建立采集基线，不能仅凭当前签名重新相等判断安全。
+Connector 不验证每张表是否启用逻辑日志，也不代为开启。缺失时可能运行正常却漏掉变更；事后启用不能补回旧变化。
+自动创建的信号表也须在发送信号前启用表级逻辑日志。
 
-测试容器使用 `SP_SET_PARA_VALUE(2, ...)` 设置 `RLOG_APPEND_LOGIC` 和 `RLOG_IGNORE_TABLE_SET`，且仅在数据库提供 `RLOG_LLOG_COMPRESS` 时将其设为 `0`，随后启用本地归档并重启数据库。
-生产库应由 DBA 根据当前 DM8 版本的参数生效规则、维护窗口和既有归档配置实施；测试容器的归档路径、`FILE_SIZE=64` 和 `SPACE_LIMIT=1024` 不是生产容量建议。
-设置或重启后，在每个可能成为主库的节点上检查*实际生效值*：
+词法和大小写设置写入 `compatibility_signature`，启动恢复及运行期间变化会停止任务。主备成员及需重放的日志区间必须保持一致。
+两次检查间改动后又改回无法检测；若该期间生成过受影响日志，应重建基线，不能只靠当前签名相等继续恢复。
+
+测试容器的归档路径、64 MiB 文件和 1 GiB 空间上限不适合作为生产容量建议。生产变更按目标 DM 版本的生效规则实施，并在每个采集或主备节点查询：
 
 [source,sql]
 ----
@@ -970,16 +199,11 @@ GRANT SELECT ON APP.ORDERS TO CDC_USER;
 `SOI` 允许读取非安全、非审计系统表，包括对象与约束目录；`VTI` 允许读取系统动态视图，包括运行状态和 LogMiner 视图。
 这是一组已经验证可用的权限，不是已证明不可再缩小的最小权限集。基线构建拒绝对 SYS.SYSOBJECTS、SYS.SYSCONS 直接进行对象级授权，不能用未经验证的单对象 GRANT 替代。
 
-=== 主备与人工切换
+=== 主备准备
 
-对两个可能成为主库的成员分别执行上述参数、归档、权限和连接核查。
-当前 Connector 只支持单实例成员（`N_EP=1`）和唯一可写主库；主备归档复制及切换由达梦 Data Guard 和 DBA 管理。
-两端均需保有本地归档，实时归档通道应健康，且新主库要有覆盖 Connector 已确认位置的连续归档历史。
-切换前确认备库已应用所需日志，切换时隔离旧主写入，切换后确认恰好一个成员在 `V$INSTANCE` 中报告 `PRIMARY`、`OPEN`。
-Connector 通过 `database.failover.hosts` 配置两个 JDBC 地址，无需 VIP；它不会发起升主或修复丢失的归档。
-详细的恢复边界和配置见 <<dameng-primary-standby-recovery,主备恢复说明>>，达梦复制与归档的管理要求见 https://eco.dameng.com/document/dm/zh-cn/pm/data-watch-overview.html[达梦 Data Guard 文档]。
-
-完成配置后，先在测试表验证快照，再提交 INSERT、UPDATE 和 DELETE 并检查 Kafka 事件；随后重启 Connect worker，确认任务能够从已保存的 offset 继续采集。
+各成员均需满足参数、授权和本地归档要求，实时归档通道保持健康。
+新主库须已应用所需 redo，并保有覆盖 Connector 已确认位置的连续历史。
+DBA 负责升主和隔离旧主，Connector 只选择符合角色的节点并检查恢复连续性。操作见 <<dameng-primary-standby-recovery,主备恢复>>。
 
 === 内置过滤和表存储类型
 
@@ -1189,6 +413,499 @@ curl -fsS -X POST http://localhost:8083/connectors/dameng-cdc/tasks/0/restart
 pause 不是删任务或清 offset，也不应依赖它立即释放所有资源；需要停止时使用当前 Worker 支持的 stop API。
 restart 不会修复缺档、不支持 DDL 或资源上限，先按故障章节解决原因。
 
+[id="dameng-snapshots"]
+== 快照与信号
+
+=== 初始快照和 no_data
+
+[cols="2,4,4",options="header"]
+|===
+|snapshot.mode |没有可恢复 offset 时 |已有已完成快照的 offset 时
+|`no_data`（默认） |读取结构、选择当前 LSN，再持续采集；不发存量行 |恢复旧位置，仍要求所需归档存在。
+|`initial` |读取结构和存量行，再持续采集 |恢复旧位置，不自动再次全量。
+|`initial_only` |读取结构和存量行后结束快照执行，不进入 CDC |不提供持续采集；Task 状态不应当作数据仍在变化的证明。
+|`never` |`no_data` 的旧别名，仍需结构基线 |与 `no_data` 相同。
+|===
+
+未完成的初始快照可能在恢复时重新执行并重发已经输出的行。
+Connector 先发现并锁住捕获表，选择 `V$RLOG.CUR_LSN`，读取结构，按模式决定是否扫描行。
+选择 LSN 后再次检查匹配过滤器的新表；如发现新表，补锁并重新选择 LSN，再检查一次。最终检查之后的新表通过 DDL 流处理。
+整个快照事务结束并成功 rollback 后才释放共享表锁。此处 rollback 用于结束只读快照事务，不是回滚业务事务。
+普通查询不使用 Oracle `AS OF SCN`；一致性依赖这些锁，因此 `no_data` 建立结构基线也会短暂锁表。
+
+`snapshot.max.duration.ms` 默认 10 分钟，覆盖锁等待、结构/数据读取和队列阻塞。
+超时中断快照并请求 JDBC abort，Task 失败，不会通过跳过表继续；实际断开会话及释放锁依赖驱动和数据库。
+主备模式在完成标记之前再次核对主库身份；切换打断初始快照后在新主库重新快照。
+当前仅允许 `snapshot.locking.mode=shared`、`snapshot.max.threads=1`。
+`snapshot.lock.timeout.ms` 的继承字段没有接入达梦锁语句，实际应结合 `database.query.timeout.ms` 和总快照预算设置超时。
+
+=== 快照范围与采集范围
+
+`schema.include.list`、`table.include.list` 等决定总体采集范围；表过滤针对完整 `schema.table`，列过滤针对 `schema.table.column`，不是 `database.schema.table`。
+规则是正则表达式，需要字面点号时在 JSON 中写 `APP\\.CUSTOMERS`。
+include 和 exclude 对应项不能同时配置。
+`snapshot.include.collection.list` 只减少初始快照输出行的表，不缩小这些已捕获表的结构 history，也不改变 streaming 或增量快照的选择范围。
+`snapshot.select.statement.overrides` 和每表 SQL 只过滤初始快照行，不能过滤之后的 CDC。
+
+结构发现完成时，日志打印结构采集表和数据快照表。
+每个没有匹配任何可见表的 `table.include.list` 表达式会 WARN，但不会因此停止，因为规则可能针对未来新表。
+应检查表名大小写、其他过滤规则、元数据可见性和 SELECT 权限；WARN 本身不能证明是哪一种原因。
+普通重启直接恢复 streaming 时不会重新执行完整快照发现检查。
+
+初始 history 当前只包含采集过滤器选中的表，`schema.history.internal.store.only.captured.tables.ddl=false` 不会扩展为所有库表结构。
+已捕获表被 rename 到范围外后仍保留后续 DDL，以支持之后改回名称；从未拥有历史定义的表不能仅靠 rename 进入捕获范围。
+在过滤器不变时，运行中或停机期间创建、删除后重建的匹配表，可以通过仍保留的 DDL 采集。
+已有完整 offset 和 history 时，可以修改表过滤范围后重启，具体边界和限制见 <<dameng-capture-scope-changes,调整采集表范围>>。不能直接用当前 JDBC 结构解释新增表的旧日志。
+
+[id="dameng-capture-scope-changes"]
+=== 调整采集表范围
+
+初始快照完成后，可 PUT 完整配置修改 schema/table include/exclude，再重启。须保留 offset、schema history 和所需归档。
+
+[cols="2,5",options="header"]
+|===
+|变更 |行为
+|新增已有表 |只锁新增表，建立当前结构和激活 LSN `S`。原有表继续原位置；新纳入范围的表不重放 `LSN <= S` 的 DML/DDL。
+|新规则匹配未来新表 |`S` 之后受支持的 CREATE TABLE 可建立结构并进入采集；已删除或不可见表的旧 CREATE 不会被回放成新表。
+|移除表 |停止输出该表，包括未发送的积压；清理其增量快照进度，保留其他表进度。已发消息不撤回。
+|重新加入表 |建立新的激活边界，不补被排除期间的历史。
+|===
+
+边界和新增结构在释放锁前写入 history，重启复用，不重新选择更晚的位置。备库采集时在主库加锁并选择边界，等待备库追平后读取结构。
+`initial` 不会在扩表时自动补存量；需要时发送该表的增量快照信号。补数只能读取当前仍存在的行，不能补回旧删除或中间变化。
+
+扩表前用 CDC 账号确认元数据和 SELECT 可见性。历史已知的新纳入表在 JDBC 中不可见，或对象编号与另一历史表冲突时，调整会失败；先恢复权限或用原配置追平重命名日志。
+未匹配任何可见表的 include 规则会 WARN，但不阻止未来建表。
+
+以下情况拒绝普通范围调整：初始快照未完成，改变数据库选择、`table.ignore.builtin` 或信号表身份，从过滤器移除信号表，以及缺失旧范围描述或兼容签名。
+旧 offset 没有 `capture_scope_manifest` 时，先用原过滤配置运行并保存新 offset，再调整范围。
+`recovery.restart.nonce` 会放弃整个任务的积压，不能替代扩表。
+
+=== 增量快照机制
+
+增量快照按主键范围分块，默认每块最多 1024 行。
+每个块通过源信号表的开启/关闭水位与 CDC 交错：读取块内行，观察水位之间的日志变更，移除被更新或删除的旧快照行，再输出剩余 `op=r` 记录。
+进度随 offset 保存，重启后可恢复。日志追赶慢会延长块完成时间，未观察到关闭水位时不能把缓存行提前当成最终结果发布。
+它不持有初始快照那种贯穿全流程的共享表锁，也不保证所有表处于同一个全库时刻。
+当前验收以声明主键的表为基础；普通无主键 CDC 支持不等于无主键增量快照支持。
+执行期间须保持表结构稳定，`incremental.snapshot.allow.schema.changes` 必须为 `false`。
+
+[id="dameng-signals"]
+=== 信号表配置、创建和触发
+
+设置 `signal.data.collection=APP.DBZ_SIGNAL`，将信号表纳入捕获规则，并确保其产生逻辑日志。
+每个独立 Connector 使用独立信号表，避免多个实例读取相同命令或互相消费水位。
+已有 offset 时不能直接添加或改名信号表绕过 capture_scope 检查，建议首次创建 Connector 时就配置。
+
+Task 在校验配置和 offset 后、发现快照表前检查信号表，不存在则自动创建；schema 必须已存在。
+自动创建需要相应 CREATE TABLE 权限。现有表不改结构、不清空记录，但必须可读，恰好具有按顺序排列的 `ID`、`TYPE`、`DATA` 三个 VARCHAR/NVARCHAR 列。
+创建或结构校验失败会阻止启动。Connector 还需插入水位的权限，`insert_delete` 策略需要 DELETE 权限。
+不授予 DDL 权限时可由 DBA 预创建：
+
+[source,sql]
+----
+CREATE TABLE APP.DBZ_SIGNAL (
+    ID VARCHAR(64) PRIMARY KEY,
+    TYPE VARCHAR(64) NOT NULL,
+    DATA VARCHAR(2000)
+);
+GRANT SELECT, INSERT, DELETE ON APP.DBZ_SIGNAL TO CDC_USER;
+----
+
+使用有写权限的账号提交一次性、唯一 ID 的命令：
+
+[source,sql]
+----
+INSERT INTO APP.DBZ_SIGNAL VALUES (
+    'customers-snapshot-001',
+    'execute-snapshot',
+    '{"type":"incremental","data-collections":["APP.CUSTOMERS"]}'
+);
+COMMIT;
+----
+
+检查 Task 日志、快照通知/指标和业务 Topic 的 `op=r`，不要仅凭 INSERT 成功认定快照完成。
+停止整个运行中的增量快照可使用公共信号动作：
+
+[source,sql]
+----
+INSERT INTO APP.DBZ_SIGNAL VALUES (
+    'customers-stop-001', 'stop-snapshot', '{"type":"incremental"}'
+);
+COMMIT;
+----
+
+停止动作不撤回已经发布的行。`pause-snapshot`、`resume-snapshot`、`additional-conditions` 和 Kafka/JMX/file 信号通道来自公共框架，但尚无本模块与源表基本流程同等范围的端到端验收，应先在目标环境验证。
+即使使用其他触发通道，当前达梦增量快照仍需要源信号表协调水位，不能只配 Kafka 信号 Topic 就省略它。
+
+[id="dameng-logminer"]
+== 日志挖掘与资源调优
+
+=== 窗口和事务
+
+Connector 只读取归档 REDO，未归档尾部会增加延迟。LSN 是日志位置，跨度不等于行数或字节数。
+
+[cols="2,3,5",options="header"]
+|===
+|策略 |配置 |行为
+|`archive_bytes`（默认） |`log.mining.window.max.bytes=67108864` |按完整归档文件 `V$ARCH_FILE.LEN` 选择前向窗口，默认软预算 64 MiB。
+|`fixed` |`log.mining.batch.size=1000` |按固定 LSN 跨度前进。
+|===
+
+文件预算包含已扫描部分和预分配空间，不等于实际 I/O 或堆占用。单文件、共享边界和事务重建可以超出预算；到归档尾部立即处理可读范围，不等凑满预算。
+所选文件 LEN 缺失或非正值时停止，可核查归档视图或显式使用 fixed。归档缺口、混入其他来源或重叠异常同样停止。
+
+未完成事务跨窗口保留，并固定安全重放起点。遇到跨窗口提交或回滚边界时，Connector 从最老安全位置重建事务，排除已回滚行，再按提交顺序发布。
+支持 SAVEPOINT 的有效结果恢复。长事务落盘后仍依赖旧归档，必须保留到安全重放位置推进。
+
+旧 adaptive 模式已删除。升级前移除 `log.mining.window.adaptive.enabled`、`log.mining.batch.size.min`、`log.mining.batch.size.max`、`log.mining.window.target.ms`，否则配置校验失败。
+要保留固定窗口，显式设置 `log.mining.window.strategy=fixed`。
+
+=== 内存与临时文件
+
+[cols="3,2,5",options="header"]
+|===
+|预算 |默认值 |超限处理
+|事务缓存估算内存 |64 MiB |将最大驻留事务写入临时文件；事务元数据不能落盘，耗尽时停止。
+|保留事务元数据条数 |1000000 |包含已提交待分发事务，超限停止。
+|单次运行的临时文件 |1 GiB |超限、I/O 失败或文件校验失败时停止。
+|单条 SQL_REDO |16 MiB UTF-16 payload |包含所有连续片段，拼接前检查；不能边拼接边落盘。
+|===
+
+事务内存预算不包括事件队列、JDBC、SQL 拼接和转换开销，不能作为 JVM 堆上限。
+`log.mining.buffer.spill.path` 应指向可写磁盘，运行中创建私有 `dameng-tx-*` 目录。临时文件含源数据；强制终止后，只清理已确认结束的运行目录。
+
+临时文件不用于重启恢复。新 Task 从 offset 重放归档，不能因缓存已落盘就删除旧归档。
+磁盘配额不包含其他 Task 或遗留文件，须另外监控剩余空间。
+旧 `log.mining.buffer.max.bytes`、`log.mining.buffer.max.records` 已废弃，设置只会 WARN 并忽略。
+
+=== 错误诊断
+
+Connector 校验 LogMiner 必需字段、长 SQL 分片顺序、对象身份和回滚标记；缺片、乱序、SQL 缺失或冲突时不发布该窗口。
+未支持操作仅在能够确定属于已排除表时过滤，否则停止。错误日志提供 LSN、XID、对象编号和归档位置。
+DDL/DML 解析失败还会输出完整拼接后的 SQL_REDO 和堆栈，日志应按源数据权限保护。
+`DATA_OBJV#` 仅用于诊断与分片一致性检查，不能代替历史表结构。
+
+=== 调优顺序
+
+先用 <<dameng-monitoring,阶段指标>> 定位瓶颈，再一次调整一个参数：
+
+* 挖掘慢：比较文件预算与 fixed 窗口、fetch 大小和归档延迟。大窗口可能增加分发等待与临时磁盘占用。
+* 重建多：检查长事务和回滚负载，保留足够归档。
+* 分发或队列等待长：检查 Worker、Converter/SMT、Producer 和 Broker。
+* Producer buffer wait 高且每请求记录少：评估 batch.size、linger.ms 和压缩；请求本身慢时先查 Broker、网络和限流。
+
+增加缓存只能承接突发，无法弥补下游持续吞吐不足。有限性能对照见 `src/test/regression-history.adoc`，不作为生产吞吐承诺。
+
+[id="dameng-ddl"]
+== DDL 与结构演进
+
+受支持的 DDL 更新 schema history，再按历史结构解码后续行。默认遇到未知语法或无法安全更新结构的语句时停止，重启会再次遇到该位置。
+
+=== 支持的表操作
+
+[cols="2,5,4",options="header"]
+|===
+|操作 |行为 |限制
+|CREATE、ALTER、RENAME、DROP |维护列顺序、类型、默认值、约束名和对象编号；列重命名同步更新主键。支持条件建表/删表、条件增删列和分组加列。 |未知 TABLE 子句、虚拟/生成列、HUGE 和分布式表拒绝。
+|主键与约束 |主键变化更新事件 Key。UNIQUE、外键、CHECK 保存名称供后续约束操作。 |UNIQUE 不自动作为事件主键；DISABLE 及启停约束的状态转换不支持。
+|整表 TRUNCATE |保留列和约束，按 `op=t` 处理。 |默认 `skipped.operations=t` 不发布数据事件；TRUNCATE CASCADE 拒绝。
+|行存储分区表 |支持 HASH/RANGE/LIST、interval、多级子分区和模板。DML 按根表采集。 |合并/拆分后的搬迁 INSERT/DELETE 仍发送，不去重；删除、清空和交换见下节。
+|CTAS |读取目标表在线字典；无需源表 history，复制行按 INSERT 日志采集。 |首次消费时目标表须仍存在且保持创建时结构。对象编号核对无法检测所有后续 ALTER，存在结构超前风险；字典失败不受通用 DDL 跳过控制。
+|LIKE |从 history 中的源表复制列及可空性。 |不继承主键、默认值、identity 或注释；源表必须已有历史定义。
+|临时表、外部表 |只保存表类型、对象编号和生命周期，跳过数据快照、增量快照、行事件及 schema 通知。 |外部文件变化不是 CDC；外部表仅支持创建、删除及重命名历史处理，其他 ALTER、TRUNCATE 和从它推导列的 LIKE 拒绝。
+|物化视图与辅助表 |识别普通物化视图/日志的创建、修改、刷新和删除；默认过滤内部表。 |不采集物化视图数据，`FOR ... ON PREBUILT TABLE` 拒绝；预建表须显式排除。
+|===
+
+DM 8.1.3.162 删除主键后，原主键列恢复可空；删除复合主键中的一列则移除整个主键，其余列保留非空，历史模型按此更新。
+普通列定义支持裸 `ENCRYPT` 标记；算法、密钥和 MANUAL 等扩展选项未支持。加密列仍需目标环境 CDC 验证。
+高级日志 `WITH/WITHOUT/TRUNCATE ADVANCED LOG` 不支持。
+
+=== 非表 DDL
+
+已识别且不改变行结构的索引、普通视图、序列、同义词、权限、COMMENT、用户/空 schema、目录、DOMAIN、PROFILE、CONTEXT、LIBRARY、STAT、LINK、OPERATOR、表空间和程序定义按 `NO_TABLE_CHANGE` 跳过。
+程序内容和查询体不在 Connector 中执行，但会校验词法、括号和完整语句边界，不能把尾随表 DDL 一起跳过。
+
+COMMENT 不刷新事件 schema 的注释。`REVOKE ... CASCADE` 回收权限，`DROP PROFILE ... CASCADE` 解除关联，`DROP TYPE BODY ... CASCADE` 删除实现，均不等于下节的对象级联删除。
+类型定义可识别不代表对象列可采集；权限回收也可能使后续查询失败。
+`CREATE SCHEMA` 内嵌对象、`DROP CLASS BODY ... CASCADE` 和单条 redo 中的复合表 DDL 不支持。
+
+`RESTORE TABLE` 的数据替换可能没有逐行 DML redo，不能依赖 CDC 同步这类恢复结果。
+多个 LOCAL 归档目的地可能造成重复注册并报 `-2848 cannot add duplicate logfile`，当前尚未支持。
+
+=== 删除、清空与交换的专用策略
+
+以下操作可能没有完整的逐行删除/插入日志，默认报错。三个开关均默认为 `false`，通用 `skip.unparseable.ddl` 不绕过它们。
+
+[cols="3,4,5",options="header"]
+|===
+|参数 |可显式忽略的语句 |后果
+|`partition.drop.ignore` |DROP/TRUNCATE PARTITION、SUBPARTITION，含 TRUNCATE TABLE ... PARTITION。 |忽略分区删除/清空，不补下游删除；见 <<dameng-ddl,专用 DDL 策略>>。
+|`partition.exchange.ignore` |完整解析且两端身份可确认的 EXCHANGE PARTITION/SUBPARTITION。 |忽略身份可确认的分区交换，不补交换行；见 <<dameng-ddl,专用 DDL 策略>>。
+|`cascade.drop.ignore` |DROP USER/SCHEMA/DOMAIN/TYPE/CLASS ... CASCADE。 |忽略五类对象级联删除，保留旧模型；见 <<dameng-ddl,专用 DDL 策略>>。
+|===
+
+EXCHANGE 两端都不在当前采集或历史维护范围时直接过滤；任意一端相关则使用专用策略。
+`WITH TABLE` 未限定 schema 时，必须由对象 ID 和历史表名确认，不能用根表的 schema 猜测。无法确认任意一端时始终失败，建议显式限定两端 schema。
+
+对象级联删除在表过滤前处理，因为依赖对象可能跨 schema。`cascade.drop.ignore` 不授权 `TRUNCATE CASCADE` 或 `DROP CLASS BODY ... CASCADE`；`DROP TABLE ... CASCADE CONSTRAINTS` 仍按普通删表处理。
+
+开启忽略会 WARN 并继续，日志含操作、对象、LSN 和完整 SQL。offset 持久化越过后，关闭参数不会补发历史，也不会自动修复下游或结构，必要时重新对账并建立基线。
+
+=== 通用 DDL 跳过
+
+`schema.history.internal.skip.unparseable.ddl=true` 可跳过流式 DDL 分析或历史模型规划中的解析/不支持错误。
+跳过时保留旧模型，不写该语句的 history，不读取当前 JDBC 结构兜底；WARN 记录 LSN、对象编号、SQL 和原因。
+
+该参数不跳过 SQL 缺失、已识别捕获表 DDL 的无效对象编号、CTAS 字典失败、DML 解析、归档读取或身份校验错误。上述三个专用策略仍独立生效。
+
+[WARNING]
+====
+跳过真实结构变化可能导致后续行解析失败，或按旧列位置/类型输出错误数据。只在确认语句影响并接受后果后启用；持久化越过后无法靠关闭参数自动恢复。
+====
+
+=== 词法和默认值
+
+支持双引号转义、N/Q 字符串、行注释、块注释和 hint；嵌套块注释按 `NESTED_C_STYLE_COMMENT` 处理。
+8.1.3.162 应使用 `BACKSLASH_ESCAPE=0`，值为 1 的字符串语义尚未适配。标识符规则见 <<dameng-case-sensitive,大小写>>。
+MySQL 可执行注释、`#` 注释和 PostgreSQL dollar string 不作为原生语法处理。
+
+常量默认值按历史列类型转换，表达式如 CURRENT_TIMESTAMP 不在 Connector 中求值。
+`0x` 二进制常量支持奇数位左补零，定长 BINARY 在右侧补零；输出遵循 `binary.handling.mode`。
+DDL 语法覆盖和实库可执行性分别记录在模块 `src/test/testing.adoc` 的官方 SQL 语料章节。
+
+[id="dameng-data-types"]
+== 数据类型映射
+
+以下为原生模式的默认映射。以实际 JDBC 物理类型和历史 DDL 为依据，不能只按另一数据库同名声明推断。
+JSON 中 bytes 常呈 Base64；Decimal 的 JSON 表示还取决于 Converter 设置，不能把 Connect BYTES 直接理解为业务字符串。
+
+[cols="3,2,5",options="header"]
+|===
+|达梦类型/物理类型 |Connect 类型 |逻辑含义与限制
+|BOOLEAN、单比特 BIT |BOOLEAN |true/false；多比特声明须按实际物理映射验收。
+|TINYINT、SMALLINT |INT8、INT16 |分别对应 8/16 位整型，输入边界以达梦实际接受范围为准。
+|INT/INTEGER、BIGINT |INT32、INT64 |保持整型值；消费端不要用不能精确表示大整数的浮点类型接收 BIGINT。
+|REAL / 物理 REAL 的 FLOAT(p) |FLOAT32 |日志文本可能损失精度，见下文。
+|DOUBLE / 物理 DOUBLE 或 FLOAT |FLOAT64 |FLOAT(p) 声明在不同模式/参数下可能映射不同，不按名字固定为单精度。
+|DECIMAL(p,s)、NUMERIC(p,s)、NUMBER(p,s) |BYTES |默认逻辑类型 `org.apache.kafka.connect.data.Decimal`，保留 scale；string/double 模式改为 STRING/FLOAT64。
+|未限定精度的 NUMBER/NUMERIC/DECIMAL |STRUCT |元数据长度非正且 precise 模式时使用 `io.debezium.data.VariableScaleDecimal`，包含 scale 和非标度 value。
+|CHAR、NCHAR、VARCHAR、VARCHAR2、NVARCHAR 等字符列 |STRING |CHAR/NCHAR 保留定长空格；按历史字节长度和字符集补齐 LogMiner 省略的 padding。
+|BINARY、VARBINARY、RAW |BYTES |或按 binary.handling.mode 输出 Base64、URL-safe Base64、hex 字符串。仅二进制列将日志 `'0x'` 解为空数组，文本列仍为文字。
+|DATE |STRING |默认无逻辑类型名称，例如 `1965-02-03`；显式选择 isostring 时使用 `io.debezium.time.IsoDate` 和末尾 `Z`，adaptive 时输出距 1970-01-01 的 INT32 天数。
+|TIME(p) |STRING |默认无逻辑类型名称，例如 `12:34:56.123456`；小数秒以实际存储值为准。显式 isostring 使用 `io.debezium.time.IsoTime`。
+|TIMESTAMP/DATETIME |STRING |默认无逻辑类型和时区，例如 `2026-09-24 12:34:56.123456`。isostring 使用 `io.debezium.time.IsoTimestamp`，其他模式见下节。
+|TIME WITH TIME ZONE |STRING |`io.debezium.time.ZonedTime`，归一 UTC，跨午夜不附加日期；版本精度限制见下节。
+|TIMESTAMP WITH TIME ZONE |STRING |`io.debezium.time.ZonedTimestamp`，保留瞬时和小数秒，归一 UTC，不保留最初写入的偏移格式。
+|INTERVAL |STRING |`io.debezium.time.Interval` version 1，保留年/月或日/时间单位及精确十进制秒。
+|CLOB / BLOB |STRING / BYTES |快照可读取完整内容；流式行外值不完整时输出不可用占位值，非完整 LOB CDC。
+|TIMESTAMP WITH LOCAL TIME ZONE |STRING |`io.debezium.time.ZonedTimestamp`，采用 <<dameng-local-time-zone-policy,有损 UTC 假设>>。
+|复杂对象、集合及无已验证映射的类型 |不支持 |报 schema 错误。ROWID 普通列仅验证 JDBC 基线与 CRUD，历史 CREATE TABLE 仍拒绝。
+|===
+
+=== Decimal、时间和默认值
+
+`decimal.handling.mode=precise` 保留固定 scale 或 VariableScaleDecimal；string 输出十进制文本；double 可能损失有效位。
+
+普通 DATE、TIME、TIMESTAMP 默认 `time.precision.mode=sqlstring`，输出无逻辑类型名称、无时区的 STRING。
+需要旧 ISO 格式时显式配置 `isostring`。升级或修改此参数会改变字段 schema 和表示，下游须先适配。
+在 adaptive、adaptive_time_microseconds 下，普通 `TIMESTAMP(7..9)` 固定输出 IsoTimestamp；显式 nanoseconds 仍受 INT64 纳秒范围限制，connect 只保留毫秒。
+
+日期按原始日历文本解析。LogMiner 的 TO_DATE/TO_TIMESTAMP/TO_TIMESTAMP_TZ 只接受已实现的 ISO 格式，不支持的表达式或格式会失败。
+INTERVAL 保留年/月与日/时间单位，不近似折算：例如 `INTERVAL '12-3' YEAR TO MONTH` 输出 `P12Y3M0DT0H0M0S`。
+支持 13 种 qualifier、leading precision 1～9、fractional seconds 0～6；不合法范围拒绝，不悄悄舍入。
+
+=== 一致性限制
+
+[cols="2,5",options="header"]
+|===
+|类型或路径 |限制
+|REAL/FLOAT/DOUBLE |已测构建的 LogMiner 文本可能舍入到六位小数，小非零值变零、相邻值合并。Converter 或 BigDecimal 无法还原日志已丢失的位。
+|TIME WITH TIME ZONE |旧 8.1.2.128 丢失小数秒；已测 8.1.3.162 的 TIME(1..6) WITH TIME ZONE 严格矩阵通过。
+|BLOB/CLOB |快照可读完整内容；流式 OUT_BLOB/OUT_CLOB 或省略的 before 值使用 `unavailable.value.placeholder`。显式 SQL NULL 仍为 null。
+|浮点 JSON 往返 |Kafka 4.3.0 schema-enabled JsonConverter 解码会将负零变正零、NaN 变零。原始 Connect 值与数据库实际存储位严格比较；JSON 测试仅允许零符号不同。
+|数据库输入边界 |声明精度、极大 NUMBER、多字节 CHAR 和 NaN 是否接受，取决于具体构建与驱动，应以实际存储值验收。
+|===
+
+[[dameng-local-time-zone-policy]]
+=== TIMESTAMP WITH LOCAL TIME ZONE
+
+此类型采用有损 UTC 假设：快照使用 UTC JDBC 会话，streaming 将 LogMiner 的本地时间文本直接标为 UTC。
+LogMiner 未提供足够的原写入会话时区信息，因此带 `Z` 的输出不保证是真实时间点，也不保证与快照相同。
+
+例如在 `+05:45` 会话写入 `2000-02-29 12:34:56.123456`，已测快照值为 `2000-02-29T06:49:56.123456Z`，流式值为 `2000-02-29T12:34:56.123456Z`。
+需要真实 instant 或跨阶段时间去重时，应避免依赖此字段；外部固定时区也不能保证所有历史 UPDATE/DELETE 的 before 值可恢复。
+该策略不适用于普通 TIMESTAMP 或 TIMESTAMP WITH TIME ZONE。
+
+=== 自定义转换器
+
+`converters` 扩展数据库类型到 Connect 值；Worker 的 key/value.converter 负责序列化；SMT 负责记录变换。
+自定义实现需验证 Key、schema、默认值、快照和 streaming 的一致性，不能恢复 LogMiner 已丢失的精度或时区。
+
+[id="dameng-topics"]
+== Topic 与消息用途
+
+默认 Topic 命名保留实际 schema/table 名称大小写。原生模式未加引号的标识符通常为大写，例如 `dameng.APP.CUSTOMERS`。
+以下以 `topic.prefix=dameng` 为例；自定义 TopicNamingStrategy 或 SMT 会改变相应业务 Topic 路由。
+
+[cols="2,3,4",options="header"]
+|===
+|用途 |默认名称或配置 |内容与要求
+|业务变更 |`dameng.APP.CUSTOMERS` |每表一个 Topic；包含该表快照和 CDC 事件。
+|结构变更事件 |`dameng` |供消费者读取的结构通知，默认 `include.schema.changes=true`。关闭不会停止内部历史记录。
+|内部 schema history |`schema.history.internal.kafka.topic` 指定 |恢复历史结构和紧急恢复基线。每个 Connector 独占，单分区、完整保留，不配置 compaction。
+|事务元数据 |`dameng.transaction` |启用 `provide.transaction.metadata=true` 后发布 BEGIN/END。
+|心跳 |`__debezium-heartbeat.dameng` |启用心跳后发布；帮助提交安全 offset，不代表业务表发生变化。
+|Worker 内部配置、offset、状态 |Worker 的 `config.storage.topic`、`offset.storage.topic`、`status.storage.topic` |由 Kafka Connect 管理，可由同一 Worker 集群的多个 Connector 共享。不能与 schema history 混用。
+|通知 |`notification.sink.topic.name` |启用 sink 通知通道时使用；不是业务 CDC 或 schema history。
+|===
+
+schema history 的分区数和保留规则关系到恢复正确性。业务 Topic 的分区数不增加达梦 Task 数；多分区也不提供表级全局顺序。
+字段名调整改变事件 schema，不会重命名数据库列。Topic 路由 SMT 只作用于发出的记录，不替代内部 history 配置。
+
+[id="dameng-events"]
+== 数据变更事件
+
+下面展示默认 envelope 的 JSON 形态，省略部分可选字段。示例数值仅用于说明，不是实测 LSN。
+`JsonConverter` 的 `schemas.enable=false` 时直接得到下面的业务对象；设为 `true` 时外层包含 `schema` 和 `payload`。
+Connect 的字段类型与最终 JSON、Avro 或其他序列化形式需要分开理解。
+
+=== Key、Value 与 source
+
+假设 `APP.CUSTOMERS(ID INT PRIMARY KEY, NAME VARCHAR(100))` 新增一行。
+Key 为：
+
+[source,json]
+----
+{"ID": 1}
+----
+
+Value 为：
+
+[source,json]
+----
+{
+  "before": null,
+  "after": {"ID": 1, "NAME": "Alice"},
+  "source": {
+    "version": "3.6.4-xingchuang-kafka2.0",
+    "connector": "dameng",
+    "name": "dameng",
+    "ts_ms": 1792368000000,
+    "snapshot": "false",
+    "db": "DAMENG",
+    "schema": "APP",
+    "table": "CUSTOMERS",
+    "lsn": 1000,
+    "change_lsn": 1100,
+    "commit_lsn": 1200,
+    "event_serial_no": 0,
+    "transaction_id": "example-transaction"
+  },
+  "op": "c",
+  "ts_ms": 1792368000100,
+  "transaction": null
+}
+----
+
+[cols="2,5",options="header"]
+|===
+|字段 |含义
+|`before` / `after` |行级变更前后镜像；NULL 行镜像与某列值为 NULL 不同。行外 LOB 可能使用不可用占位值。
+|`op` |`r` 快照读取、`c` 插入、`u` 更新、`d` 删除、`t` 清空表。
+|`source.name` / `source.db` |逻辑来源 `topic.prefix` / 配置的 `database.dbname`。后者不是 PDB、schema 或 JDBC URL 的路由参数。
+|`source.schema` / `source.table` |历史位置对应的逻辑表标识。
+|`source.lsn` |安全重放起点，可能被长事务固定；不是已经挖到的最大 LSN。
+|`source.change_lsn` |这条变更对应的日志位置。
+|`source.commit_lsn` |事务提交位置；同事务的多条变更可能相同。
+|`source.event_serial_no` |事务内记录序号，从零开始，可因过滤而不连续；不是 Kafka offset，也不等同于 transaction.total_order。
+|`source.transaction_id` |达梦日志事务标识。不能假设跨数据库重建或所有恢复世代永久唯一。
+|`source.snapshot` |是否来自快照；可能为 `true`、`last`、`incremental` 或 `false`，按实际快照阶段解释。
+|`source.ts_ms` / 顶层 `ts_ms` |来源时间 / Connector 构造事件的时间；公共 envelope 还可提供 `ts_us`、`ts_ns`。它们不是 Kafka 消费确认时间，时钟差和来源时间粒度影响延迟计算。
+|`transaction` |启用事务元数据时的事务 ID 和事件顺序；默认未启用。
+|===
+
+复合主键的 Key 包含全部主键列。唯一索引或 UNIQUE 约束不会自动当作主键。
+无主键表支持普通 snapshot 和 CDC，默认 Key 为 null；用 `message.key.columns` 可以指定业务键，但必须自行保证非空、唯一和稳定。
+这不会创建数据库主键，也不等于该表具备已验证的增量快照条件。
+
+=== 操作类型和下游处理
+
+[cols="1,3,3,4",options="header"]
+|===
+|op |before |after |说明
+|`r` |null |当前行 |初始/增量快照读取，不表示数据库刚刚 INSERT。
+|`c` |null |新增行 |INSERT 的提交结果。
+|`u` |旧行 |新行 |更新的行级镜像；一条批量 SQL 可能产生多个事件。
+|`d` |旧行 |null |删除事件，消费者应按 Key 删除其副本。
+|`t` |null |null |TRUNCATE 表级事件，Key 为 null；默认 `skipped.operations=t` 不发布。需要时显式设置 `skipped.operations` 为空字符串。
+|===
+
+以下展示 update、delete 和 truncate 的 envelope 片段，实际消息还包含 source 和时间字段：
+
+[source,json]
+----
+[
+  {"before":{"ID":1,"NAME":"Alice"},"after":{"ID":1,"NAME":"Bob"},"op":"u"},
+  {"before":{"ID":1,"NAME":"Bob"},"after":null,"op":"d"},
+  {"before":null,"after":null,"op":"t"}
+]
+----
+
+默认 `tombstones.on.delete=true`：有 Key 的 DELETE 后再发送相同 Key、Kafka value 为 null 的 tombstone，供 compacted Topic 清理旧值。
+tombstone 不是 `{"after":null}`，也没有 envelope。无 Key 表无法依赖主键压缩清理。
+主键更新产生旧 Key 的 delete、可选 tombstone、新 Key 的 create，公共发射器还提供新旧 Key 关联 header。
+中途重启可能重发旧 Key 的 delete。下游应使用幂等写入/删除，不要只靠统计消息数推断数据库当前行数。
+TRUNCATE 没有逐行 Key，多分区消费时不能假定其与所有分区内消息具有全局顺序。
+
+=== 结构变更事件与内部 history
+
+启用 `include.schema.changes` 时，结构变更 Topic 的 Key 包含 `databaseName`，Value 包含 `source`、`ts_ms`、`databaseName`、`schemaName`、`ddl` 和 `tableChanges`。
+`tableChanges` 描述 CREATE、ALTER、DROP 等结构变化，包含列、主键和表标识等结构化信息；它不是一条业务行。
+初始结构快照也会生成结构事件，DDL 文本可能为空。消费者应读取结构化定义，不能假定每条记录都有可执行 SQL。
+
+[source,json]
+----
+{"databaseName":"DAMENG"}
+----
+
+单次加列事件的字段片段示意：
+
+[source,json]
+----
+{
+  "databaseName": "DAMENG",
+  "schemaName": "APP",
+  "ddl": "ALTER TABLE APP.CUSTOMERS ADD EMAIL VARCHAR(200)"
+}
+----
+
+内部 history 保存恢复所需的完整结构、位置和达梦对象属性；结构变更 Topic 是面向消费者的通知，两者不可互相替代。
+不要从业务结构事件手工拼出 history，也不要清空 history 后保留旧 offset 继续采集。
+
+=== 事务元数据
+
+设置 `provide.transaction.metadata=true` 后，事务 Topic 发布如下形式的边界消息，业务事件附带 transaction 字段：
+
+[source,json]
+----
+[
+  {"status":"BEGIN","id":"example-transaction","ts_ms":1792368000000,"event_count":null,"data_collections":null},
+  {"status":"END","id":"example-transaction","ts_ms":1792368000100,"event_count":2,
+   "data_collections":[{"data_collection":"APP.CUSTOMERS","event_count":2}]}
+]
+----
+
+[source,json]
+----
+{"id":"example-transaction","total_order":1,"data_collection_order":1}
+----
+
+`total_order` 是已发出的事务数据事件顺序，`data_collection_order` 是该表在事务内的事件顺序，均从 1 开始。
+计数反映捕获范围和事件处理路径，不等于数据库原始事务修改的所有行数，也不包含 tombstone 作为新的行变更。
+达梦 BEGIN 的时间来自所处理的日志行，END 使用 Connector 处理时间；不能将两者差直接当作数据库事务执行时长。
+事务元数据提供下游重组依据，但不会让多个业务 Topic 的消息自动原子可见。
+
 [id="dameng-configuration"]
 == Connector 参数参考
 
@@ -1212,9 +929,9 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`database.password` |无 |CDC 账号密码；生产配置应使用 Worker 支持的外部配置提供器。
 |`database.dbname` |`DAMENG` |事件 source.db 和结构事件中的数据库名称，不选择 schema/PDB，不改变连接目标。
 |`database.failover.hosts` |空 |同一主备数据库的 `host:port` 列表，IPv6 写 `[address]:port`；覆盖 hostname/port，仅选择 OPEN PRIMARY。
-|`database.standby.hosts` |空 |备库采集的 `host:port` 列表；非空时 LogMiner、初始快照和增量快照读取仅连接 OPEN STANDBY，现有数据库地址用于主库信号写入和初始快照锁。可与 failover.hosts 使用相同的成员列表，驱动按角色选择。两条连接使用相同的数据库账号，须属于同一物理数据库家族。
-|`database.standby.replay.timeout.ms` |`60000` |等待备库完成主库快照边界或低水位重放的最长毫秒数，必须为正。超时按连接恢复策略重试，不确认未完成的快照。JDBC 单次查询仍受 socket/query timeout 约束。
-|`database.connection.adapter` |`logminer` |当前唯一适配器；不支持 JNI、XStream 或 OpenLogReplicator 配置值。
+|`database.standby.hosts` |空 |备库采集地址列表；现有数据库地址连接主库写信号和加快照锁。两组使用相同账号，须为同一物理数据库家族。见 <<dameng-standby-capture,备库采集>>。
+|`database.standby.replay.timeout.ms` |`60000` |等待备库追平快照或水位边界的预算，必须为正；超时不确认未完成快照。
+|`database.connection.adapter` |`logminer` |唯一可用值为 logminer。
 |`database.socket.timeout.ms` |`600000` |正整数，映射 DM JDBC socketTimeout；不能另配 `database.socketTimeout`。
 |`database.query.timeout.ms` |`600000` |非负，正数向上取整为秒后应用 statement timeout；0 关闭语句超时，但不关闭网络和快照总时限。
 |===
@@ -1229,16 +946,16 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`table.include.list` |未指定 |允许捕获的完整 schema.table 正则列表；未指定时仍受 schema 和内置表规则约束。
 |`table.exclude.list` |未指定 |排除的 schema.table 正则列表，不与 include 同用。
 |`table.ignore.builtin` |`true` |应用内置系统表过滤，包括 `MTAB$_`、`MLOG$_`、`BMJ$_` 内部表；false 不会自动授予目录权限或启用内部表 CDC。
-|`partition.drop.ignore` |`false` |显式忽略 DROP PARTITION/SUBPARTITION、TRUNCATE PARTITION/SUBPARTITION（含 TRUNCATE TABLE ... PARTITION）并继续后续 DML，不补发逐行删除或整表清空事件；被移除的旧数据可能留在下游。默认报错并打印 SQL 和开启此参数的提示，通用 skip.unparseable.ddl 不绕过此限制；不允许分区 EXCHANGE。
-|`partition.exchange.ignore` |`false` |显式忽略完整解析且两端身份可确认的 EXCHANGE PARTITION/SUBPARTITION。两端均在处理范围外时直接跳过；任意一端采集或仍需维护历史时默认报错，开启后 WARN 并保留旧模型和对象映射，不补发交换造成的行事件或整表清空。下游可能缺失或残留数据，后续解码可能失败或错误。通用 skip.unparseable.ddl 不绕过此策略，也不能绕过无法确认的交换范围。
-|`cascade.drop.ignore` |`false` |显式忽略完整解析的 DROP USER/SCHEMA/DOMAIN/TYPE/CLASS ... CASCADE。默认报错，通用 skip.unparseable.ddl 不绕过此限制。开启后 WARN 并保留旧历史模型和对象 ID 映射，不补发依赖表删除；下游数据可能残留，同名重建、对象 ID 复用及后续解析可能失败或产生错误数据。关闭后不自动修复已跳过的变化。不允许复合语句或 cascading TRUNCATE，不改变现有受支持的 TABLE、TYPE BODY 和 PROFILE 操作。
+|`partition.drop.ignore` |`false` |忽略分区删除/清空，不补下游删除；见 <<dameng-ddl,专用 DDL 策略>>。
+|`partition.exchange.ignore` |`false` |忽略身份可确认的分区交换，不补交换行；见 <<dameng-ddl,专用 DDL 策略>>。
+|`cascade.drop.ignore` |`false` |忽略五类对象级联删除，保留旧模型；见 <<dameng-ddl,专用 DDL 策略>>。
 |`database.include.list`、`database.exclude.list` |未指定 |公共过滤输入，也计入 capture_scope；达梦表标识无 catalog，不用它们代替 schema/table 过滤或选择数据库。
 |`column.include.list` |未指定 |保留的 schema.table.column 正则列表；不要排除事件 Key 必需的列。
 |`column.exclude.list` |未指定 |排除的列正则列表，不与 column.include.list 同用；不能保证绕过包含不支持类型的历史 DDL。
 |`message.key.columns` |未指定 |如 `APP.CUSTOMERS:ID,REGION;APP.ORDERS:ID`，为匹配表指定事件 Key 列；不创建数据库约束。
 |`column.mask.with.<n>.chars` |未指定 |值是要屏蔽的字符列正则列表，输出 n 个星号；元数据模板名为 `column.mask.with.(d+).chars`。
 |`column.truncate.to.<n>.chars` |未指定 |值是字符列正则列表，截断到 n 个字符；元数据模板名为 `column.truncate.to.(d+).chars`。
-|`column.mask.hash.<algorithm>.with.salt.<salt>` |未指定 |按指定算法和 salt 对匹配字符列做哈希；模板 `column.mask.hash.([^.]+).with.salt.(.+)`。hash.v2 形式由公共列映射支持，用于更稳定的跨系统哈希规则；部署前核验目标格式。
+|`column.mask.hash.<algorithm>.with.salt.<salt>` |未指定 |对匹配字符列加盐哈希；公共框架另支持 hash.v2。模板为 `column.mask.hash.([^.]+).with.salt.(.+)`。
 |`column.propagate.source.type` |未指定 |为匹配列增加来源类型/长度/scale schema 参数，值为列正则列表。
 |`datatype.propagate.source.type` |未指定 |按来源类型正则选择需传播元数据的列。
 |`include.schema.changes` |`true` |发布消费者可见的结构事件；false 不会关闭内部 history 或 DDL 校验。
@@ -1276,7 +993,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |参数 |元数据默认值 |当前达梦边界
 |`snapshot.lock.timeout.ms` |`10000` |未用于达梦 LOCK TABLE；使用查询超时和 snapshot.max.duration.ms。
 |`snapshot.max.threads.multiplier` |`1` |公共并行分块参数，达梦未提供该并行快照能力。
-|`legacy.snapshot.max.threads` |`false` |公共旧并行模式开关，不能绕过单线程限制。
+|`internal.legacy.snapshot.max.threads` |`false` |内部旧并行模式开关，不能绕过单线程限制。
 |`snapshot.mode.custom.name` |未指定 |达梦 snapshot.mode 不接受 custom，自定义 snapshotter 未提供。
 |`snapshot.mode.configuration.based.snapshot.data` |`false` |configuration_based 模式未提供，不能用此字段切换快照数据。
 |`snapshot.mode.configuration.based.snapshot.schema` |`false` |同上，不改变达梦结构基线流程。
@@ -1316,7 +1033,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`queue.provider.type` |`memory` |公共队列实现选择；当前默认内存队列，非默认实现须单独验证。
 |`heartbeat.interval.ms` |`0` |0 关闭心跳，正值启用周期心跳，帮助低变更量来源提交安全位置；不强制数据库归档。
 |`heartbeat.action.query` |未指定 |心跳时通过独立数据库连接执行的 SQL，可产生源端活动；需要权限且应避免修改业务数据，不替代归档策略。
-|`heartbeat.topics.prefix` |`__debezium-heartbeat` |旧公共配置字段；当前默认 TopicNamingStrategy 使用下文 topic.heartbeat.prefix，不依赖此旧字段定制名称。
+|`heartbeat.topics.prefix` |`__debezium-heartbeat` |旧字段；默认命名策略使用 `topic.heartbeat.prefix`。
 |`errors.max.retries` |`-1` |可重试连接错误的重试上限，-1 不限制、0 不重试；不使 DDL、缺档、结构或磁盘错误变为可重试。
 |`retriable.restart.connector.wait.ms` |`10000` |可重试错误后重新启动 Task 的等待。
 |`event.processing.failure.handling.mode` |`fail` |公共分发处理策略 fail/warn/skip；warn/skip 可能丢事件，且不能绕过分发之前的达梦 DDL/DML、归档和身份校验。
@@ -1330,7 +1047,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |===
 |参数 |默认值 |用途与限制
 |`decimal.handling.mode` |`precise` |precise 保留 Decimal/VariableScaleDecimal；string 输出文本；double 使用浮点，可能损失精度。
-|`time.precision.mode` |`sqlstring` |DATE、TIME 和普通 TIMESTAMP 默认输出无时区的 SQL 风格 STRING，例如 `2026-09-24 12:34:56.123456`，无时间逻辑类型名称。显式配置 isostring、adaptive、adaptive_time_microseconds、connect、microseconds 或 nanoseconds 可选择其他映射；达梦对高精度普通 TIMESTAMP 的 adaptive 映射仍固定使用 IsoTimestamp。connect 只保留毫秒，显式 nanoseconds 受 INT64 范围限制。
+|`time.precision.mode` |`sqlstring` |普通日期时间默认 SQL 风格 STRING；其他模式与高精度例外见 <<dameng-data-types,类型映射>>。
 |`binary.handling.mode` |`bytes` |bytes、base64、base64-url-safe、hex；改变二进制字段的 schema/表示。
 |`unavailable.value.placeholder` |`__debezium_unavailable_value` |日志没有完整 LOB 内容时的标记；BLOB 标记先按 UTF-8 编码，再应用 binary.handling.mode。不是 SQL NULL。
 |`schema.name.adjustment.mode` |`none` |调整事件 schema 名称，可用 avro/avro_unicode 等公共规则；不改变数据库标识符。
@@ -1360,7 +1077,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`schema.history.internal.kafka.query.timeout.ms` |`3000` |Kafka 管理查询超时。
 |`schema.history.internal.kafka.create.timeout.ms` |`30000` |创建 history Topic 超时；Kafka 2.0 应提前创建，不靠延长超时修复协议差异。
 |`schema.history.internal.kafka.buffer.batch.size` |`1024` |history 启用批量缓冲期间的记录数阈值，不是业务事件 batch。
-|`schema.history.internal.skip.unparseable.ddl` |`false` |显式设为 true 时跳过实时 DDL 分析/历史模型规划的解析或不支持错误，WARN 记录 LSN、DATA_OBJ#、SQL 和原因。保留旧模型且不写该语句的 history；可能造成后续数据错误。不绕过 partition.drop.ignore、partition.exchange.ignore 和 cascade.drop.ignore 专用策略，不跳过缺失 SQL、已识别捕获表 DDL 的无效对象编号、归档、DML 或捕获范围/身份校验错误。详见 <<dameng-ddl,DDL 支持边界>>。
+|`schema.history.internal.skip.unparseable.ddl` |`false` |跳过流式 DDL 解析/规划错误，可能使结构与数据失真；不绕过专用策略。边界见 <<dameng-ddl,DDL 跳过>>。
 |`schema.history.internal.store.only.captured.tables.ddl` |`false` |当前达梦初始 history 仍仅记录采集表；false 不增加未捕获表结构。
 |`schema.history.internal.store.only.captured.databases.ddl` |`false` |公共 history 字段，不提供达梦跨数据库捕获能力。
 |`schema.history.internal.producer.*` |客户端默认及 history 固定设置 |history producer 参数透传，如安全协议、SASL/SSL 配置；不影响 Worker 业务 producer。
@@ -1387,7 +1104,7 @@ Worker 认证、业务 producer 认证和 history 客户端认证分别核对，
 |`signal.kafka.groupId` |`kafka-signal` |Kafka 信号消费者组。
 |`signal.kafka.poll.timeout.ms` |`0` |Kafka 信号 poll 超时。
 |`signal.consumer.*` |Kafka 客户端默认 |信号 consumer 透传配置，与 history consumer 分开。
-|`signal.file` |无，file 通道必填 |公共文件信号通道读取的 JSON Lines 文件；当前达梦未完成该通道的专项端到端验收，仍需源信号表协调增量水位。
+|`signal.file` |无，file 通道必填 |文件信号的 JSON Lines 路径；该通道未专项验收，增量快照仍需源信号表水位。
 |`notification.enabled.channels` |未指定 |通知通道列表，如 log、jmx、sink；未指定时不输出这些通道通知，不影响 CDC。
 |`notification.sink.topic.name` |未指定 |sink 通知 Topic，通过 Worker 输出；选用前核验 Topic 权限和消息格式。
 |===
@@ -1406,10 +1123,10 @@ Worker 认证、业务 producer 认证和 history 客户端认证分别核对，
 |`memory.management.schemas.class` |`io.debezium.relational.ConcurrentMapTableMappingStorage` |公共 schema 映射存储；不是事务临时落盘配置。
 |`memory.management.tables.class` |`io.debezium.relational.ConcurrentMapTableMappingStorage` |公共表模型存储；不是业务表数据缓存。
 |`custom.metric.tags` |未指定 |`key=value` 逗号列表，加入 JMX 名称；Exporter 规则需匹配实际名称。
-|`statistics.metrics.enabled` |`true` |公共统计指标开关，不能代替采集正确性验证。
-|`guardrail.collections.max` |`0` |公共捕获表数量保护阈值，0 不限制；不是自动拆分 Task。
+|`statistics.metrics.enabled` |`true` |公共统计指标开关。
+|`guardrail.collections.max` |`0` |捕获表数量保护阈值，0 不限制。
 |`guardrail.collections.limit.action` |`warn` |超过公共阈值时 warn 或 fail。
-|`custom.sanitize.pattern` |公共敏感键正则 |控制配置日志中哪些键值脱敏；默认覆盖 secret、password、JAAS、认证凭据及连接串等，不用于业务列脱敏，不建议削弱。
+|`custom.sanitize.pattern` |公共敏感键正则 |配置日志脱敏键正则，默认覆盖密码、secret、JAAS 和连接串；不用于业务列脱敏。
 |`openlineage.integration.enabled` |`false` |公共 OpenLineage 集成开关，本模块未完成外部服务端到端验收。
 |`openlineage.integration.config.file.path` |`./openlineage.yml` |集成配置文件路径。
 |`openlineage.integration.job.namespace` |未指定 |OpenLineage 作业命名空间。
@@ -1426,78 +1143,67 @@ Worker 认证、业务 producer 认证和 history 客户端认证分别核对，
 [id="dameng-recovery"]
 == 恢复、升级与主备切换
 
-=== 普通重启
+=== 普通重启与升级
 
-正常恢复保留 Connector 身份、offset、完整 schema history 和所需归档，从已确认位置重放。
-`source.lsn` 可能小于最近发出的 `change_lsn`，因为未完成事务仍需要旧日志。
-临时落盘缓存不能替代归档，进程重启不会将旧临时文件作为恢复状态。
-所需归档已清理、history 缺失或身份不一致时停止；修改为 `no_data` 不会自动跳过错误位置。
+保留 Connector 名称、`topic.prefix`、offset、独占的完整 schema history 和所需归档，从确认位置重放。
+`source.lsn` 可能被长事务固定；本地临时缓存不参与重启恢复。缺档、history 缺失或身份不匹配时停止，`no_data` 不会跳过故障位置。
 
-升级前保存 REST 配置、读取 Worker 支持的 `GET /connectors/{name}/offsets`、保留旧镜像和存储。
-缺失 `compatibility_signature` 或 `capture_scope` 的旧 offset 不能通过填入当前参数伪造历史解释条件。
-通常使用新 Connector 名称、`topic.prefix` 和 history Topic，再显式 `snapshot.mode=initial` 重建；默认 no_data 不会补齐存量。
-同一个逻辑来源不能同时由两个实例共享同一 history 并写入不同恢复状态。
+升级前保存 REST 配置、Worker 支持的 `GET /connectors/{name}/offsets` 结果和旧镜像。
+缺失 `compatibility_signature` 或 `capture_scope` 的旧 offset 不能手工补造；通常用新 Connector 名称、`topic.prefix`、history Topic 和显式 `snapshot.mode=initial` 建立基线。
+回滚镜像前也须确认旧插件能读取新 offset/history 格式。
 
-=== 显式从当前 LSN 重建基线
+=== 显式放弃积压并重建基线
 
-故障处置允许主动丢弃旧积压时，在完整 REST 配置中设置新 nonce：
+仅在接受历史丢失时，在完整 REST 配置中设置新的 nonce：
 
 [source,json]
 ----
 {
-  "recovery.restart.nonce": "incident-20261019-01",
+  "recovery.restart.nonce": "incident-20261105-01",
   "recovery.incremental.snapshot.auto.start": "false"
 }
 ----
 
-这会跳过旧位置到新基线之间的历史变化，包括中间更新、删除和旧主键，不是无损恢复。
-默认只恢复 CDC，即使配置了 `snapshot.mode=initial` 也不扫描存量行。需要时由人工稍后发送增量快照信号。
-设置 auto.start 为 true 才会在新基线创建时安排已捕获业务表的增量快照，要求信号表及全部目标表的主键；单独改该开关不会重新安排。
-nonce 最多 128 个不含空白的可打印 ASCII 字符；同值、移除或空白均恢复当前世代，使用历史中较早的旧值会拒绝。
-`initial_only` 不能与恢复 nonce 组合；Connector 名称、source partition 和业务 Topic 不因 nonce 改变。
+新 nonce 跳过旧位置到当前基线的历史，包括更新、删除和旧主键；即使 `snapshot.mode=initial`，也不扫描存量行。
+需要补数时稍后发送增量快照信号，或将 auto.start 设为 true，在新基线创建时安排全部捕获业务表的补数；要求信号表和目标表主键。
+补数只读当前行，旧删除和旧主键仍须对账清理。
 
-恢复仍需共享锁、当前结构和对象编号，等待已写捕获表的事务结束后选择当前 LSN，持锁到基线持久化完成。
-因此不扫描行也可能等待长事务，且受快照总时限约束。之前只写其他表的事务可以在解锁后写入捕获表，其基线之后的部分正常采集，回滚重建不越过新基线。
-随后等待归档覆盖新 LSN，并保留新的安全重放范围。
+[cols="2,5",options="header"]
+|===
+|配置变化 |行为
+|新的非空 nonce |创建新世代。最多 128 个不含空白的可打印 ASCII 字符。
+|同值、移除或留空 |恢复当前世代，不再重选位置。
+|重用更早的 nonce |拒绝。
+|仅修改 auto.start |不触发新恢复或另一次补数。
+|`snapshot.mode=initial_only` |不能与恢复 nonce 组合。
+|===
 
-新世代的 nonce、完整结构、baseline offset、兼容签名和可选补数计划先持久化在一条 history 记录中，随后才允许事件确认新位置。
-Worker 尚未保存新业务 offset 就崩溃时，也从该 history 基线恢复，不重新选择更晚的起点；旧世代结构不会混入新世代。
-完整基线必须放得进单条 Kafka 消息，受 producer、Topic 和 Broker 大小限制；写入失败不会开始新 CDC，失败快照通知也不能确认不存在的基线。
-history 必须持久、完整、可读且由该 Connector 独占。数据库角色、身份和兼容检查继续生效。
-日志记录请求和新旧位置，JMX 暴露 `RecoveryNonce`、`RecoveryBaselineLsn`；重置指标不清除基线。
-
-增量快照只能补当前存在的行，无法发现跳过区间已经删除的行。下游仍可能保留陈旧行或旧主键，需对账或重建才能恢复精确副本。
+建立基线仍需共享锁，等待已写捕获表的事务结束，受 `snapshot.max.duration.ms` 限制。
+nonce、结构、offset 和可选补数计划先写入一条 history 记录，再允许确认新位置；崩溃后复用已持久化基线。
+完整基线须能放入单条 Kafka 消息，受 producer、Topic 和 Broker 大小限制。
+JMX 的 `RecoveryNonce`、`RecoveryBaselineLsn` 可确认当前世代。
 
 [id="dameng-primary-standby-recovery"]
 === 无 VIP 主备恢复
 
-成员必须属于同一数据库家族，单实例 `N_EP=1`，只允许一个可写主库，归档由 DM Data Guard 同步和管理。
-用 `database.failover.hosts=dm-a.example.com:5236,dm-b.example.com:5236` 替代单地址；Connector 不升主、不修复复制、不隔离旧主，也不把 endpoint 列表当作脑裂检测。
-官方架构依据为 https://eco.dameng.com/document/dm/zh-cn/pm/data-watch-overview.html[达梦数据守护说明]。
+配置 `database.failover.hosts=dm-a.example.com:5236,dm-b.example.com:5236`，成员须为同一物理数据库家族、`N_EP=1`，保持唯一 OPEN PRIMARY。
+驱动固定 `loginMode=1`、`loginStatus=4`、`rwSeparate=0`、`autoReconnect=0`、`switchTimes=1`、`switchInterval=200`，禁止冲突覆盖。
+重连由 Connector 按 `errors.max.retries` 管理，未确认事件可能重放。
 
-驱动使用服务组地址，并固定 `loginMode=1`、`loginStatus=4`、`rwSeparate=0`、`autoReconnect=0`、`switchTimes=1`、`switchInterval=200`。
-这些参数在建连时选择 OPEN PRIMARY，重连由 Connector 按确认的 offset/history 管理。禁止冲突覆盖、透明切库、自动重连别名和读写分离。
-连接失败或角色改变后，按 errors.max.retries 创建新会话并恢复，未确认事件可能重放。
+切换步骤：
 
-计划 switchover 前确认备库已应用所需 redo、两地址可达；DBA 用 DM 工具切换，检查恰好一个 PRIMARY/OPEN，实时归档通道健康。
-不改变地址列表、offset 或 history，观察 Task 和 OldestReplayLsn 恢复。
-主库故障时先隔离旧主写入，在确认所需日志已应用后执行非强制 takeover。
-没有可用主库时按重试策略等待；新主库落后、身份链缺失或归档分叉时停止，不能仅因其当前 LSN 较大就继续。
+. 确认备库已应用所需 redo，两端归档连续、地址可达。
+. DBA 执行 switchover；主库故障时先隔离旧主，再执行非强制 takeover。
+. 确认唯一 PRIMARY/OPEN 和实时归档健康，保留配置、offset/history，观察 Task 与 `OldestReplayLsn` 恢复。
 
-恢复校验 PERMANENT_MAGIC、与存储 database_magic 对应的 SYS.SYSOPENHISTORY 锚点、连续来源主库链，以及每次 open 的 applied LSN 是否覆盖已存 replay/change/commit 位置。
-offset 还保存 permanent_magic、primary_open_guid。挖掘中刷新身份，发布前锚点改变则放弃该窗口。
-DM open history 最多保留 128 条，锚点轮转丢失、时间戳排序歧义、应用 LSN 倒退或身份链不一致均拒绝恢复。
-保持数据库时钟同步，监控切换频率及归档保留；强制有损切换不在已验证范围。
-
-归档 DB_MAGIC 标识本地写入库，SRC_DB_MAGIC 标识 redo 来源，复制后两者可不同。
-校验整个文件的身份和范围，不仅检查窗口内部分；允许共享包含式端点，但拒绝更大重叠、缺口或错误分支。
-这些校验配合 DM 管理的归档，不认证人为混合的任意文件集合。
-旧单地址 offset 缺少主备锚点，不能只增加 failover.hosts 升级；通常需新身份、新 history 和显式 initial，或按已声明的有损恢复流程建立新基线。
+Connector 校验 PERMANENT_MAGIC、SYS.SYSOPENHISTORY 锚点、来源主库链和已应用 LSN。
+open history 最多 128 条；锚点丢失、时间戳排序歧义、应用 LSN 倒退或归档分叉均停止。高当前 LSN 不能代替这些检查。
+旧单地址 offset 没有主备锚点，不能仅添加 failover.hosts 升级，应新建身份/基线，或接受有损恢复。
 
 [id="dameng-standby-capture"]
-=== 备库采集与主库信号写入
+=== 备库采集
 
-使用支持备库 `DBMS_LOGMNR` 的数据库构建，在现有主库配置之外增加：
+使用支持备库 LogMiner 的构建，在主库地址配置之外增加：
 
 [source,json]
 ----
@@ -1505,48 +1211,26 @@ DM open history 最多保留 128 条，锚点轮转丢失、时间戳排序歧�
   "database.failover.hosts": "dm-a.example.com:5236,dm-b.example.com:5236",
   "database.standby.hosts": "dm-a.example.com:5236,dm-b.example.com:5236",
   "database.standby.replay.timeout.ms": "60000",
-  "snapshot.mode": "no_data",
   "signal.data.collection": "CDC.DBZ_SIGNAL"
 }
 ----
 
-这是任务配置片段。两组成员地址可相同：主库连接使用 `loginMode=1`，备库连接使用 `loginMode=2`，均要求 `loginStatus=4`，关闭驱动自动重连和读写分离。
-主库连接负责自动创建信号表、信号水位 INSERT/DELETE、配置的 heartbeat.action.query 以及初始快照的共享锁；LogMiner、表结构、对象编号和快照行数据从备库读取。
-用户发出的 execute-snapshot 信号也应插入主库，不能对备库执行 INSERT。初始快照即使从备库读取，仍会在主库持有共享锁，因此不能理解为对主库写入完全无影响。
-两条连接使用 database.user/password。账号在主库具有已说明的元数据、表 SELECT/锁及信号表写入权限，在备库具有动态视图、元数据、业务表读取与 LogMiner 权限；不允许写入任意其他数据库家族。
+两组列表可相同，驱动分别选择主库和备库，两条连接使用相同账号。
 
-流水线的安全边界为 `min(归档上界, V$RAPPLY_SYS.SLSN, V$RAPPLY_PARALLEL_INFO.RPKG_LSN)`。
-SLSN 表示确认允许重演的日志，RPKG_LSN 表示重演已经完成；备库刚收到但尚未确认或尚未重演的归档不能用于推进可发布位置。
-挖掘前后校验角色、数据库身份和重演边界。offset 的 database_magic/primary_open_guid 保存来源主库历史，归档 DB_MAGIC 仍检查实际读取成员，SRC_DB_MAGIC 检查来源链。
-来源主库变更时重启 Task，并从持久化 offset 重建事务缓存，不把旧主库未确认尾部带入新窗口。
+[cols="2,5",options="header"]
+|===
+|连接 |职责
+|主库（`loginMode=1`） |信号表创建、命令和水位 INSERT/DELETE、heartbeat.action.query、初始快照共享锁。
+|备库（`loginMode=2`） |LogMiner、结构和对象编号读取、初始与增量快照查询。
+|===
 
-初始快照先在主库锁住捕获表，再取主库 LSN，等待备库重演完成，随后从备库读取结构和数据，最后释放主库锁。
-`no_data` 使用相同的结构边界但不扫描存量行；recovery.restart.nonce 的新基线也遵循该边界。
-增量快照在主库提交低水位后，等待备库重演到该位置，结束备库之前的读事务，再读取分块，最后在主库提交高水位。
-这样低水位之前的删除和更新已经对备库查询可见，避免因为备库落后而补回陈旧行；窗口内变更继续由原有去重逻辑处理。
-两种 watermarking.strategy 均使用主库写连接。等待超时、连接中断或角色改变时，未完成的协调操作进入 Task 恢复，不把它当作成功完成的分块。
-备库增量快照的分块读取失败也不会走公共实现的跳表路径，不会把失败表记为已跳过后继续确认位置。可重试的连接故障受 errors.max.retries 控制，权限、SQL 超时等错误仍须处理原因后恢复。
+用户信号也必须写入主库。初始快照先锁主库、取主库 LSN、等备库追平，再读取备库，最后释放锁；因此仍影响主库写入。
+增量快照在主库提交低水位，等备库应用后读取块，再提交高水位，避免补回备库尚未删除的旧行。
 
-人工切换仍由 DBA 执行。列表包含两个成员时，Task 重建后分别选择新的主库和备库；只有固定单节点地址时需由运维更新对应配置。
-已实测的切换瞬态包括 JDBC `6091`（无符合角色的成员）、`-6508 / 25000`（事务被 MOUNT 中断）及 `-510 / 22000`（查询时处于 MOUNT）；在启用主备身份检查的连接配置下，按既有重试预算重建会话。
-没有可用 OPEN STANDBY 时不会偷偷转成主库采集。例如只有两个节点且主库宕机、备库升主之后，须等另一个成员重新成为可用备库才可恢复备库采集。
-缺失的归档、丢失的历史锚点、强制有损切换和 DMDSC 仍按现有规则拒绝。服务需要读取本地的 RPKG_LSN，不能用主库中存在反馈延迟的 V$ARCH_APPLY_INFO 替代。
+挖掘上界为 `min(归档上界, V$RAPPLY_SYS.SLSN, V$RAPPLY_PARALLEL_INFO.RPKG_LSN)`，并检查角色和来源身份。
+等待超过 `database.standby.replay.timeout.ms`、角色改变或连接失败时，不确认未完成快照；读取失败不跳表。连接类错误按重试预算恢复，权限和 SQL 超时需处理原因。
 
-==== 主备采集验收范围（2026-10-21）
-
-使用 `dameng:8.1.3.162-20240621-rev232765`，服务器构建 `03134284194-20240621-232765-20108`、JDBC 驱动 `8.1.3.140`。
-真实备份还原的两个单实例成员使用 UTF-8、COMPATIBLE_MODE=0、CASE_SENSITIVE=1；没有使用两个独立初始化的数据库模拟物理主备。
-`DamengStandbyIT` 验证备库初始快照与 CRUD、主库信号表自动创建、两种增量快照水位策略、持久化快照完成位置、Task 重启、人工切换和备库重启，以及跨窗口事务落盘恢复、部分/完整回滚和 restart nonce。
-`DamengPrimaryStandbyIT` 还验证主库采集切换、切回、非强制接管，以及初始快照中途切换时主库读取/备库读取两条路径的恢复。
-初始快照被打断后允许重复发送已有行，不承诺 exactly-once。
-
-本轮 `BUILD SUCCESS`：1503 个单元用例、2 个架构检查和 118 个选定数据库集成调用全部通过，0 失败、0 错误、0 跳过。
-本轮独立采集的行覆盖率为 4354/4466，*97.49%*；分支覆盖率为 2769/3038，91.15%。95% 行覆盖率门槛保持启用，格式与 Checkstyle 通过。
-日志、仅本轮 XML 报告、覆盖率和执行清单保存在 `debezium-connector-dameng/target/standby-acceptance-20261021/`，测试说明中保留具体选择范围。
-
-单机 CASE_SENSITIVE=0/1 回归通过，不代表已经验证两种大小写模式与所有主备、字段、兼容模式和字符集的组合。
-复制延迟下并发修改与增量快照的完整故障注入矩阵尚未执行；DMDSC、强制有损接管仍不支持。
-本轮没有重跑完整字段边界矩阵、压测或独立 Kafka Connect Worker，也未重新构建或替换现有 Docker 镜像；<<dameng-regression-813162,升级回归>>中记录的字段和词法缺陷仍然有效，不能把本次主备验收当作整体生产验收。
+切换后 Task 重选主备节点。没有 OPEN STANDBY 时停止等待，不回退到主库采集；两节点中备库升主后，须有另一个可用备库才能恢复。
 
 [id="dameng-monitoring"]
 == 监控、日志与 Grafana
@@ -1555,7 +1239,7 @@ SLSN 表示确认允许重演的日志，RPKG_LSN 表示重演已经完成；备
 
 MBean 通常为 `debezium.dameng:type=connector-metrics,context=<context>,server=<topic.prefix>`，另加 custom.metric.tags。
 context 包括 snapshot、streaming、schema-history。标签中的 server 是 topic.prefix，不一定等于 Connect Connector 名称。
-JMX 暴露、Exporter 映射和 Grafana 展示是三层：有 JMX 字段不代表现有面板已经画出每一项。
+Exporter 只导出已配置的 JMX 属性，Grafana 使用导出指标和 recording rules。
 
 [cols="2,4,5",options="header"]
 |===
@@ -1563,7 +1247,7 @@ JMX 暴露、Exporter 映射和 Grafana 展示是三层：有 JMX 字段不代�
 |公共事件/队列 |TotalNumberOfEventsSeen、NumberOfEventsFiltered、NumberOfErroneousEvents、CapturedTables、QueueTotalCapacity、QueueRemainingCapacity、CurrentQueueSizeInBytes |已观察/过滤/错误事件和队列情况，不等于下游已确认条数；容量限制与当前占用分开看。
 |streaming |Connected、MilliSecondsBehindSource、SourceEventPosition、LastTransactionId、NumberOfCommittedTransactions |来源状态、事件时间差和位置。事件时间差不能替代归档积压或端到端消费延迟。
 |snapshot |SnapshotRunning、SnapshotCompleted、SnapshotAborted、RemainingTableCount、RowsScanned、SnapshotDurationInSeconds |快照阶段、扫描行数及耗时；no_data 没有存量行事件是预期行为。
-|增量快照 |IncrementalSnapshotRunning、IncrementalSnapshotPaused、IncrementalSnapshotPhase、IncrementalSnapshotCurrentTable、IncrementalSnapshotRemainingTableCount、IncrementalSnapshotRowsScanned、IncrementalSnapshotRowsEnqueued、IncrementalSnapshotWindowsCompleted |独立增量快照运行/暂停、当前表/阶段和 Task 生命周期累计计数；另有查询、水位确认和发送耗时，详见下节。公共 ChunkId、ChunkFrom/To、TableFrom/To 仍可从 JMX 读取，不是独立线程数量。
+|增量快照 |IncrementalSnapshot*；公共 ChunkId、ChunkFrom/To、TableFrom/To |独立阶段、当前表、计数和耗时见下表。
 |schema-history |Status、RecoveryStartTime、ChangesRecovered、ChangesApplied、MilliSecondsSinceLastAppliedChange、MilliSecondsSinceLastRecoveredChange |STOPPED/RECOVERING/RUNNING 和结构恢复进度；时间字段按各自单位读取，RecoveryStartTime 为 epoch 秒。
 |===
 
@@ -1609,9 +1293,7 @@ reset 清除完成结果，但保留尚未释放事务的活动锁状态；重�
 [id="dameng-incremental-snapshot-monitoring"]
 === 增量快照进度与性能指标
 
-增量快照使用 `context=snapshot` 下独立的 `IncrementalSnapshot*` 属性，不需要新增连接参数。
-公共 `SnapshotRunning`、`RemainingTableCount` 等来自共用进度监听器，不能仅凭这些值区分初始和增量快照；共享表锁指标仅对应初始/结构快照持锁过程。
-Grafana 的「Incremental Snapshot · 增量快照」区域独立展示当前表、阶段、剩余表数、读取与入队速度、Task 累计计数及每块耗时。
+使用 `context=snapshot` 下的 `IncrementalSnapshot*` 属性。初始与增量快照共用部分公共指标，应以下列独立属性区分阶段。
 
 [cols="3,4,6",options="header"]
 |===
@@ -1630,56 +1312,29 @@ Grafana 的「Incremental Snapshot · 增量快照」区域独立展示当前表
 |`IncrementalSnapshotLastEmitDurationMillis` |`last_emit_duration_seconds` |最近完成本块缓存发送耗时，含转换、分发及队列等待；不含 Kafka 确认，进行中的发送不提前更新。
 |===
 
-表中 Prometheus 后缀均添加 `dameng_incremental_snapshot_` 前缀。
-导出规则将毫秒换算为秒；字符串通过属性值生成 phase/table 标签，规则关闭 cache，避免阶段或表变化后仍沿用旧标签。
-所有指标带 context 和 server，Prometheus 再附加 namespace、pod、job、instance 等抓取目标标签。
-累计 counter 跨本 Task 的多次增量快照，Task 重启清零；不是本次快照或当前表的完成行数。
-读取多于入队可能来自 CDC 去重、过滤或重新读取，不能直接把两者差值判定为丢数。
+表中 Prometheus 后缀加 `dameng_incremental_snapshot_`，毫秒转换为秒。counter 累计整个 Task 生命周期，重启归零；读取数含重读和去重，入队数不等于 Kafka 确认数。
+`dameng:incremental_snapshot_scan_rate_rows` 和 `dameng:incremental_snapshot_enqueue_rate_rows` 使用两分钟 rate，表示行/秒。短阶段可能在抓取间隔中被漏过，剩余表数不能换算为剩余行数或 ETA。
 
-recording rules 新增 `dameng:incremental_snapshot_scan_rate_rows` 与 `dameng:incremental_snapshot_enqueue_rate_rows`，分别对读取和入队 counter 使用两分钟 rate，单位行/秒。
-规则不合并 server 或 Worker，保留所有源和抓取标签；可见 counter reset 由 rate 处理，至少两个样本才有值。
-块式更新和 rate 窗口会平滑或形成脉冲，暂停后短期仍可能显示先前两分钟的平均速度。
-面板对运行期速度和最近耗时使用独立 running 标志过滤，任务完成后隐藏陈旧结果；最近耗时在活动任务中仍保留上一块结果，不能当成实时阶段计时。
-累计卡片仍显示 Task 生命周期总量，Prometheus 中的历史曲线按其存储保留策略保留。
-没有可靠总行数时不计算完成百分比或预计结束时间。
+按当前阶段排查：
 
-一次块处理按准备 OPEN、查询、写 CLOSE、等待 CLOSE 进入 CDC、发送缓存串行推进。
-preparing 还可能包含写入 OPEN、主库提交、备库回放屏障以及读取前的准备，不完全包含在查询/CLOSE/发送三个最近耗时之内，三者不能当作完整阶段耗时占比。
-当前阶段和当前表按抓取时刻采样，短阶段可能不可见。
-定位慢速时按以下方向检查：
+* preparing：主库信号写入、提交和备库回放屏障。
+* reading：主键索引、分块 SQL、JDBC 取数与类型转换。
+* waiting_close：归档延迟、备库回放、LogMiner 和分发等待。
+* emitting：事件队列、Worker 与下游发送压力。
 
-* reading 长：查主键/复合键索引、实际分块 SQL 与执行计划、JDBC 网络取数和类型转换；分别验证 snapshot.fetch.size 与 incremental.snapshot.chunk.size。
-* waiting_close 长：查信号提交、归档可见性、备库安全回放边界、LogMiner 窗口扫描和分发。归档扫描积压为零不能排除此类等待，因为扫描上界不等于 CLOSE 已被处理。
-* emitting 长：查事件队列满等待、Worker、序列化/SMT、Producer 请求延迟及 Broker；入队与 Producer 等待可能重叠，不能相加作为总耗时。
-* preparing 长：检查 OPEN 写入权限/提交、主库连接及备库回放屏障日志，不要只盯着 LogMiner 积压。
+增大 `incremental.snapshot.chunk.size` 可摊薄水位成本，同时增加去重缓存和单块停顿，应结合行宽与堆预算验证。
 
-更大的 chunk.size 可摊薄固定水位开销，同时增加去重缓存、单次查询/发送停顿和 CDC 延迟。用相同负载单参数对照，结合行宽和堆预算验证，不能保证按块大小等比例提速。
-更新这一功能必须部署含新埋点的 Connector JAR 或镜像，同时更新 Exporter YAML、Prometheus rules 和 Grafana JSON。
-只更新面板无法从旧 Connector 获取新属性；只更新 JAR 而不更新 Exporter 则不会导出对应 Prometheus series。
-Kubernetes 使用 PodMonitor 时继续沿用原抓取端口与标签选择器，重新应用本目录的 PrometheusRule 即可加载两个新 recording rules；同一 Prometheus 只部署一份共享规则。
+=== Prometheus 与 Grafana
 
-=== 配置 Prometheus Agent
-
-监控资源位于仓库 `debezium-connector-dameng/docker/monitoring/`。Agent 1.4.0、Exporter YAML、recording rules、Grafana JSON 是可执行部署资源，使用说明集中在这里。
-当前 Docker 镜像内置 `/opt/jmx/jmx_prometheus_javaagent-1.4.0.jar` 和 `/opt/jmx/jmx-exporter.yaml`，并通过默认 `KAFKA_OPTS` 启用 `9404/metrics`。
-运行时无需挂载 Agent JAR 或默认配置。构建机准备 Agent 的命令如下；脚本校验官方发行 SHA-256，Docker 构建时也会再次校验：
+部署资源位于 `debezium-connector-dameng/docker/monitoring/`。默认镜像内置 Agent 1.4.0 和 `jmx-exporter.yaml`，通过 `KAFKA_OPTS` 启用 `9404/metrics`，运行时无需另挂载 JAR。
+Compose 发布 9404 端口后可检查：
 
 [source,shell]
 ----
-bash debezium-connector-dameng/docker/monitoring/fetch-agent.sh
+curl -fsS http://localhost:9404/metrics
 ----
 
-使用内置默认配置时，Compose 只需发布监控端口。Prometheus 与 Connect 在同一 Docker 网络时，可以直接访问容器的 9404 端口，无需发布到宿主机：
-
-[source,yaml]
-----
-services:
-  dameng-connect:
-    ports:
-      - "9404:9404"
-----
-
-若 Compose 显式设置 `KAFKA_OPTS`，会覆盖镜像默认值；合并其他 JVM 参数时保留如下 Agent 参数，且只保留一份：
+显式设置 `KAFKA_OPTS` 会覆盖镜像默认值，增加 JVM 参数时保留一份：
 
 [source,yaml]
 ----
@@ -1687,10 +1342,10 @@ environment:
   KAFKA_OPTS: "-javaagent:/opt/jmx/jmx_prometheus_javaagent-1.4.0.jar=9404:/opt/jmx/jmx-exporter.yaml -Duser.timezone=UTC"
 ----
 
-设置 `KAFKA_OPTS: ""` 可关闭 Agent。需要自定义指标规则时，可只读挂载自己的 YAML 覆盖 `/opt/jmx/jmx-exporter.yaml`；Grafana 面板和 Prometheus rules 仍分别交给 Grafana、Prometheus 加载。
-从旧 Compose 迁移时，可以删除 Agent JAR 和默认 YAML 的两个 bind mount。保留旧挂载会覆盖镜像内置文件，宿主机文件路径仍必须存在；内网部署不应保留原开发机的绝对路径。
-改变 javaagent 启动参数需要重建 Worker 容器；Connector 配置和 offset 依赖 Kafka 内部 Topic 保留，不存储在容器可写层。
-Prometheus 与 Connect 同网络时可用下面抓取配置；不同网络时改为可达地址，不能照抄本机 localhost：
+设为空字符串可关闭 Agent。自定义 Exporter 规则可只读覆盖 `/opt/jmx/jmx-exporter.yaml`；旧 bind mount 会覆盖镜像内置版本，迁移时应核对。
+修改 javaagent 启动参数需重建 Worker 容器。
+
+Prometheus 示例，目标地址须从 Prometheus 可达：
 
 [source,yaml]
 ----
@@ -1703,26 +1358,14 @@ rule_files:
   - /etc/prometheus/dameng/prometheus-rules.yaml
 ----
 
-挂载对应 rules 文件。Exporter 输出检查：
+挂载同目录的 `prometheus-rules.yaml`，将 `dameng-cdc-dashboard.json` 导入 Grafana 并选择 Prometheus 数据源。
+自动加载可使用 `grafana-provider.yaml`，面板 UID 为 `dameng-cdc-overview`。
+「源标识」对应 `topic.prefix`，「Connect 任务」对应 REST 名称，应选中同一任务；JVM 指标属于整个 Worker。
+UI 修改面板后须导出回源码，否则 provisioning 加载可能覆盖修改。
 
-[source,shell]
-----
-curl -fsS http://localhost:9404/metrics
-----
+==== Kubernetes / Prometheus Operator
 
-=== Kubernetes 与 Prometheus Operator
-
-Kubernetes Worker 容器需要保留镜像中的 javaagent 启动参数，并在 Pod 模板声明指标端口：
-
-[source,yaml]
-----
-ports:
-  - name: metrics
-    containerPort: 9404
-    protocol: TCP
-----
-
-`docker/monitoring/kubernetes/pod-monitor.yaml` 提供 PodMonitor 样例，`prometheus-rule.yaml` 提供 Operator 的 PrometheusRule 样例。Pod 模板要有同名 `metrics` 容器端口，并让 PodMonitor 的 `spec.selector.matchLabels` 与 Pod 标签一致。将 PodMonitor 中的目标命名空间改为 Connect 所在命名空间后应用：
+Pod 声明 `metrics:9404` 容器端口，按实际标签和命名空间修改样例后应用：
 
 [source,shell]
 ----
@@ -1730,63 +1373,21 @@ kubectl apply -n debezium -f debezium-connector-dameng/docker/monitoring/kuberne
 kubectl apply -n debezium -f debezium-connector-dameng/docker/monitoring/kubernetes/prometheus-rule.yaml
 ----
 
-Prometheus Operator 的 Prometheus 资源必须通过 `podMonitorSelector` 选中 PodMonitor 标签，并通过 `podMonitorNamespaceSelector` 覆盖 PodMonitor 所在命名空间；PodMonitor 自身的 `spec.namespaceSelector` 决定要抓取哪些 Pod 命名空间。否则资源存在也不会产生 scrape target。还要让 `ruleSelector` 匹配 PrometheusRule 的 `app.kubernetes.io/name: dameng-connect` 标签，并让 `ruleNamespaceSelector` 覆盖其命名空间，否则 `dameng:scan_backlog_lsn` 等 recording rule 不会生成。按集群现有的标签约定修改样例，不要假设所有发行版都使用相同的 Helm release 标签。
+PodMonitor 的 selector/namespaceSelector 选择 Connect Pod；Prometheus 的 podMonitorSelector/podMonitorNamespaceSelector 选择 PodMonitor，ruleSelector/ruleNamespaceSelector 选择 PrometheusRule。
+一个 Prometheus 只部署一份共享规则，各命名空间可分别部署 PodMonitor，避免相同规则重复写入。
 
-检查当前 Prometheus 自定义资源实际使用的标签选择器：
+没有原始指标时查端口、Pod 标签和 Prometheus target 的 `up`；有原始指标但无积压/速率时，查 **Status → Rules** 中是否加载 `dameng-cdc`、Operator 规则选择器及 `rule_evaluation_failures_total`。
 
-[source,shell]
-----
-kubectl get prometheus -A -o json | jq -r '.items[] | [.metadata.namespace, .metadata.name, (.spec.podMonitorSelector|tostring), (.spec.ruleSelector|tostring), (.spec.podMonitorNamespaceSelector|tostring), (.spec.ruleNamespaceSelector|tostring)] | @tsv'
-----
+==== 指标判读
 
-把选择器与 PodMonitor、PrometheusRule 的 `metadata.labels` 以及它们所在的 Namespace 对齐。比如 selector 按 `app.kubernetes.io/name: dameng-connect` 选择资源时，两个资源都必须有该标签；如果 chart 通过 `release: <release-name>` 选择资源，就要给两个资源加上对应的 release 标签，并确保 namespace selector 覆盖 Connect 命名空间。
+* `LatestArchivedLsn - ScannedUpperLsn` 是扫描积压，`ScannedUpperLsn - OldestReplayLsn` 是重放跨度，均不是时间延迟。
+* LSN 是 gauge，不用 counter 的 rate；面板的两分钟窗口至少需要两个抓取样本。抓取间隔过长时须同步调整窗口。
+* 入队、dispatch 和 Producer 等待可能重叠，不能相加；队列空也可能是源空闲或挖掘慢。
+* Producer buffer wait 表示分配缓冲等待，batch-size、record-size、records-per-request 是滚动统计，空闲缺值不当作零。
+* 增量快照完成后面板隐藏旧阶段与最近耗时；累计卡片仍为 Task 总量，无数据不等于零。
 
-Grafana 的积压、速率、重放跨度和队列占用面板使用 `dameng:scan_backlog_lsn` 等 recording rules。若 Prometheus 查得到原始 `dameng_latest_archived_lsn` 与 `dameng_scanned_upper_lsn`，但 recording rule 没有值，检查 Prometheus UI 的 **Status → Rules** 是否加载 `dameng-cdc` 组、Operator 是否选择了 PrometheusRule，以及 `rule_evaluation_failures_total`。若原始指标也没有，检查 Pod 的 9404 端口、PodMonitor selector、Prometheus target 的 scrape 状态及 `up`。面板有 cluster、namespace、job 和 Worker 筛选；Prometheus 没有 `cluster` 标签时选择 All。
-
-一个 Prometheus 同时监控多个 Connect 实例时，部署一份共享的 `PrometheusRule` 即可。规则表达式会分别计算每个 scrape target 的指标，Prometheus 会保留 `cluster`、`namespace`、`pod`、`instance`、`job` 等目标标签，所以不同 Worker 的结果是不同 time series。不要在每个 Connect 命名空间都复制一份相同规则，同时又让同一个 Prometheus 选择这些规则；重复规则会重复计算，并可能对相同标签集写出重复记录。可把唯一的 PrometheusRule 放在统一的 monitoring 命名空间，并让 Prometheus 的 `ruleNamespaceSelector` 包含该命名空间；各 Connect 命名空间仍可分别部署 PodMonitor。
-
-现有本机 Compose 路径为 `~/projects/dockerfiles/kafka-2.0-3node-compose.yaml`，支持 DAMENG_MONITORING_DIR、DAMENG_CONNECT_METRICS_PORT、DAMENG_CONNECT_METRICS_BIND；迁移时按真实路径和抓取地址修改。
-YAML 规则更新可在 scrape 时重载；单文件 bind mount 注意替换 inode 可能让容器仍读旧文件。
-检查 jmx_config_reload_success_total、jmx_scrape_error 和新 series。新增埋点还要求新版公共队列/Connector JAR，只有规则变化不能补齐旧镜像的指标。
-
-=== Grafana 面板与判读
-
-Grafana 面板统一在 Connector 目录的 `debezium-connector-dameng/docker/monitoring/dameng-cdc-dashboard.json` 中维护，配套自动加载配置为同目录的 `grafana-provider.yaml`。
-导入该 JSON 并选择 Prometheus 数据源；或将 `grafana-provider.yaml` 放入容器的 `/etc/grafana/provisioning/dashboards` 目录，将 JSON 放入其配置的 `/etc/grafana/provisioning/dashboards/dameng` 目录。
-面板 UID 为 `dameng-cdc-overview`，文件夹为 Dameng CDC，默认可访问 `http://localhost:3000/d/dameng-cdc-overview?theme=dark`。
-筛选项包括数据源、Worker、source identifier 和 Connector 名称。Agent/JVM 无任务也可显示，达梦和业务 producer 指标需任务运行。事件吞吐、Worker CPU、挖掘阶段耗时和 JVM GC 面板使用固定 `rate(...[2m])`，避免 Grafana 数据源推算的 `$__rate_interval` 小于实际抓取间隔；与增量快照及 LSN 速率 recording rules 的窗口一致。每条时间序列在 2 分钟内仍须至少有两个成功抓取样本；实际抓取间隔接近或超过 2 分钟时，应先缩短抓取间隔，或相应增大面板及 recording rules 的窗口。
-每个指标图表标题旁的帮助说明均包含含义与单位、统计口径、判读边界、排查与优化方向，以及对应的 Prometheus 指标名。
-「源标识」是 `topic.prefix`，「Connect 任务」是 REST Connector 名称，两者目前独立筛选，应选中同一采集任务；JVM 指标始终属于整个 Worker。
-多源选择时注意概览卡片的 `sum`、`max`、`min` 聚合口径，具体见各卡片帮助。空闲、采样不足、Task 重启或规则未加载引起的无数据，不能直接当作零值。
-增量快照区新增独立运行/暂停、当前表/阶段、读取/入队速率与 Task 生命周期累计、完成块数及查询/CLOSE/发送耗时；每个图表的帮助说明统计边界和优化方向。
-窗口帮助分别解释文件预算和固定 LSN 策略，并提供文件预算/总 LEN 与文件数面板。调优应比较实际扫描速度、积压趋势与资源压力，不能仅看单轮耗时。旧自适应专属的 WindowIncreases、WindowDecreases、WindowAdjustmentReason 指标及扩缩次数导出规则已删除。
-Producer 帮助说明了约 8 KiB 记录与 16 KiB 批次的边界、64 KiB 批次和 `linger.ms` 的单参数对照方法，以及 Worker 的 `producer.*` 与任务级 `producer.override.*` 的区别。
-本地 `~/projects/docker-prometheus-grafana/` 下的文件是部署副本，修改 Connector 目录中的源文件后需同步部署副本；也可以让 Grafana Compose 直接只读挂载源文件到上述容器路径。
-通过 Grafana UI 修改面板后，需要导出 JSON 并更新 Connector 目录中的源文件；UI 修改不会写回 provisioning 文件，后续文件加载可能覆盖这些修改。
-只更新帮助文案时，重新导入同一 UID 的面板 JSON 或同步 Grafana provisioning 文件即可，无需重建 Connect 镜像或重启 CDC Task。
-
-归档上界减扫描上界是扫描积压；扫描上界减安全重放位置是 replay span，不是历史重读放大倍数。
-LSN 速率使用两分钟斜率，窗口中出现初始零值或回退时抑制；LSN 是 gauge，不能直接当作事件 counter 使用 rate。
-累计耗时使用 rate/increase；increase 在图表时间范围内估算并处理可见 reset，至少需要两个样本。
-producer buffer wait 是分配缓冲区的等待比例/累计时间，不是缓冲占用。records-per-request、batch-size、record-size 是滚动统计，不是配置值；空闲时缺值/NaN 不等于零。
-队列空可能是源空闲或挖掘慢，队列满常是下游压力。入队等待、producer wait 和 dispatch 有重叠，不能相加当总耗时。
-本地曾设置 Prometheus 15 天保留，这是部署参数，不是 Connector 保留策略。
-
-业务 producer 图表按 `connector-producer-<connector>-<task>` 选择客户端，不把内部 Topic 或 history producer 混入。
-Exporter 对 Kafka 3.9 的 bufferpool-wait-time-total 和 bufferpool-wait-time-ns-total 别名只导出前者，避免重复统计。
-
-[cols="4,6",options="header"]
-|===
-|Prometheus 指标 |解释
-|`kafka_producer_buffer_wait_ratio` |Kafka 指标时间窗内分配缓冲区的等待时间比例，不是缓冲占用比例。
-|`kafka_producer_buffer_wait_seconds_total` |bufferpool-wait-time-total 从纳秒换算的累计秒，producer 重建时归零。
-|`kafka_producer_records_per_request` |每请求记录数滚动均值。
-|`kafka_producer_batch_size_bytes` |实际每分区 batch 字节滚动均值，启用压缩时为压缩后大小，不是配置 batch.size。
-|`kafka_producer_record_size_bytes` |当前镜像使用的 Kafka 3.9.1 客户端按每批最大记录的未压缩大小估算上界取滚动平均，含记录开销；不是全部消息大小的算术平均，也不只是 JSON Value。
-|`dameng_queue_enqueue_wait_seconds_total` |Debezium 队列满等待累计秒，需新版公共队列和达梦 JAR；与 producer 等待分属不同阶段且可能重叠。
-|===
-
-recording rules 回归检查在 monitoring 目录执行：
+新增埋点需同步 Connector JAR、Exporter、Prometheus rules 和面板。只改面板不能从旧插件取得新指标。
+规则检查在 monitoring 目录执行：
 
 [source,shell]
 ----
@@ -1809,7 +1410,7 @@ docker run --rm --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules \
 |持续追不上归档 |前进/重建/dispatch 时间、入队等待、producer buffer wait |按瓶颈调窗口、fetch、batch/压缩/资源；不要只增加 max.queue.size。
 |持锁久或快照超时 |加锁日志、持锁指标、活跃写事务、快照数据量、下游队列 |结束不必要的长事务或调整维护窗口/预算。no_data 仍有结构锁；增量快照避免全程共享锁但需先建立结构基线。
 |旧 LSN 归档缺失 |最老 replay LSN 到当前的完整归档范围 |补回正确来源的归档后恢复，或采用新身份初始快照；接受历史损失时才显式 nonce。重复 restart 和 no_data 不会修复。
-|不支持 DDL，重启后再次失败 |错误 LSN、对象编号、SQL 位置、原始语句、兼容参数 |优先支持该历史语句或重建基线。明确接受结构丢失和错误数据风险时，可显式设 schema.history.internal.skip.unparseable.ddl=true 跳过实时解析/规划错误；查看 WARN 并核对后续数据。该设置不恢复被跳过的结构，不跳过后续 DML 错误。不要拿当前表结构替换旧定义。
+|不支持 DDL，重启后再次失败 |错误 LSN、原始 SQL、对象身份和兼容参数 |处理历史语句或重建基线；接受风险时按 <<dameng-ddl,DDL 策略>> 显式忽略，不用当前表定义替换旧结构。
 |capture_scope differs / 范围调整被拒绝 |旧范围描述、初始快照状态、数据库选择、信号表、table.ignore.builtin |普通表扩缩按范围调整机制处理；快照未完成或不支持的身份变更不能直接恢复。保留原配置排查，不填造签名或删除 history。
 |compatibility_signature 不匹配/缺失 |旧插件 offset、模式/词法/大小写参数、主备参数一致性 |不要填造签名。只有确认临时设置期间没生成受影响历史，才可还原设置恢复，否则新基线。
 |内存/事务数/单 SQL 上限或磁盘失败 |具体错误字段、SQL 连续片段、并发事务、落盘可用容量/权限 |调整对应资源或负载后重启；队列、事务缓存、单 SQL 是不同预算。不能跳过超限事务。
@@ -1823,36 +1424,49 @@ docker run --rm --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules \
 快照预算、SQL timeout、history 存储、落盘损坏、未知 DDL 和缺档等不是靠重连能修复的错误，应先处理原因。
 首次排查保存版本、配置键名、脱敏日志、LSN 和失败语句；不要把凭据、业务行或 history 全文直接公开。
 
-=== 新增表和多实例
-
-过滤规则已覆盖且启动后新建的表可通过 DDL 进入采集，前提是其类型/DDL 支持、权限和日志完整。
-原先排除的已有表通过 <<dameng-capture-scope-changes,范围调整>>建立独立启动边界和结构基线，原有表继续使用旧位置；不读取新增表边界之前的历史变化。
-增量快照用于已启用表补当前行，扩表不会默认自动触发，也不能用它恢复被排除期间的删除和中间变化。
-同一 Worker 集群有多个 Worker 只提高调度容错，不增加单个达梦 Connector 的 Task 数。多 Worker 重平衡和 Broker 故障不应从单 Worker 测试推断已全部验收。
-
-=== 安全与升级
-
-REST API 的网络访问、认证与代理策略由部署管理；凭据用配置提供器，临时文件、offset 和 history 按源数据敏感级别保护。
-数据库参数由 DBA 配置，Connector 不自动开启归档。自动建信号表只影响显式配置的信号表，不修改业务表。
-数据库驱动 TLS、Kafka SASL/SSL、配置提供器和运行平台变化都应独立验收，不能照搬 Oracle Wallet 配置。
-回滚插件镜像也要考虑新插件写出的 offset/history 格式是否可被旧插件理解；保留镜像不等于可以无条件回滚状态。
+多个 Worker 只提高调度容错，不增加单个 Connector 的 Task 数。扩缩表见 <<dameng-capture-scope-changes,范围调整>>，升级与回滚见 <<dameng-recovery,恢复>>。
+REST 访问由部署层保护；凭据使用配置提供器，日志、临时文件、offset 和 history 按源数据权限保护。
 
 [id="dameng-testing"]
-== 构建、测试和发布验收
+== 构建、测试与发布
 
-使用根 POM 要求的构建 JDK（当前至少 JDK 21）和 `./mvnw`，Connector 字节码目标 Java 17 不表示全部构建工具可以在 JDK 17 运行。
-改 Java 代码后先 process-sources 格式化；`-am` 包含当前分支本地模块，避免单独构建从远端找不到同版本内部依赖。
+使用 JDK 21 或更高版本和根目录 `./mvnw`。Java 17 是 Connector 字节码目标，不是构建 JDK 要求。
+改 Java 代码后先格式化；`-am` 包含本地依赖模块：
 
 [source,shell]
 ----
 ./mvnw -pl debezium-connector-dameng -am process-sources
-./mvnw -pl debezium-connector-dameng -am install -DskipITs
+./mvnw -pl debezium-connector-dameng -am test
+./mvnw -pl debezium-connector-dameng -am verify -Pdameng-tests
 ----
 
-数据库集成测试使用 Testcontainers；不传 dameng.hostname 时启动自有数据库，测试会配置其归档并清理容器。
-默认 DM 镜像为本地导入的 `dameng:8.1.3.162-20240621-rev232765`，完整构建为 `1-3-162-2024.06.21-232765-20108-ENT`。
-普通数据库、主备、独立 Connect 进程、性能与探测用例使用同一默认镜像；兼容模式矩阵也继承这个默认值。
-该镜像不是公开仓库中的可自动下载标签，首次运行前须导入原始离线包并添加标签：
+Surefire 在 test 阶段执行单元测试，Failsafe 在 integration-test 执行集成测试、verify 检查结果。达梦默认跳过 IT，须选择测试 profile。
+
+[cols="3,5",options="header"]
+|===
+|Profile |范围
+|`dameng-tests` |普通数据库与嵌入式引擎回归。
+|`dameng-probes` |手动能力诊断，只选择 `*ProbeIT`。
+|`dameng-performance-tests,assembly` |`*BenchmarkIT` / `*PerformanceIT`，须满足各自启用条件；生成器场景使用 `-Ddameng.perf.enabled=true`。
+|`dameng-connect-tests,assembly` |插件打包和独立 Kafka Connect Worker 回归。
+|`dameng-all-tests` |普通、诊断和性能类，排除独立 Connect；不绕过启用条件。
+|===
+
+单元测试用 `-Dtest=类名`，集成测试用 `-Dit.test=类名`。例如：
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng -am verify -Pdameng-tests \
+  -Dit.test=DamengConnectorIT -Dfailsafe.failIfNoSpecifiedTests=false
+----
+
+嵌套套件与其他类的 `#方法` 筛选应分次执行，混合到一个 it.test 值可能漏跑嵌套套件。核对 XML 中实际执行的类与数量。
+报告位于模块 `target/surefire-reports/`、`target/failsafe-reports/`，不同调用会残留历史 XML；同一工作区串行运行。
+覆盖率使用 `clean verify -Pdameng-tests,dameng-coverage` 收集新数据，95% 行覆盖率门槛不替代行为验收。
+
+=== 测试环境
+
+数据库测试使用 Docker/Testcontainers，默认创建、配置并清理自己的数据库。以下 DM 镜像须先离线导入，不能自动从公开仓库拉取：
 
 [source,shell]
 ----
@@ -1861,583 +1475,19 @@ unzip -p /path/to/dm8_20240715_x86_rh6_rq_single.tar.zip dm8_20240715_x86_rh6_rq
 docker tag dm8_single:dm8_20240715_rev232765_x86_rh6_64 dameng:8.1.3.162-20240621-rev232765
 ----
 
-本轮原始 ZIP 的 SHA-256 为 `f845a8676c26ac833a4a3e788568df6e36eee88f173aac8883ea9faa51abed2d`，本机 Docker 镜像 ID 为 `sha256:3a19c8145fb91dcc959c9bc9304edbedf65cfbd4c1e251b18dd0a652d9d0e11e`。
-2026-10-20 启动核验显示自带试用授权到期日为 2026-11-03；版本、构建和授权有效性均须以实际环境为准。
-旧 8.1.2.128 的历史结果继续保留，不能因切换默认镜像而改写为新版本的验证结果。
-`dameng.image` 可以覆盖镜像名，但替换数据库构建后需要重新验收，不能沿用旧结果。
+可用 `dameng.image` 覆盖数据库镜像。使用外部测试库时传 `dameng.hostname`、`dameng.port`、`dameng.user`、`dameng.password`；测试会修改表，不要指向生产库。
+独立 Worker 默认 Java 镜像为 `eclipse-temurin:21-jre`，可用 `dameng.connect.java.image` 覆盖；其 Kafka 4.3.0 回归不等于 Kafka 2.0 部署验收。
+已验证的独立 Worker 和性能环境为原生 Linux x86_64，性能场景使用 host 网络。
 
-[source,shell]
-----
-./mvnw -pl debezium-connector-dameng -am verify -Pdameng-tests
-----
+离线运行前，在联网机器准备相同 profiles 的 Maven 依赖、wrapper 缓存和测试镜像。传输完整仓库与缓存，docker load 后用 `-o`；专用 Maven 缓存可由 `-Dmaven.repo.local=/path/to/cache` 指定。
 
-需要指定本地 Ryuk 镜像时，可设置 `TESTCONTAINERS_RYUK_CONTAINER_IMAGE=testcontainers/ryuk:0.13.0`，保留自动清理。
-使用已配置好的外部测试库时传 dameng.hostname、dameng.port、dameng.user、dameng.password；测试不会自动配置或销毁外部实例，但会操作测试表，因此不要指向生产业务库。
-单元测试用 `-Dtest=...`，数据库专项用 `-Dit.test=...`；多模块聚焦测试时可配 surefire/failsafe.failIfNoSpecifiedTests=false 避免非目标模块报无匹配用例。
+=== 测试资料与发布记录
 
-[cols="3,5",options="header"]
-|===
-|入口 |验证内容
-|`DamengConnectionIT` |JDBC 版本、原始字段、长 SQL 分片序列、重复挖掘结果及 DDL 前后的对象版本。
-|`DamengConnectorIT`、`DamengDatatypesIT` |初始/no_data、提交/回滚、无主键、Key 变化、事务元数据、类型与历史结构恢复。
-|`DamengDatatypeProbeIT`、`run-compatible-mode-matrix.py` |数据库存储、JDBC、LogMiner 和 Converter 边界；组件探测不等同于完整 Connector 支持。dameng.compatible.mode 是测试参数。
-|`DamengDdlExtensionsIT`、`DamengLexicalSettingsIT` |历史 DDL 扩展、词法参数四种组合和设置漂移保护。
-|`DamengCaseSensitivityIT` |分别初始化 CASE_SENSITIVE=0/1，核对 JDBC 与归档拼写、快照和历史 DDL/CRUD、信号表及无主键输出。
-|`DamengIncrementalSnapshotIT` |信号表自动创建、分块、水位去重、删除/主键移动和恢复。
-|`DamengPrimaryStandbyIT`、`DamengRecoverySafetyIT` |人工主备切换、快照被切换打断、网络故障和受限账号。
-|`DamengStandbyLogMinerProbeIT` |直接验证物理备库挖掘、重连、重启、事务和人工切换；旧构建可走 -710 边界诊断路径，新构建已通过挖掘路径，均不等于完整 Connector 备库支持。
-|`DamengLargeTransactionIT`、`DamengLogMiningWindowIT` |大事务落盘、跨窗口、回滚和文件预算/固定窗口行为。
-|`DamengRestartNonceIT` |新/旧/移除 nonce、CDC-only、手动/自动补数、基线持久化及跨边界事务。
-|`DamengKafkaConnectIT` |独立 Worker 插件加载、Kafka 交付、kill/restart 及 offset 尚未提交时的恢复基线。
-|===
-
-大事务默认有限负载为 10000 行、512 字节 payload、300 秒等待，通过 dameng.stress.rows、dameng.stress.payload.bytes、dameng.stress.timeout.seconds、dameng.stress.mining.batch.size 调整。
-workloadRowChanges 包括尝试/回滚和标记行，deliveredDataEvents 可能含重放；elapsedMs 包含写入、CDC、断言和安静期，不含容器启动；测试 JVM 采样堆不等于 Connector 保留内存或容器 RSS。
-有限压力测试不能定义生产最大事务或吞吐保证，负载和资源应单独记录。
-
-进程测试需 assembly 插件包，使用 `-Pdameng-connect-tests,assembly`。
-默认 Java 21 基础镜像为 `eclipse-temurin:21-jre`，可用 dameng.connect.java.image 修改，默认允许拉取缺失镜像；dameng.connect.allow.image.pull=false 仅使用本地已有镜像。
-该 fixture 使用仓库解析的 Kafka 4.3.0，通常为单 Broker；专门的故障用例使用 3 Broker 和多个 Worker，验证重平衡和 Leader 故障。它不是 Kafka 2.0 镜像验收。
-证据在 Failsafe XML、`target/dameng-connect-logs` 及各专项目录。
-
-已记录的 2026-10-19 恢复功能回归通过 1410 个单元用例和 126 个数据库用例，之后补充聚焦回归和独立 Worker 用例；这些重复运行不能相加当独立用例数。
-当轮新鲜 JaCoCo 数据覆盖 4060/4181 行（97.11%），超过 95% 行覆盖率门槛；分支覆盖不是同一指标，也不证明所有数据库版本/模式均支持。
-2026-10-20 LogMiner 视图完整性改进通过 1445 个单元用例、2 个架构检查及 82 个数据库用例（`DamengConnectionIT` 11、`DamengConnectorIT` 60、`DamengLogMiningWindowIT` 11），均无跳过。
-该轮重新采集的 JaCoCo 数据覆盖 4110/4242 行（96.89%），通过 95% 行覆盖率检查；验证包含 SQL NULL、分片缺失/重复/乱序、未知操作、落盘诊断保留及对象索引随 DDL 更新。
-对象查找回归验证稳定表模型下 100 条已知/未知对象交替的记录只遍历一次表集合；此结果不是端到端吞吐压测。
-较早的全量、主备、性能及字段回归记录保留在 `debezium-connector-dameng/src/test/testing.adoc`；本手册维护当前支持结论，历史日期结果不代表当前构建已重新运行所有场景。
-源码和测试更新不会自动替换运行中的镜像，发布需要另外构建和部署。
-
-=== 换一台电脑复现测试
-
-将完整仓库及本地未提交的改动一起带走；仅复制 Connector 子目录不足以构建同版本内部依赖。
-统一入口为 `debezium-connector-dameng/src/test/run-tests.py`，只使用 Python 标准库。
-当前完整测试的运行基线是原生 Linux x86_64、本机 Docker Engine、Python 3.9+ 和 JDK 21+（本轮使用 JDK 25）。
-Docker 至少分配 8 GiB 内存，建议 12 GiB 以上；开始前 Docker 数据盘至少空闲 15 GiB，源码目录至少空闲 2 GiB。
-首次下载镜像、Maven 缓存所需的额外空间取决于本机已有缓存。性能测试使用 host 网络，不把 macOS、Windows、远程 Docker 或 ARM 模拟列为已验证环境。
-
-[source,shell]
-----
-# 在仓库根目录执行，JAVA_HOME 指向本机 JDK
-python3 debezium-connector-dameng/src/test/run-tests.py
-----
-
-入口先格式化并用 Maven wrapper 的 `-am install` 构建当前源码的依赖模块，再顺序运行单元、数据库、独立 Connect 进程、有限性能回归，最后检查本轮行覆盖率至少 95%。
-测试自行创建数据库和 Kafka，不需要预先运行 Compose，也不读取另一个 datagen 工程或已有 Connect 的任务配置。
-默认不设置 dameng.hostname；完整回归不应指向外部数据库。
-COMPATIBLE_MODE 基线为 0，词法测试自行覆盖受支持参数的组合；其他模式使用下文的专项入口，不能将模式 0 的成功推及所有模式。
-
-结果目录默认为 `debezium-connector-dameng/target/regression-时间-随机后缀/`。
-`summary.json` 记录每阶段用例数、失败、跳过、缺失类和最终状态，`environment.json` 记录源码状态、JDK、Docker 和实际镜像 ID/摘要。
-每阶段保留命令、日志和 XML，覆盖率使用结果目录下全新的 `jacoco.exec`，不会累加以前的数据。
-缺报告、所选测试类未执行、跳过或失败都会让命令最终返回非零；单个测试阶段失败后仍执行其他独立阶段，准备环境或构建失败则停止。
-summary.json 另外记录 all_requested_suites_completed，表示所选阶段是否都执行结束，不能将它当成 passed。
-失败记录保留测试类、方法、错误详情，并将字段矩阵的参数序号还原为 case-catalog.txt 中的字段声明。
-`--skip-build` 仅用于已构建依赖的开发迭代，报告会标记未重建依赖，不能用它证明新电脑可从源码完整构建。
-同一工作区请串行执行，避免 Maven target、插件包和测试报告互相覆盖。
-全量包含数百个字段边界用例和多组容器故障演练，通常需要数十分钟；入口每 30 秒输出当前阶段的运行时间，详细进度在该阶段 maven.log 中。
-
-[source,shell]
-----
-# 只查看会执行哪些测试，无需 Docker
-python3 debezium-connector-dameng/src/test/run-tests.py --list
-# 分阶段重现；阶段成功不代表整个回归完成
-python3 debezium-connector-dameng/src/test/run-tests.py --suite unit
-python3 debezium-connector-dameng/src/test/run-tests.py --suite database
-python3 debezium-connector-dameng/src/test/run-tests.py --suite connect
-python3 debezium-connector-dameng/src/test/run-tests.py --suite performance
-# 校验测试入口自身对缺报告、缺测试、跳过和错误 XML 的处理
-python3 -m unittest discover -s debezium-connector-dameng/src/test -p test_runner.py
-----
-
-默认使用上述固定 DM 镜像、`eclipse-temurin:21-jre`、`apache/kafka:3.9.1` 和 `testcontainers/ryuk:0.13.0`。
-支持通过 --dm-image、--java-image、--kafka-image、--ryuk-image 选择可访问的镜像仓库或本地已加载的同一镜像。
-公开仓库的缺失镜像会自动拉取；上述本地 DM 标签须先导入，不能依赖 Docker Hub 拉取。
-不关闭 Ryuk，测试结束时清理自己创建的容器和网络，不清理开发者已有服务或全局 Docker 缓存。
-性能回归沿用 Kafka 3.9.1 Worker/Broker 基线；进程恢复测试使用项目 Maven 解析的 Kafka 4.3.0，编译依赖版本没有变更。
-
-[source,shell]
-----
-# 使用镜像加速仓库中的相同内容
-python3 debezium-connector-dameng/src/test/run-tests.py \
-  --java-image hub.badxiao.top/library/eclipse-temurin:21-jre \
-  --kafka-image hub.badxiao.top/apache/kafka:3.9.1
-----
-
-内网准备需在联网机器完整运行一次，用同一操作系统/JDK 准备 Maven 本地仓库及 wrapper 下载缓存，再传输这些缓存、完整源码和 `docker save` 导出的上述镜像。
-目标机器用 `docker load` 导入后运行 `--offline`，缺少 Maven 依赖或镜像会直接失败，不会自动改成跳过。
-`docker save/load` 不一定保留 RepoDigest，此时用 --dm-image 指定导入后的本地 tag，并核对 environment.json 中的镜像 ID；不要把其他构建重命名成测试基线。
-不需要复制原机器的绝对路径、datagen JAR、数据库卷或 Kafka 卷。Maven 的仓库凭据、私有镜像拉取权限由目标环境自行配置。
-
-可用 --maven-repo 指定专用 Maven 缓存，便于只打包这套测试需要的依赖；--skip-build 会跳过当前所选 profile 的依赖准备，例如仅跑过 unit 后切换 performance 仍需先构建 assembly 依赖。
-
-[source,shell]
-----
-# 在联网机器准备专用缓存并完整验收
-python3 debezium-connector-dameng/src/test/run-tests.py --maven-repo /path/to/test-maven-cache
-# 将上述缓存、wrapper 下载缓存、源码及镜像传到内网后执行
-python3 debezium-connector-dameng/src/test/run-tests.py --offline \
-  --maven-repo /path/to/test-maven-cache --dm-image dameng:8.1.3.162-20240621-rev232765
-----
-
-最后一条命令使用本轮 8.1.3.162 的本地完整构建标签，需要在导出镜像时一并保存。
-
-
-=== 已集成的数据生成器和性能校验
-
-生成器来自用户的 datagen 工程，源码已纳入 `src/test/java/io/debezium/connector/dameng/datagen/`，字段定义在 `src/test/resources/datagen/bseg-columns.csv`。
-保留其 221 列 BSEG 表、五字段复合主键、确定性随机种子，以及每轮 1 个大事务和 9 个小事务的模型；每个事务精确包含 7% INSERT、90% UPDATE、3% DELETE。
-原有 H2 单元测试一并纳入，覆盖逐事务比例、批处理失败整笔回滚、轮间等待、初始化重入和主键校验。
-H2 只用于生成器测试，真实 JDBC/CDC 校验在自有达梦容器完成；这些测试源码和 H2 依赖不进入 Connector 插件。
-
-`DamengDatagenPerformanceIT` 默认直接从本次编译的测试 classpath 启动生成器，不再要求 dameng.perf.datagen.jar。
-仍保留该属性用于显式对比外部版本；dameng.perf.bootstrap.servers 可显式指定外部测试 Broker，统一入口不使用这两项。
-默认自动启动单 Broker、单分区、单副本的 Kafka，以及独立 Worker；所有 Topic 带本轮随机前缀。
-它逐条核对 before image、精确统计三类 DML 数量，将 Kafka 消息重建的全部 221 列最终状态与 JDBC 查询结果比较，再验证生成器重新初始化不改动已有数据。
-该场景是有限吞吐和数据正确性回归，不代表所有数据库字段类型、峰值 SLA 或 Kafka 2.0 的验收。
-
-[cols="3,2,5",options="header"]
-|===
-|性能测试系统属性 |默认 |用途
-|dameng.perf.enabled |false；统一入口开启 |显式启用有限性能回归。
-|dameng.perf.initial.rows |5000 |初始行数，允许 1000～20000；使用有界基线替代原独立脚本的 100000 行初始化。
-|dameng.perf.cycles |3 |轮数，允许 1～10，禁止无限负载。
-|dameng.perf.large.size / dameng.perf.small.size |10000 / 100 |每个大/小事务的操作数，须为 100 的倍数，大事务须大于小事务。
-|dameng.perf.interval.ms |7000 |每轮结束后的暂停，允许 0～30000 ms。
-|dameng.perf.timeout.seconds |240 |生成和 Kafka 追平的等待时间，不含容器启动。
-|dameng.perf.min.free.gib |15；统一入口设为 2 |测试结果所在文件系统的最低剩余空间。
-|dameng.perf.docker.min.free.gib |15 |自有 Broker 容器所在 Docker 数据文件系统的最低剩余空间；入口可用 --min-free-gib 调整。
-|dameng.perf.max.growth.gib |4 |本轮允许的文件系统空间增长；达到阈值立即失败并清理测试容器。
-|dameng.perf.window.strategy |fixed |显式 archive_bytes/fixed 进行同负载比较。
-|dameng.perf.window.max.bytes |67108864 |文件预算模式的字节软预算。
-|dameng.perf.mining.batch.size |1000 |fixed 模式的 LSN 跨度；10000 可作为固定对照。
-|dameng.perf.directory |target/dameng-datagen-performance |性能证据目录；统一入口为每轮分配独立目录。
-|===
-
-默认生成 32700 条已提交 DML，限制总量不超过 110000。
-运行中检查磁盘余量和增长，证据包含 workload.log、worker.log、broker.log、samples.csv、JFR 和最终核对结果。
-全局磁盘增长包含其他进程的写入，因此保护触发不一定意味着 Connector 自己使用了全部空间；排查时结合容器指标。
-
-=== 能力探测与功能回归的边界
-
-`--suite all`（默认）执行单元、数据库、进程和性能回归。
-其中 DamengDatatypesIT 保留严格的全字段一致性断言，包含此前标为 TODO 的浮点、高精度时间、LOCAL TIME ZONE、超大 NUMBER 等边界；基线数据库可能实际失败。
-这些失败会如实计入错误并返回非零，不通过忽略误差、放宽断言或跳过来得到绿色报告；完整运行不等于所有数据库限制已经修复。
-独立的数据库能力探测另设入口，避免把能力探测结果混作已支持功能。
-`--suite probes` 执行所有 `*ProbeIT`；其中高精度时间、浮点、LOCAL TIME ZONE 等探测可能在基线数据库上失败，必须查看错误和证据，不能报告为 Connector 一致性已通过。
-兼容模式探测继续使用 `src/test/run-compatible-mode-matrix.py`；升级数据库后可以按指定模式重复同一套用例。
-`DamengLogMinerBenchmarkIT` 和 `src/test/native/logminer-timing-probe.c` 是 SQL/JNI 比较及原生耗时诊断，须另行提供与数据库匹配的达梦官方 JNI JAR、动态库和加载路径，仓库不代发厂商二进制。
-上述未执行专项会列在统一报告中，既不计入成功，也不会隐藏为零个失败。
-
-[[dameng-case-sensitive]]
-=== CASE_SENSITIVE=0 标识符适配
-
-`CASE_SENSITIVE` 是建库属性，不是 Connector 参数，也不能通过修改正在运行的任务把数据库切换为模式 0。
-Task 自动查询 `SF_GET_CASE_SENSITIVE_FLAG()`，结果仍进入 offset 的 compatibility_signature；重启不能把不同建库属性的历史位置混用。
-
-8.1.3.162 实测：模式 0 的 JDBC 元数据保留不少原始拼写，例如 Dbz_Mixed、Id，而非引号关键词 VaLuE 被保存为 VALUE；LogMiner 的 DDL 保留提交语句的原始拼写。
-因此模式 0 对 schema、表、列、主键列和约束统一使用大写作为 Connector 内部及消息中的标识符，历史 DDL 与 JDBC 使用同一规则。默认 Topic 中的 schema/table 部分和消息字段名也相应大写，topic.prefix 本身不变；`'AbC'` 等数据和默认值不改变大小写。
-例如物理表 `"Dbz_App"."Dbz_Case"`、列 `"VaLuE"` 对应 `prefix.DBZ_APP.DBZ_CASE` 与字段 `VALUE`。
-
-模式 0 的 include/exclude、列配置、增量快照 data-collections 和下游映射应使用这套规范名称；即使正则显式关闭忽略大小写，也按规范名称匹配。
-`signal.data.collection` 的具体表名会自动规范化，已有混合大小写信号表可复用；自动创建时也按统一身份识别，防止水位写进去了却没有被信号处理器认出。
-模式 1 的双引号名称保留大小写，非引号名称按现有规则转大写；模式 0 的新命名约定不会改变模式 1 的 Topic 或字段。
-本次也修正了信号表的两段名称解析：达梦统一按 schema.table 处理，不采用公共框架的 catalog.table 默认值。此前登录用户与配置 schema 不同且信号表不存在时，自动建表可能落在登录用户 schema；现在按指定 schema 建表，重启复用同一张表。
-建库属性与主备读写路由是两个独立能力。物理备库采集及主库信号写入已在 <<dameng-standby-capture,备库采集与主库信号写入>> 实现；本节的 CASE_SENSITIVE 回归不代表其与所有主备、字段和兼容模式组合均已覆盖。
-
-专项测试入口（测试自己分别建库并确认实际标志为 0/1）：
-
-[source,shell]
-----
-./mvnw -pl debezium-connector-dameng process-sources verify -Pdameng-tests -Dit.test=DamengCaseSensitivityIT
-----
-
-该用例也由 run-tests.py 的 database 套件自动发现。它在当前新镜像、COMPATIBLE_MODE=0、BACKSLASH_ESCAPE=0 下验证标识符路径，不表示其他兼容模式或字符集的完整字段矩阵均已验收。
-
-2026-10-20 适配完成后的相关回归：1456 项单元/架构检查和 30 项唯一集成调用全部通过，0 跳过。集成调用包括 JDBC 11 项、DDL 扩展 8 项、增量快照 7 项，以及 CASE_SENSITIVE=0/1 的元数据与完整引擎路径 4 项；补跑按用例替换，不累计重复执行次数。
-完整引擎路径覆盖严格大小写过滤、列排除、混合大小写 schema/table/column、默认值、主键与无主键、停机期间历史 DDL、建表/增列/列改名/删除主键/表改名、CRUD、信号表自动创建及重启复用、增量快照，以及字符串主键从 a 改成 A 后的删除/新增事件与分块补数。
-最终源码的行覆盖率为 4121/4269，*96.53%*，95% 门槛通过；测试容器均已清理。
-结果和逐项 XML 路径保存在 `target/case-sensitive-20261020/validation-summary.json`，最终 Maven 日志与覆盖率报告位于其 acceptance 子目录。
-此项适配通过不改变下一节升级回归中 66 项字段一致性、2 项词法及独立探针/JNI 的失败结论。
-
+测试组织和专项参数见 `debezium-connector-dameng/src/test/README.md`、`src/test/testing.adoc`。
+已知浮点有损检查通过 `-Ddameng.datatype.floating.diagnostics=true` 显式运行；诊断跳过不代表问题已修复。
 
 [[dameng-regression-813162]]
-=== 2026-10-20 DM 8.1.3.162 升级回归
-
-默认镜像切换为 `dameng:8.1.3.162-20240621-rev232765`，JDBC 实测版本 `8.1.3.162`，服务器构建 `03134284194-20240621-232765-20108`。
-驱动仍为 `8.1.3.140`，Connector/Kafka 编译依赖未变。普通数据库用例使用 GB18030、COMPATIBLE_MODE=0、LENGTH_IN_CHAR=0、RLOG_APPEND_LOGIC=2、RLOG_IGNORE_TABLE_SET=1、RLOG_LLOG_COMPRESS=0；物理主备 fixture 使用 UTF-8。
-本轮未重新运行非零 COMPATIBLE_MODE 的完整矩阵，不能由原生模式结果推导其兼容性。
-版本告警名单未改，8.1.3.162 启动时的“未测试版本”WARN 仍存在；该告警本身不终止任务。
-
-测试环境适配包括归档目录继承数据库目录属主、主备 fixture 显式接管容器入口和动态库路径，以及删除新版 dminit 不接受的 LENGTH_IN_CHAR 初始化参数。
-主备就绪检查改为主库 REALTIME 归档与双方 LOCAL 归档有效；新版备库未启用的反向发送状态为 null，不能要求双向发送均为 VALID。人工切换和 takeover 输入新版 dmmonitor 所需的 YES，并为监视器增加 90 秒超时和失败日志保存。
-首次归档目录权限失败的尝试保留在 `target/regression-dm813162-20261020`；第二轮与后续补跑保留在 `target/regression-dm813162-20261020-r2`。环境准备失败不能当作 CDC 断言结果，也不会删除记录后声称首轮通过。
-
-==== 完整执行结果
-
-[cols="3,1,1,4",options="header"]
-|===
-|范围 |通过/总数 |失败 |说明
-|单元与架构 |1451/1451 |0 |本轮全量执行。
-|数据库功能 |838/906 |68 |66 项字段一致性和 2 项词法失败；主备环境修复后 2 项恢复用例通过。
-|Kafka Connect |4/4 |0 |进程恢复、Broker 故障及消息校验通过。
-|内置生成器压测 |1/1 |0 |32700 次 DML，逐条 before 和 221 列最终状态一致；最终 6308 行。独立单副本 Kafka，Worker/Broker 3.9.1，不是 Kafka 2.0 验收。
-|独立数据库能力探针 |704/742 |38 |排除重复运行的主备恢复用例；字段 37 项和历史元数据 1 项失败。
-|SQL/JNI 严格对照 |0/1 |1 |预热轮原始记录多重集不一致，未执行完整计时轮次。
-|===
-
-所有上述范围均执行完毕，0 跳过；*整体回归未通过*。覆盖率独立门槛通过：本轮采集 4139/4242 行，97.57%。覆盖率不能替代正确性断言。
-最终唯一用例统计见 `target/regression-dm813162-20261020-r2/validation-summary.json`；原始首次结果及补跑 XML 均保留，最终统计仅替换修正 fixture 后的主备用例，未重复累计。
-
-JNI 使用本镜像的 libdmlogmnr_client.so、libdmdpi.so；镜像不含 Java 绑定，采用先前从另一份本地厂商安装包提取的 com.dameng.logmnr.jar，来源和校验和见 `target/dm813162-jni/metadata.json`。这不是同发行包配套组合，不能外推为所有 8.1.3.162 JNI 的结论。
-同一份冻结归档包含 100000 次 INSERT、50000 次 UPDATE、25000 次 DELETE 及 100 次回滚 UPDATE；SQL 与 JNI 都读出 176111 条原始记录，但逐字段多重集不同，严格断言停止。差异证据见 `jni/evidence/difference-0-jni-2.txt`。
-仅完成的预热轮 SQL 总耗时约 1.067 秒，JNI 约 4.139 秒，其中 getData 约 2.850 秒；因一致性失败且未完成多轮，不据此给出可替换生产 SQL 路径的性能结论。
-
-==== 字段一致性与原 81 项失败的对照
-
-DamengDatatypesIT 的 769 个调用执行完成：703 通过，42 个断言失败、24 个错误、0 跳过，共 66 个失败调用。
-新旧 703 项边界矩阵清单完全相同，断言未放宽。
-原 81 项失败中有 19 项转为通过，62 项仍失败；另有原来通过的 4 项 NaN 原始事件用例在写入时失败，因此净减少 15 项。
-
-[cols="4,1,5",options="header"]
-|===
-|原失败转为通过 |数量 |本轮边界
-|TIME(1..6) WITH TIME ZONE |6 |快照和流式 CRUD 小数秒及 JSON 往返均通过。
-|TIMESTAMP(7..9) 的部分值及 WITH TIME ZONE |9 |普通 TIMESTAMP 的 1969/2000 年值共 6 项，以及带时区类型共 3 项通过。不能推广到普通 TIMESTAMP 的全部年份。
-|CHAR(8 CHAR) 中文和 emoji |3 |7/8 个“梦”和 8 个 emoji 输入及 CDC 通过。
-|ROWID 普通列 |1 |从 JDBC 快照结构开始的 VALUE ROWID 指定字符串输入、NULL 转换和 CRUD 通过；独立探针的 CREATE TABLE 历史 DDL 解析仍拒绝 ROWID，因此不代表该类型完整生命周期已支持。
-|===
-
-[cols="4,1,5",options="header"]
-|仍失败或新增失败 |数量 |原因与影响
-|普通浮点流式精度 |30 |原始 Connect 值仍可能舍入、合并或归零，包含 21 个聚焦用例和 9 个矩阵用例；后者也含负零 JSON 差异，不重复计数。
-|仅负零 JSON 往返差异 |5 |原始 Connect 值保留负零，标准 JsonConverter 解码后符号丢失。
-|NaN 写入拒绝 |6 |4 个原始 Connect 场景为新增失败，另 2 个矩阵用例原已因 JSON 失败。本轮均在 JDBC INSERT 阶段报 Data overflow，尚未进入 CDC，不能算 NaN 的 JSON 问题已经修复。
-|NUMBER/DECIMAL/NUMERIC 的 ±1E125 |18 |当前数据库/驱动组合仍拒绝这些输入，未进入 Connector。
-|TIMESTAMP(7..9) 的 0001/9999 年 |6 |新版允许声明及写入，但默认 NanoTimestamp 的 INT64 epoch 纳秒范围不足。日志显示 long overflow，snapshot 和 streaming 的对应非空值变成 null；这是输出一致性缺陷，不能仅描述为测试断言空指针。
-|TIMESTAMP WITH LOCAL TIME ZONE |1 |当轮实现仍主动拒绝缺少可恢复时区语义的列；后续已改为显式有损 UTC 映射，见 <<dameng-local-time-zone-policy,当前策略>>。
-|===
-
-除此之外，词法组合新增 2 个失败：BACKSLASH_ESCAPE=1、NESTED_C_STYLE_COMMENT=0/1 时，普通字面量 `'A\0B'` 返回 `A0B`，不再满足旧版保留反斜杠的规则。
-失败发生在数据库字面量语义预检，后续 CDC 断言没有执行；不能据此声称这两种组合的 CDC 已验收，也不能只修改预期文本就认为解析适配完成。
-BACKSLASH_ESCAPE=0 的两组完整词法回归通过。
-
-==== 独立数据库能力探针
-
-DDL 扩展探针 2 项、DDL 语法探针 14 项通过。
-字段组件探针执行 724 项，687 通过，17 个断言失败、20 个错误、0 跳过；其中包括普通浮点/JSON、纳秒时间范围、LOCAL TIME ZONE、超大 NUMBER、NaN，以及完整引擎快照用例未覆盖到的 ROWID 历史建表解析失败。
-ROWID 的 JDBC 结构加 CRUD 可以通过，`CREATE TABLE ... VALUE ROWID` 的历史 DDL 仍报 `Unsupported DM column type ROWID`，不能把这两条路径混成全功能支持。
-历史元数据探针 1 项失败：改列名后对旧 LSN 的系统目录闪回查询返回 NEW_NAME，预期应为 OLD_NAME。此前旧构建的目录闪回结论不适用于本构建；生产 Connector 并未接入这种兜底。
-备库 LogMiner 探针 1 项通过：真实备份/恢复的主备对复制结果一致，241 条原始记录逐字段对比通过，事务重建得到 209 条已提交业务/DDL 记录；还验证重新连接、仅已提交模式、跨窗口未提交事务、备库重启和人工切换后的历史挖掘。
-该轮升级探针中，备库信号表创建及写入继续报 -710，当时生产 Connector 尚未开放 STANDBY。后续读写连接分离实现见 <<dameng-standby-capture,备库采集与主库信号写入>>；升级探针本身不作为完整 Connector 的验收依据。
-主备 Connector 恢复补跑 2 项通过，覆盖快照中途切换、历史 DDL、切回及主库故障后的人工 takeover；这是连接当前主库的现有功能，与上述备库采集方案分别统计。
-
-逐项对照见 `target/regression-dm813162-20261020-r2/datatype-comparison.json`；新一轮原始错误、类型名称及参数序号见 database 下 XML 和 database-evidence/case-catalog.txt。
-后面的 81 项分析保留为旧 8.1.2.128 的历史记录，不代表新版本仍有同样的 81 项失败。
-
-==== 官方 8.1.3.162 pack1 镜像复测（2026-10-23）
-
-使用达梦官方提供的 `dm8_20250520_x86_rh7_64_rq_ent_8.1.3.162_pack1.tar`，SHA-256 为 `d822a5af3386a0c0cb257a2291cf57e0602e5f631a5b9b54cb2eeb4803e37bbb`。
-导入标签为 `dm8:dm8_20250520_rev234060_x86_rh7_64`；实际服务器构建为 `03134284194-20240703-234060-20108`，与上一轮 `20240621-232765` 构建不同，JDBC 驱动仍为 8.1.3.140。
-字段矩阵同样使用 GB18030、COMPATIBLE_MODE=0、CASE_SENSITIVE=1、RLOG_APPEND_LOGIC=2、RLOG_IGNORE_TABLE_SET=1 和 RLOG_LLOG_COMPRESS=0。
-
-`DamengDatatypesIT` 完整执行 769 项，703 通过、42 个断言失败、24 个错误、0 跳过。
-66 个失败调用的测试名称、失败类别和错误消息与上一轮逐项一致，没有新增或消失的字段失败；上表的六类原因仍适用。
-原始 XML 位于 `debezium-connector-dameng/target/official-pack1-20261023-datatypes/reports/`。
-
-后续测试分类调整：字段一致性目录只保留数据库已接受的输入，移除了 `3.5E38`、`1E309`、NaN、当前构建拒绝的 `±1E125` 以及其他专门验证数据库拒绝的输入。
-对当前 LogMiner 已知有损的严格浮点检查仍保留，但日常数据库回归跳过；显式传入 `-Ddameng.datatype.floating.diagnostics=true` 可重新执行并观察失败。
-正负零按数值相等比较。以上 66 项是调整前的历史复测数据，不代表调整后整套回归已经通过。
-
-2026-10-26 使用同一官方 pack1 镜像重跑调整后的完整 `DamengDatatypesIT`：708 项中 691 项通过、7 项断言失败、0 项错误、10 项跳过。
-数据库拒绝写入的用例已不在当轮字段一致性目录中；保留的 7 项失败均发生在数据库接受输入之后，其中 6 项为 `TIMESTAMP(7..9)` 的 0001/9999 年值超出 Connector 默认纳秒时间表示范围，1 项为当轮明确拒绝的 `TIMESTAMP WITH LOCAL TIME ZONE`。这些是修改前的历史结果。
-跳过的 10 项是 9 个浮点字段矩阵和 1 个聚焦浮点方法；严格浮点诊断仍可通过 `-Ddameng.datatype.floating.diagnostics=true` 显式执行。
-
-针对其中 6 项年份越界，在官方 pack1 镜像上以 `time.precision.mode=isostring` 运行 `TIMESTAMP(7)`、`TIMESTAMP(8)`、`TIMESTAMP(9)` 定向回归，3 项全部通过。
-每种精度覆盖 0001 年、9999 年和两个中间值，逐一对照 JDBC 回读的实际存储值，检查快照、增量 INSERT/UPDATE/DELETE 前后镜像及 JSON 往返；事件逻辑类型为 `io.debezium.time.IsoTimestamp`。
-这验证了字符串映射避开 `INT64` 纳秒范围限制，并不证明数据库保留了输入字面量的 7 至 9 位小数秒。当时 `TIMESTAMP WITH LOCAL TIME ZONE` 仍被拒绝；后续策略见 <<dameng-local-time-zone-policy,当前策略>>。
-切换现有任务的 `time.precision.mode` 会改变时间字段的 Kafka Connect schema，消费者必须按新类型适配。
-
-2026-10-27 先将达梦普通 `TIMESTAMP(7..9)` 在当时默认的 adaptive 模式下改为固定 `IsoTimestamp` schema，而不是逐条记录在纳秒溢出时切换到微秒单位。一个字段的 Kafka Connect schema 必须对每条记录保持相同的单位和逻辑类型。
-官方 pack1 镜像的 12 个定向边界用例全部通过，覆盖三个精度各自的 0001、1969、2000 和 9999 年，逐一核对 snapshot、流式 CRUD 与 JSON 往返。历史的六项纳秒溢出失败不再适用于这一映射；该定向结果不代表完整字段矩阵或其他数据库集成测试已在此次修改后重新执行。
-升级已有任务时，这些字段从 `NanoTimestamp` INT64 变为 `IsoTimestamp` STRING，下游必须按新 schema 解析。显式配置 `time.precision.mode=nanoseconds` 仍选择原来的纳秒映射及其范围限制。
-
-随后将达梦 Connector 的默认 `time.precision.mode` 从 adaptive 改为 isostring，DATE、TIME、普通 TIMESTAMP 的所有声明精度都默认输出 ISO 字符串。显式配置 adaptive 的任务仍按原模式工作，但普通 `TIMESTAMP(7..9)` 保留上述 IsoTimestamp 安全映射。未显式设置该参数的已有任务升级后，日期和时间字段的 Kafka Connect schema 与值表示都会改变；消费者必须先适配。
-
-之后默认值从 isostring 改为 sqlstring。普通 DATE、TIME、TIMESTAMP 改为无 `T`/`Z` 的字符串，Connect schema 为无逻辑类型名称的 STRING；带时区类型和 LOCAL TIME ZONE 保持各自原有的 UTC 字符串表示。已有任务若依赖旧格式，应显式配置 `time.precision.mode=isostring`；默认值变更会再次改变普通时间列的 Kafka Connect schema 与字段值。
-
-另外 16 个数据库集成测试类执行 154 项，首轮 148 通过、5 个断言失败、1 个错误。
-其中 2 项是已知的 BACKSLASH_ESCAPE=1 字面量差异；2 项主备手动切换失败暴露了仅在备库挖掘模式创建的 `primaryConnection` 被手动切换模式解引用的问题，修复后 `DamengPrimaryStandbyIT` 3/3 通过。
-备库事件等待首轮失败，独立复测 `DamengStandbyIT` 5/5 通过，未稳定复现。
-快照过滤的 1 项错误是旧测试仍预期扩表必须失败；改为验证已删除的新纳入表不回放旧事件、保留表持续采集和再次重启后恢复，`DamengSnapshotFilterIT` 3/3 通过。
-首轮报告与针对性复测分别位于 `target/official-pack1-20261023-database-other/`、`target/official-pack1-20261023-targeted/` 和 `target/official-pack1-20261023-filter-fixed/`；这些是分轮结果，未声称在最后一次源码修改后重新执行了全部 923 项数据库测试。
-
-Kafka Connect 进程级测试使用本地 `hub.badxiao.top/library/eclipse-temurin:21-jre` 镜像和独立的 Kafka 4.3.0 测试 Broker；首轮 4 项中 3 项通过，Broker 故障场景在一次 15 秒 topic leader 管理查询时超时。
-在原有 2 分钟故障恢复期限内重试选主查询后，该场景独立复测通过。
-这验证了所用测试 Worker 的插件加载、偏移恢复和故障场景，不是 Kafka 2.0 环境验收。
-报告位于 `target/official-pack1-20261023-connect-local/` 和 `target/official-pack1-20261023-connect-retry/`。
-本轮未重新执行有限吞吐压测、独立能力探针或非零 COMPATIBLE_MODE 矩阵；不能由上述结果推出这些范围通过。
-
-=== 2026-10-20 测试环境整理验证（旧 8.1.2.128）
-
-本轮将纯源码复制到另一绝对路径，没有携带 .git 或 target，重新构建并通过 1451 项单元与架构检查。
-另使用不含当前分支内部构件的独立 Maven 仓库，仅复用第三方/历史版本下载缓存，在离线模式下从源码补齐当前分支依赖及 assembly 构件。
-这验证了路径和内部构件依赖的移植，不等同于无需 JDK、Docker、镜像和第三方依赖的空环境运行。
-
-内置生成器经自有达梦、Worker 和单副本 Kafka 验证 32700 条 DML：INSERT 2289、UPDATE 29430、DELETE 981。
-逐条 before、全部 221 列最终状态和初始化重入均通过，最终 6308 行；生成器及 H2 未进入生产插件包。
-数据库完整回归执行 906 项，825 项通过、44 项断言失败、37 项错误、0 跳过，14 个测试类均执行。
-失败均位于严格字段一致性套件，未放宽断言或把它们改成忽略：
-
-[cols="4,1,5",options="header"]
-|===
-|边界 |用例数 |本轮表现
-|普通浮点及 JSON 负零/NaN |37 |包括 26 个聚焦浮点用例和 11 个矩阵用例；原始 LogMiner 精度限制及标准 JsonConverter 往返差异。
-|TIME(1..6) WITH TIME ZONE |6 |小数秒不能完整保留。
-|TIMESTAMP WITH LOCAL TIME ZONE |1 |当轮 Connector 明确拒绝未经验证的类型映射；这是修改前的历史结果。
-|无约束 NUMBER / DECIMAL / NUMERIC |18 |正负 1E125 在三个 decimal 模式下被基线数据库拒绝。
-|TIMESTAMP(7..9)，含 WITH TIME ZONE |15 |基线数据库拒绝高精度声明。
-|CHAR(8 CHAR) 多字节边界 |3 |基线数据库拒绝对应中文/emoji 输入。
-|ROWID 普通列声明 |1 |基线数据库拒绝该声明，不等同于伪列 ROWID 能力。
-|===
-
-本轮独立 JaCoCo 数据覆盖 4138/4242 行（97.55%），通过 95% 行覆盖率门槛；不能据此将上述失败标成通过。
-迁移目录中独立 Connect 进程的 4 项测试全部通过，使用 Temurin 21 基础镜像和从 Maven 解析的 Kafka 4.3.0，包含 Worker kill、发布中断、多个 Worker 及 Broker 故障恢复。
-独立 *ProbeIT 和厂商 JNI benchmark 本轮未执行；它们仍有单独入口和依赖说明。
-本轮证据汇总位于 `debezium-connector-dameng/target/portable-regression-20261020/validation-summary.json`，保留各阶段 XML、命令、容器日志及字段失败详情；不同目录中的重复单元运行未相加成独立用例数。
-测试入口自身的 7 项检查覆盖报告缺失、测试类缺失、跳过/错误、XML 损坏及阶段失败后继续执行。
-完整 suite 保留这些严格字段断言，因此在当前数据库上应返回非零；升级数据库或调整实现后可以用相同用例验证失败是否消失。
-
+[[dameng-official-pack1-regression]]
 [[dameng-datatype-failures-20261020]]
-=== 2026-10-20 字段边界失败分析
-
-本节复核上述完整回归已有的 XML、失败堆栈、参数目录和当前测试源码，没有重新执行数据库测试，也没有修改实现、Kafka 依赖或断言。
-81 是失败的参数化测试实例数，不是 81 种字段类型，也不是 81 个独立根因。
-全部来自 `DamengDatatypesIT`：769 项执行，688 项通过，44 项 failure，37 项 error，0 跳过。
-其中一个实例可能同时检查多个输入、snapshot、INSERT、UPDATE 的 before/after、DELETE 及 JSON，并包含多个断言失败；不能把嵌套断言数再次加到 81 上。
-
-本次环境为 JDBC 数据库版本 `8.1.2.128`、完整构建 `08134283904-20220804-166351-20005`、驱动 `8.1.3.140`、GB18030。
-参数包括 `COMPATIBLE_MODE=0`、`LENGTH_IN_CHAR=0`、`NVARCHAR_LENGTH_IN_CHAR=1`、`RLOG_APPEND_LOGIC=2`。
-结论仅适用于这个组合，不自动推广到其他兼容模式、数据库构建或 Converter 版本。
-
-==== 按失败阶段归类
-
-预期值独立读取数据库实际存储结果，浮点比较实际二进制位，不是要求数据库存储后仍等于原始十进制输入文本。
-每行先核对 Connector 原始 Connect Struct，再使用 Kafka 4.3.0、`schemas.enable=true` 的标准 JsonConverter 编解码核对。
-测试中的 JSON 往返在进程内执行；该差异不需要经过 Kafka Broker 才能复现。
-
-[cols="1,3,1,4,4",options="header"]
-|===
-|分类 |字段或输入 |实例数 |最早失败位置 |生产含义
-|A |REAL / FLOAT / DOUBLE 普通值 |30 |流式原始 Connect 值已不一致；21 项聚焦用例和 9 项矩阵用例 |数值可被舍入或归零，影响 INSERT after、UPDATE before/after、DELETE before。9 项矩阵同时存在负零 JSON 问题，仍只计一次。
-|B |负零、NaN，仅 JSON 失败 |7 |原始 Connect 值通过；snapshot 和 streaming 的 JSON 解码结果不一致 |5 项负零、2 项 NaN。影响使用此解码路径的下游；不等于原始事件或 Broker 丢值。
-|C |TIME(1..6) WITH TIME ZONE |6 |流式原始 Connect 值丢小数秒；snapshot 检查通过 |时区时间的秒内精度丢失，前后镜像均受影响。
-|D |TIMESTAMP(6) WITH LOCAL TIME ZONE |1 |当轮 snapshot 建立输出 schema 时主动抛 DataException |当轮任务明确失败；后续改为有损 UTC 映射，不代表已恢复真实时间点。
-|E |NUMBER / DECIMAL / NUMERIC，正负 1E125 |18 |初始化测试数据 INSERT，Data overflow |数据库没有接受输入；Connector 尚未启动，无法判定这些值的 CDC 一致性。
-|F |TIMESTAMP(7..9)，含 WITH TIME ZONE |15 |CREATE TABLE，Precision is out of range |该构建未接受精度声明，尚未到数据写入或 CDC 阶段。
-|G |CHAR(8 CHAR)，7/8 个中文字符及 8 个 emoji |3 |初始化测试数据 JDBC INSERT，Param incompatible |输入没有成功存入，不能描述为 Connector 采集后截断中文。
-|H |普通列声明 ROWID |1 |CREATE TABLE，Invalid base class name[ROWID] |普通列类型声明受限；不代表 LogMiner 中用作行定位的 ROWID 伪列不可用。
-|===
-
-互不重复的阶段合计为：36 项流式原始值不一致、7 项仅 JSON 往返不一致、1 项主动拒绝、37 项数据库建表/写入拒绝，共 81 项。
-其中 A 的 9 项矩阵同时受 JSON 负零影响；若按影响范围统计，JSON 特殊值问题涉及 16 项，但不能再与上表相加。
-同样，A/C 的错误原始值进入 JSON 后也会失败，这不代表多出一个 JSON 根因。
-
-==== A/C：日志输出已经丢失精度
-
-当前失败消息包含以下 JDBC 基线与实际流式值：
-
-[cols="3,3,3",options="header"]
-|===
-|用例 |JDBC 存储值 |流式 Connect 值
-|DOUBLE 普通小数 |1.23456789012345 |1.234568
-|DOUBLE 小非零值 |1.23456789E-7 |0.0
-|DOUBLE，1.0 的相邻较大值 |1.0000000000000002 |1.0
-|REAL 普通小数 |1.2345679 |1.234568
-|TIME(6) WITH TIME ZONE，归一 UTC |10:00:00.999999Z |10:00:00Z
-|===
-
-这 36 项中的原始 snapshot 检查没有不一致；浮点矩阵的 snapshot 负零失败仅属于 JSON 层。
-2026-10-12 的历史诊断观察到 SQL_REDO 输出已舍入浮点、去掉带时区 TIME 的小数秒。
-同一历史诊断尝试在线字典 `MINE_VALUE` 仍得到有损值，无字典逻辑列访问未获得替代值。
-本次没有重跑 MINE_VALUE/JNI 专项，历史报告的旧 target 目录也未在本次工作区保留，因此这些接口结论应与当前 XML 的数值差异证据区分。
-此处的限制是已验证 LogMiner 接口暴露的值，不能据此认定数据库存储或底层物理 REDO 本身也丢失了原值。
-
-仅改 Java 浮点解析、改用 BigDecimal、输出字符串或增加科学计数法支持，都不能从 `1.234568` 唯一恢复原来的 `1.23456789012345`。
-更换 Converter 也不能修复已经有损的原始 Connect 值；读取业务表当前行不能可靠还原历史 UPDATE 或已删除行。
-可行方向是获取并验证无损的数据库版本/日志接口，或在业务允许时重新设计源字段类型；`decimal.handling.mode=precise` 不会让已有 FLOAT 日志变无损。
-TIME(0) WITH TIME ZONE、无时区 TIME 与带时区 TIMESTAMP 必须分别看测试结果，不能把这 6 项概括成所有时间类型都不支持。
-
-==== B：标准 JSON 解码的特殊值差异
-
-5 项聚焦负零用例为 REAL、FLOAT(24)、FLOAT、FLOAT(53)、DOUBLE 的 `-0.0`；2 项 NaN 用例为 REAL 和 DOUBLE。
-负零经过编码的 JSON 包含 `-0.0`，但标准 JsonConverter 解码后成为 `+0.0`；NaN 编码为字符串 `"NaN"`，同一转换器解码成数值 0。
-原始 Connector 特殊浮点 CRUD 回归另有 8 项，当前 XML 中均通过。
-`DamengJsonConverterCompatibilityTest` 独立验证标准转换器的现有行为；诊断测试通过不等于无损往返通过。
-
-负零与正零虽然按通常数值比较相等，但符号位、倒数和部分科学计算语义不同；NaN 变成 0 会把“非数值”误作真实零值。
-这是可以单独评估修复的转换/消费协议问题：在 Kafka 依赖版本保持不变的条件下，验证自定义 Converter 或下游显式解码协议，并检查 schema、存量消息和消费者兼容性。
-本次未实现或验证替代 Converter，不能宣称换一种格式就已解决。
-
-[[dameng-local-time-zone-policy]]
-==== D：LOCAL TIME ZONE 的当前策略与历史验证
-
-旧版 CREATE/INSERT 已成功，但 snapshot 在 `DamengValueConverters.schemaBuilder()` 主动拒绝 LTZ，底层原因为 `Unsupported Dameng TIMESTAMP WITH LOCAL TIME ZONE`。这是实现修改前的历史结果。
-历史跨会话诊断发现：快照随读取会话时区变化，而日志文本没有携带足够的原始写入时区信息，无法唯一恢复 instant。
-2026-10-26 在官方 8.1.3.162 pack1 构建 `03134284194-20240703-234060-20108` 上重新验证：两个写入会话分别设置 `+05:45` 和 `-12:59`，写入同一无偏移字面量 `2000-02-29 12:34:56.123456`。
-UTC 读取会话分别得到 `2000-02-29 06:49:56.123456` 与 `2000-03-01 01:33:56.123456`，即两个不同 instant；对应归档 `SQL_REDO` 均为同一个 `TIMESTAMP'2000-02-29 12:34:56.123456'`。
-挖掘会话设为 UTC 或 `+08:00` 时，两条 redo 的表达式都保持相同；另一组测试也确认同一行的 JDBC 读值会随读取会话时区变化。
-在线字典模式下，`DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, 'schema.table.VALUE')` 对这两条历史 INSERT 也都返回 `2000-02-29 12:34:56.123456`；挖掘会话设为 UTC 或 `+08:00` 结果相同。因此在已验证的 `SQL_REDO` 和 `MINE_VALUE` 路径中，都没有得到可区分这两个 instant 的列值。
-后续对照加入第三条：在 `-12:59` 写入会话用 `2000-02-28 17:50:56.123456` 表示第一条的同一个 UTC 时间点。归档 `SQL_REDO` 和 `MINE_VALUE` 仍返回这个不同的本地时间文本，说明已测输出不是统一的 UTC 时间。第四条在 `+05:45` 会话写入带显式 `-12:59` 偏移的 `2000-02-29 12:34:56.123456`；挖掘结果为 `2000-03-01 07:18:56.123456`，说明输出也不是简单复制 INSERT 原文，而是呈现写入会话的本地时间。
-`MINE_VALUE` 的 JDBC 元数据为 `VARCHAR`，`getObject()` 返回 `String`。将该字符串再读成 `Timestamp` 只会引入客户端时区解释，不会恢复写入时区。上述实验确定的是公开 LogMiner 查询的时间基准，未直接解码归档文件的原始二进制编码；不能断言物理 redo 内部一定按写入会话时区存储。
-`DamengDatatypeProbeIT.shouldExposeAmbiguousLocalTimezoneRedoAcrossWriterSessions` 将这种歧义作为回归断言。结论限于本构建已测的归档 `SQL_REDO` 和在线字典 `MINE_VALUE` 路径，不排除未来数据库版本或其他接口提供可恢复的原始时间点。
-当前实现按用户选择接受这种语义损失：只对 `TIMESTAMP WITH LOCAL TIME ZONE` 将流式本地时间文本当作 UTC，并将 Connector 的 JDBC 会话设为 UTC 以固定 snapshot 读取基准。输出是带 `Z` 的 `io.debezium.time.ZonedTimestamp` 字符串，不声明流式输出是真实 instant。普通 `TIMESTAMP` 和 `TIMESTAMP WITH TIME ZONE` 维持原有映射。
-在官方 8.1.3.162 pack1 上，完整引擎定向测试覆盖同表三种时间类型的 snapshot、INSERT、UPDATE、DELETE：`+05:45` 写入的 LTZ 在快照为 `2000-02-29T06:49:56.123456Z`，流式为 `2000-02-29T12:34:56.123456Z`；另外两列未被套用 LTZ 规则。下游恢复需要每条写入对应的会话时区，任务配置一个固定默认时区不能保证所有历史记录正确。
-
-若未来要求无损支持，仍需验证能取得每条历史记录原始 instant 或写入会话时区的数据库接口，并覆盖不同写入会话、显式偏移、夏令时及重启回放。
-
-==== E/F/G/H：数据库未接受测试声明或输入
-
-E 的 18 项等于 3 种类型名称 × 3 种 decimal.handling.mode × 正负两个值。
-配置仅影响 Connector 的表示方式，无法改变启动前的 INSERT 结果；本轮 SQL 科学计数值被拒绝，错误根因为 `Data overflow`。
-历史分路径诊断还记录 JDBC setBigDecimal 拒绝同样数值，但本次没有重新执行该诊断。
-不能把官网数值表达式的计算范围直接等同于该旧构建的列存储范围。
-
-F 的 15 项等于每种精度下 4 个普通 TIMESTAMP 输入独立用例、1 个带时区用例，共 3 组。
-四个输入含公元 1 年、1969 年末、闰日及 9999 年；这次全部在建表阶段失败，尚不能判断对应日期/小数秒转换的结果。
-升级后即使接受声明，还要检查 Connector 纳秒时间戳的 INT64 可表示范围；当前测试用独立 BigInteger 期望值防止溢出被误判为通过。
-
-G 的输入是 `梦` 重复 8 次、重复 7 次，以及 `😀` 重复 8 次。
-报告中的 emoji `length=16` 来自 Java UTF-16 长度，实际是 8 个 Unicode 码点，不是写入了 16 个 emoji。
-现有字符集和长度参数下 JDBC 报 `Param incompatible`；历史 SQL 字面量路径也记录列超长。
-目前不能仅凭这些信息断言是驱动、服务器实现还是某个参数单独负责，应在升级后重测两条写入路径及显式 CHAR/BYTE 语义。
-
-H 的建表语句使用 `VALUE ROWID`，与查询或日志 WHERE 中的 ROWID 行定位语义不同。
-不能通过删除这项失败就把普通 ROWID 类型列标成支持，也不能据此否定无主键表采集。
-
-37 项都尚未进入这些值的 CDC 验收。升级后需先确认原声明/输入被接受，再检查 snapshot、归档 CRUD、before/after、JSON 及相关重启/历史结构回放。
-缩小输入、截短中文或把精度改成 6 会变成另一个用例，不能算修复原来的边界。
-
-==== 后续处理顺序与验收口径
-
-先处理 A/C 的流式值失真，因为它们可能正常发布消息却给出错误数值；确认业务是否使用相关字段，并优先验证升级构建或无损接口。
-B 可以作为独立开发项评估，保持 Kafka 版本不变也能研究转换器/消费者解码，但需要实际往返验收。
-D 继续明确拒绝，满足历史时区恢复条件后再开放；E/F/G/H 保留数据库能力限制及升级 TODO。
-测试报告可进一步区分“声明/输入未接受”“显式不支持”“原始事件不一致”“序列化往返不一致”，但这不是把失败改成成功的理由。
-如果未来拆分能力探测与已支持功能回归，应保留严格矩阵及未支持清单，不能靠放宽浮点容差或跳过用例达到全绿。
-97.55% 行覆盖率说明代码执行覆盖程度，不表示这 81 项一致性和能力问题已解决。
-
-==== 81 项定位索引
-
-下表的 F[n] 对应 `shouldPreserveStoredFloatingPointBitsInSnapshotAndStreaming(String, String)[n]`，
-M[n] 对应 `shouldPreserveTypeBoundariesAndNullCrudImages(TypeCase)[n]`，均属于 `DamengDatatypesIT`。
-索引以本次 XML 与 case-catalog 为准，未来增删参数后须重新映射；名称、输入和分类才是跨版本追踪依据。
-A～H 对应前面的分类及失败阶段。
-
-浮点矩阵的“13 值”依次为负上界、负最小正规数、负最小次正规数、普通负小数、负零、正零、最小次正规数、最小正规数、1 的相邻较小值、1、1 的相邻较大值、普通正小数、正上界。
-普通小数为正负 `1.23456789012345` 经对应 Float/Double 参数转换后的值；REAL/FLOAT(1)/FLOAT(24) 使用 Float，其余使用 Double。
-单精度上界为 `3.4e38f`，双精度上界为 `Double.MAX_VALUE`，最小值和相邻值取对应 Java 类型常量/nextUp/nextDown。
-TIME(p) WITH TIME ZONE 的 3 值为 `00:00:00.<p个9> +14:00`、`23:59:59.<p个9> -12:59`、`12:34:56.123456 +05:45`。
-TIMESTAMP(p) WITH TIME ZONE 的 2 值为 `1969-12-31 23:59:59.<p个9> +14:00` 和 `2000-02-29 00:00:00.<p个9> -12:59`。
-矩阵用例设计包含独立 NULL 行，并对接受的输入继续检查值与 NULL 互转及删除镜像；建表或输入被拒绝的实例尚未执行到这些检查。
-
-// datatype-failure-index-start
-[cols="1,7,1",options="header"]
-|===
-|索引 |字段与输入/配置 |分类
-|F[1] |REAL，JDBC 参数 1.23456789012345 |A
-|F[2] |REAL，JDBC 参数 -1.23456789012345 |A
-|F[3] |REAL，JDBC 参数 0.000000123456789 |A
-|F[6] |REAL，JDBC 参数 -0.0 |B
-|F[7] |FLOAT(24)，JDBC 参数 1.23456789012345 |A
-|F[8] |FLOAT(24)，JDBC 参数 -1.23456789012345 |A
-|F[9] |FLOAT(24)，JDBC 参数 0.000000123456789 |A
-|F[12] |FLOAT(24)，JDBC 参数 -0.0 |B
-|F[13] |FLOAT，JDBC 参数 1.23456789012345 |A
-|F[14] |FLOAT，JDBC 参数 -1.23456789012345 |A
-|F[15] |FLOAT，JDBC 参数 0.000000123456789 |A
-|F[18] |FLOAT，JDBC 参数 -0.0 |B
-|F[19] |FLOAT(53)，JDBC 参数 1.23456789012345 |A
-|F[20] |FLOAT(53)，JDBC 参数 -1.23456789012345 |A
-|F[21] |FLOAT(53)，JDBC 参数 0.000000123456789 |A
-|F[24] |FLOAT(53)，JDBC 参数 -0.0 |B
-|F[25] |DOUBLE，JDBC 参数 1.23456789012345 |A
-|F[26] |DOUBLE，JDBC 参数 -1.23456789012345 |A
-|F[27] |DOUBLE，JDBC 参数 0.000000123456789 |A
-|F[30] |DOUBLE，JDBC 参数 -0.0 |B
-|F[32] |DOUBLE，JDBC 参数 2.2250738585072014E-308 |A
-|F[33] |DOUBLE，JDBC 参数 4.9E-324 |A
-|F[34] |DOUBLE，JDBC 参数 1.0000000000000002 |A
-|F[35] |DOUBLE，JDBC 参数 0.9999999999999999 |A
-|F[37] |REAL，JDBC 参数 1.1754944E-38 |A
-|F[38] |REAL，JDBC 参数 1.4E-45 |A
-|M[165] |NUMBER/precise/input=1E125 |E
-|M[166] |NUMBER/precise/input=-1E125 |E
-|M[172] |NUMBER/string/input=1E125 |E
-|M[173] |NUMBER/string/input=-1E125 |E
-|M[179] |NUMBER/double/input=1E125 |E
-|M[180] |NUMBER/double/input=-1E125 |E
-|M[186] |DECIMAL/precise/input=1E125 |E
-|M[187] |DECIMAL/precise/input=-1E125 |E
-|M[193] |DECIMAL/string/input=1E125 |E
-|M[194] |DECIMAL/string/input=-1E125 |E
-|M[200] |DECIMAL/double/input=1E125 |E
-|M[201] |DECIMAL/double/input=-1E125 |E
-|M[207] |NUMERIC/precise/input=1E125 |E
-|M[208] |NUMERIC/precise/input=-1E125 |E
-|M[214] |NUMERIC/string/input=1E125 |E
-|M[215] |NUMERIC/string/input=-1E125 |E
-|M[221] |NUMERIC/double/input=1E125 |E
-|M[222] |NUMERIC/double/input=-1E125 |E
-|M[227] |REAL，13 值矩阵；另有负零 JSON 差异 |A
-|M[228] |FLOAT(1)，13 值矩阵；另有负零 JSON 差异 |A
-|M[229] |FLOAT(24)，13 值矩阵；另有负零 JSON 差异 |A
-|M[230] |FLOAT(25)，13 值矩阵；另有负零 JSON 差异 |A
-|M[231] |FLOAT，13 值矩阵；另有负零 JSON 差异 |A
-|M[232] |FLOAT(53)，13 值矩阵；另有负零 JSON 差异 |A
-|M[233] |FLOAT(126)，13 值矩阵；另有负零 JSON 差异 |A
-|M[234] |DOUBLE，13 值矩阵；另有负零 JSON 差异 |A
-|M[235] |DOUBLE PRECISION，13 值矩阵；另有负零 JSON 差异 |A
-|M[236] |REAL，JDBC NaN |B
-|M[237] |DOUBLE，JDBC NaN |B
-|M[250] |TIME(1) WITH TIME ZONE，3 值矩阵 |C
-|M[252] |TIME(2) WITH TIME ZONE，3 值矩阵 |C
-|M[254] |TIME(3) WITH TIME ZONE，3 值矩阵 |C
-|M[256] |TIME(4) WITH TIME ZONE，3 值矩阵 |C
-|M[258] |TIME(5) WITH TIME ZONE，3 值矩阵 |C
-|M[260] |TIME(6) WITH TIME ZONE，3 值矩阵 |C
-|M[296] |TIMESTAMP(7)，TIMESTAMP'0001-01-01 00:00:00' |F
-|M[297] |TIMESTAMP(7)，TIMESTAMP'1969-12-31 23:59:59.9999999' |F
-|M[298] |TIMESTAMP(7)，TIMESTAMP'2000-02-29 12:34:56.123456789' |F
-|M[299] |TIMESTAMP(7)，TIMESTAMP'9999-12-31 23:59:59.9999999' |F
-|M[300] |TIMESTAMP(7) WITH TIME ZONE，2 值矩阵 |F
-|M[301] |TIMESTAMP(8)，TIMESTAMP'0001-01-01 00:00:00' |F
-|M[302] |TIMESTAMP(8)，TIMESTAMP'1969-12-31 23:59:59.99999999' |F
-|M[303] |TIMESTAMP(8)，TIMESTAMP'2000-02-29 12:34:56.123456789' |F
-|M[304] |TIMESTAMP(8)，TIMESTAMP'9999-12-31 23:59:59.99999999' |F
-|M[305] |TIMESTAMP(8) WITH TIME ZONE，2 值矩阵 |F
-|M[306] |TIMESTAMP(9)，TIMESTAMP'0001-01-01 00:00:00' |F
-|M[307] |TIMESTAMP(9)，TIMESTAMP'1969-12-31 23:59:59.999999999' |F
-|M[308] |TIMESTAMP(9)，TIMESTAMP'2000-02-29 12:34:56.123456789' |F
-|M[309] |TIMESTAMP(9)，TIMESTAMP'9999-12-31 23:59:59.999999999' |F
-|M[310] |TIMESTAMP(9) WITH TIME ZONE，2 值矩阵 |F
-|M[315] |TIMESTAMP(6) WITH LOCAL TIME ZONE，TIMESTAMP'1969-12-31 23:59:59.123456' |D
-|M[333] |CHAR(8 CHAR)，JDBC string(length=8):梦梦梦梦梦梦梦梦 |G
-|M[334] |CHAR(8 CHAR)，JDBC string(length=7):梦梦梦梦梦梦梦 |G
-|M[335] |CHAR(8 CHAR)，JDBC string(length=16):😀😀😀😀😀😀😀😀 |G
-|M[341] |普通列 VALUE ROWID；计划输入 AAABAAAAACAAAAAAAy（建表即失败） |H
-|===
-// datatype-failure-index-end
-
-证据基目录为 `debezium-connector-dameng/target/portable-regression-20261020/`。
-`validation-summary.json` 是完成各阶段后的汇总；根目录早期 `summary.json` 不代表后续阶段的最终状态。
-`database/detailed-results.json` 保留全部失败消息和堆栈；`database/reports/TEST-io.debezium.connector.dameng.DamengDatatypesIT.xml` 用于核对实例和失败层次。
-`database/database-evidence/case-catalog.txt` 用于参数索引映射，`environment-mode-0.txt` 用于环境限定。
-target 是构建输出，发布时应另行归档证据，避免后续 clean 清理后失去原始记录。
-
-=== 发布与资料维护
-
-每次发布记录 Connector commit/版本、插件和镜像校验和、完整 DM 构建、JDBC 数据库/驱动版本、兼容参数、字符集、拓扑、实际测试和已知失败。
-对照本页矩阵更新支持状态，不能仅因单测覆盖率通过将未验证组合标为支持。
-技术依据使用达梦官方 https://eco.dameng.com/document/dm/zh-cn/pm/dbms_logmnr-package.html[DBMS_LOGMNR]、https://eco.dameng.com/document/dm/zh-cn/pm/logmnr-interface-instructions.html[LogMiner 接口]、https://eco.dameng.com/document/dm/zh-cn/pm/physical-storage.html[参数]和 https://eco.dameng.com/document/dm/zh-cn/pm/jdbc-rogramming-guide.html[JDBC 文档]。
-实现边界与用户配置集中维护在本手册；测试说明 `debezium-connector-dameng/src/test/testing.adoc` 保留可复跑入口及历史回归结果，具体运行产物位于各测试的 `target/` 证据目录。
+历史回归数、失败索引和实验过程集中在 `debezium-connector-dameng/src/test/regression-history.adoc`。它们只证明当时的执行范围，不代表当前构建已重新全量验收。
+每次发布记录源码版本、插件/镜像校验和、数据库完整构建、驱动、参数、拓扑、实际测试及已知限制；原始报告另行归档，避免 clean 丢失。

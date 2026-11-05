@@ -51,10 +51,11 @@ class DamengArchiveLogTest {
         assertThat(connection.archiveLogsForRange(200, 200)).containsExactly(first, second);
     }
 
-    @Test
-    void shouldAcceptContiguousArchivePositions() throws Exception {
+    @ParameterizedTest
+    @ValueSource(longs = { 0, 200 })
+    void shouldAcceptContiguousArchivePositions(long previous) throws Exception {
         final var first = file("first", 100, 200, 99);
-        final var second = file("second", 201, 300, 200);
+        final var second = file("second", 201, 300, previous);
         when(connection.readArchiveLogFiles()).thenReturn(List.of(first, second));
 
         assertThat(connection.archiveLogsForRange(150, 250)).containsExactly(first, second);
@@ -143,6 +144,15 @@ class DamengArchiveLogTest {
         when(connection.readArchiveLogFiles()).thenReturn(List.of(new ArchiveLogFile("foreign", 100, 200, magic, 99)));
 
         assertThatThrownBy(() -> connection.archiveLogsForRange(100, 200))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("DB_MAGIC mismatch");
+    }
+
+    @Test
+    void shouldRejectForeignArchivesWithinAnOtherwiseCoveredWindow() throws Exception {
+        when(connection.readArchiveLogFiles()).thenReturn(List.of(
+                file("first", 1, 300, 0), new ArchiveLogFile("foreign", 101, 200, 99, 100)));
+
+        assertThatThrownBy(() -> connection.archiveLogsForRange(50, 250))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("DB_MAGIC mismatch");
     }
 

@@ -36,7 +36,7 @@ class DamengConnectorTaskTest {
 
     @Test
     void shouldCloseBothReaderConnectionsAndPrimaryWhenStandbyCoordinationCannotStart() throws Exception {
-        final var config = DamengConnectorConfigTest.configuration().with("database.standby.hosts", "replica:5236")
+        final var config = DamengTestConfiguration.configuration().with("database.standby.hosts", "replica:5236")
                 .with("errors.max.retries", 2).build();
         final var task = new DamengConnectorTask();
         try (var connections = mockConstruction(DamengConnection.class, (connection, context) -> {
@@ -61,7 +61,7 @@ class DamengConnectorTaskTest {
     @ParameterizedTest
     @CsvSource({ "8.1.2.128, true", "8.1.2.129, false", "8.1.3.140, false", ", false", "'', false" })
     void shouldLogDatabaseVersionAndContinueStartupRegardlessOfTestedStatus(String productVersion, boolean tested) throws SQLException {
-        final var config = DamengConnectorConfigTest.configuration().build();
+        final var config = DamengTestConfiguration.configuration().build();
         final var task = new DamengConnectorTask();
         try (var connections = mockConstruction(DamengConnection.class, (connection, context) -> {
             when(connection.getDatabaseVersion()).thenReturn(new DamengDatabaseVersion("DM DBMS", productVersion, 8, 1));
@@ -86,7 +86,7 @@ class DamengConnectorTaskTest {
     @ParameterizedTest
     @ValueSource(strings = { "HY000", "0A000", "08S01" })
     void shouldWarnAndContinueStartupWhenJdbcVersionMetadataCannotBeRead(String sqlState) throws SQLException {
-        final var config = DamengConnectorConfigTest.configuration().build();
+        final var config = DamengTestConfiguration.configuration().build();
         final var task = new DamengConnectorTask();
         try (var connections = mockConstruction(DamengConnection.class, (connection, context) -> {
             when(connection.getDatabaseVersion()).thenThrow(new SQLException("version metadata unavailable", sqlState));
@@ -105,7 +105,7 @@ class DamengConnectorTaskTest {
 
     @Test
     void shouldCarryStartupRetryBudgetAcrossAttemptsAndClosePartialConnections() throws Exception {
-        final var config = DamengConnectorConfigTest.configuration().with("errors.max.retries", 2).build();
+        final var config = DamengTestConfiguration.configuration().with("errors.max.retries", 2).build();
         final var task = new DamengConnectorTask();
         try (var connections = mockConstruction(DamengConnection.class, (connection, context) -> {
             when(connection.getDatabaseVersion()).thenReturn(TESTED_VERSION);
@@ -131,7 +131,7 @@ class DamengConnectorTaskTest {
 
     @Test
     void shouldNotRetryAnInitialConnectionWhenRetriesAreDisabled() {
-        final var config = DamengConnectorConfigTest.configuration().with("errors.max.retries", 0).build();
+        final var config = DamengTestConfiguration.configuration().with("errors.max.retries", 0).build();
         final var task = new DamengConnectorTask();
         try (var connections = mockConstruction(DamengConnection.class, (connection, context) -> {
             when(connection.getDatabaseVersion()).thenReturn(TESTED_VERSION);
@@ -145,7 +145,7 @@ class DamengConnectorTaskTest {
 
     @Test
     void shouldKeepAuthenticationFailuresTerminalWithoutConsumingRetryBudget() {
-        final var config = DamengConnectorConfigTest.configuration().with("errors.max.retries", 10).build();
+        final var config = DamengTestConfiguration.configuration().with("errors.max.retries", 10).build();
         final var task = new DamengConnectorTask();
         try (var connections = mockConstruction(DamengConnection.class, (connection, context) -> {
             when(connection.getDatabaseVersion()).thenReturn(TESTED_VERSION);
@@ -160,7 +160,7 @@ class DamengConnectorTaskTest {
 
     @Test
     void shouldPreserveTheStartupFailureWhenCleanupAlsoFails() {
-        final var config = DamengConnectorConfigTest.configuration().build();
+        final var config = DamengTestConfiguration.configuration().build();
         final var task = new DamengConnectorTask();
         try (var connections = mockConstruction(DamengConnection.class, (connection, context) -> {
             when(connection.getDatabaseVersion()).thenReturn(TESTED_VERSION);

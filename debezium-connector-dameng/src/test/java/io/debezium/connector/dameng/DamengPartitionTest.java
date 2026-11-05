@@ -27,7 +27,7 @@ class DamengPartitionTest extends AbstractPartitionTest<DamengPartition> {
 
     @Test
     void shouldProvideOneStableOffsetPartitionForTheLogicalServer() {
-        final var config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration().with("topic.prefix", "orders-dm").build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("topic.prefix", "orders-dm").build());
         final var provider = new DamengPartition.Provider(config);
 
         assertThat(provider.getPartitions()).singleElement().satisfies(partition -> {

@@ -50,7 +50,7 @@ class DamengStreamingMetricsTest {
 
     @Test
     void shouldExposeRecoveryBaselineWithoutResettingItWithCounters() throws Exception {
-        final var offset = new DamengOffsetContext(new DamengConnectorConfig(DamengConnectorConfigTest.configuration().build()), 100);
+        final var offset = new DamengOffsetContext(new DamengConnectorConfig(DamengTestConfiguration.configuration().build()), 100);
         metrics.onRecoveryBaseline(offset);
         assertThat(metrics.getRecoveryNonce()).isEmpty();
         assertThat(metrics.getRecoveryBaselineLsn()).isZero();
@@ -80,7 +80,7 @@ class DamengStreamingMetricsTest {
     @BeforeEach
     void before() {
         server = "dameng-metrics-" + UUID.randomUUID();
-        final var rawConfig = DamengConnectorConfigTest.configuration().with("topic.prefix", server).build();
+        final var rawConfig = DamengTestConfiguration.configuration().with("topic.prefix", server).build();
         final var config = new DamengConnectorConfig(rawConfig);
         taskContext = new DamengTaskContext(rawConfig, config);
         queue = mock(ChangeEventQueueMetrics.class);

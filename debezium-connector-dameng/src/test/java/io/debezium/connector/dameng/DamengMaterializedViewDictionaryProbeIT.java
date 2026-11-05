@@ -34,7 +34,7 @@ import io.debezium.connector.dameng.logminer.LogMinerSql;
 import io.debezium.relational.TableId;
 
 /** Compares identical materialized-storage redo with and without the current online dictionary. */
-class DamengMaterializedViewDictionaryIT {
+class DamengMaterializedViewDictionaryProbeIT {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Path EVIDENCE = Path.of("target/materialized-view-dictionary-it.json");
     private static final String BASE = "DBZ_MVD_BASE";

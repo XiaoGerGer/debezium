@@ -40,6 +40,7 @@ import java.util.stream.Stream;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -154,992 +155,9 @@ class DamengStreamingChangeEventSourceTest {
         source = (DamengStreamingChangeEventSource) sourceFactory.getStreamingChangeEventSource();
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = { "fixed", "archive_bytes" })
-    void shouldBoundStandbyMiningByCompletedReplayInsteadOfReceivedArchives(String strategy) throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("database.standby.hosts", "replica:5236")
-                .with("log.mining.window.strategy", strategy).build());
-        createSource();
-        when(connection.readStandbyProgress()).thenReturn(new DamengConnection.StandbyProgress(140, 125));
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isNull();
-        verify(connection).startLogMining(90, 125, false);
-        assertThat(offset.getLsn()).isEqualTo(125);
-        assertThat(delivered).hasSize(1);
-        assertThat(metrics.getLatestArchivedLsn()).isEqualTo(150);
-        assertThat(metrics.getStandbyReplayableLsn()).isEqualTo(140);
-        assertThat(metrics.getStandbyReplayedLsn()).isEqualTo(125);
-        assertThat(metrics.getStandbyMiningUpperLsn()).isEqualTo(125);
-        metrics.reset();
-        assertThat(metrics.getStandbyMiningUpperLsn()).isZero();
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = { "fixed", "archive_bytes" })
-    void shouldRejectAStandbyReplayRegressionBeforePublishingAnyRecords(String strategy) throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("database.standby.hosts", "replica:5236")
-                .with("log.mining.window.strategy", strategy).build());
-        createSource();
-        when(connection.readStandbyProgress()).thenReturn(new DamengConnection.StandbyProgress(150, 150), new DamengConnection.StandbyProgress(100, 100));
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).hasMessageContaining("replay boundary regressed");
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldStopBeforeRebindingACachedWindowToANewPrimaryGeneration() throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("database.standby.hosts", "replica:5236").build());
-        createSource();
-        doThrow(new SQLException("primary changed", "08006")).when(connection).validateUnchangedPrimary();
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).hasMessageContaining("primary changed");
-        verify(connection, times(1)).validatePrimaryStandbyIdentity(offset);
-        verify(connection, never()).startLogMining(anyLong(), anyLong(), anyBoolean());
-        assertThat(offset.getLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldReusePhysicalMetadataAcrossInterleavedTables() {
-        final var first = schema.getTables().forTable(TABLE_ID);
-        final var second = Table.editor().tableId(new TableId(null, "APP", "OTHER"))
-                .addColumn(Column.editor().name("VALUE").jdbcType(Types.VARCHAR).type("VARCHAR").length(30).create()).create();
-        final var firstPhysical = source.physicalTable(7, first);
-        final var secondPhysical = source.physicalTable(8, second);
-
-        assertThat(firstPhysical.id().table()).isEqualTo("OBJ# 7");
-        assertThat(secondPhysical.id().table()).isEqualTo("OBJ# 8");
-        assertThat(firstPhysical.columnWithName("COL 1").jdbcType()).isEqualTo(Types.INTEGER);
-        assertThat(secondPhysical.columnWithName("COL 1").jdbcType()).isEqualTo(Types.VARCHAR);
-        assertThat(source.physicalTable(7, first)).isSameAs(firstPhysical);
-        assertThat(source.physicalTable(8, second)).isSameAs(secondPhysical);
-    }
-
-    @Test
-    void shouldRebuildPhysicalMetadataAfterHistoricalSchemaReplacement() {
-        final var original = schema.getTables().forTable(TABLE_ID);
-        final var originalPhysical = source.physicalTable(7, original);
-        final var altered = original.edit()
-                .addColumn(Column.editor().name("LABEL").jdbcType(Types.CHAR).type("CHAR", "CHAR(10 CHAR)")
-                        .length(10).charsetName("UTF-8").create())
-                .reorderColumn("LABEL", null).create();
-        final var alteredPhysical = source.physicalTable(7, altered);
-
-        assertThat(alteredPhysical).isNotSameAs(originalPhysical);
-        assertThat(alteredPhysical.retrieveColumnNames()).containsExactly("COL 1", "COL 2");
-        final var label = alteredPhysical.columnWithName("COL 1");
-        assertThat(label.jdbcType()).isEqualTo(Types.CHAR);
-        assertThat(label.typeExpression()).isEqualTo("CHAR(10 CHAR)");
-        assertThat(label.length()).isEqualTo(10);
-        assertThat(label.charsetName()).isEqualTo("UTF-8");
-        assertThat(alteredPhysical.columnWithName("COL 2").jdbcType()).isEqualTo(Types.INTEGER);
-        assertThat(source.physicalTable(7, altered)).isSameAs(alteredPhysical);
-        // Replaying an earlier schema must never return the most recent mapping.
-        final var replayed = source.physicalTable(7, original);
-        assertThat(replayed.retrieveColumnNames()).containsExactly("COL 1");
-        assertThat(replayed.columnWithName("COL 1").jdbcType()).isEqualTo(Types.INTEGER);
-        assertThat(original.retrieveColumnNames()).containsExactly("ID");
-    }
-
-    @Test
-    void shouldRebuildPhysicalMetadataForARecreatedObjectOrEqualSchemaInstance() {
-        final var original = schema.getTables().forTable(TABLE_ID);
-        final var cached = source.physicalTable(7, original);
-        final var replacement = original.edit().create();
-        assertThat(replacement).isEqualTo(original).isNotSameAs(original);
-        final var replaced = source.physicalTable(7, replacement);
-        assertThat(replaced).isNotSameAs(cached);
-        final var recreated = source.physicalTable(99, replacement);
-        assertThat(recreated).isNotSameAs(replaced);
-        assertThat(recreated.id().table()).isEqualTo("OBJ# 99");
-        assertThat(source.physicalTable(99, replacement)).isSameAs(recreated);
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = { "ALTER TABLE APP.T ADD NAME VARCHAR(30)", "DROP TABLE APP.T", "ALTER TABLE APP.T RENAME TO T2", "TRUNCATE TABLE APP.T" })
-    void shouldReleaseCachedPhysicalMetadataWhenApplyingDdl(String ddl) throws Exception {
-        final var table = schema.getTables().forTable(TABLE_ID);
-        final var beforeDdl = new AtomicReference<Table>();
-        final var afterDdl = new AtomicReference<Table>();
-        doAnswer(invocation -> {
-            beforeDdl.compareAndSet(null, source.physicalTable(7, table));
-            return true;
-        }).when(dispatcher).dispatchDataChangeEvent(any(), any(), any());
-        doAnswer(invocation -> {
-            afterDdl.set(source.physicalTable(7, table));
-            return null;
-        }).when(dispatcher).dispatchSchemaChangeEvent(any(), any(), any(TableId.class), any());
-        records(List.of(dml(101, 90, 110, 1), commit(110, 90, 1),
-                Map.of("SCN", 121L, "START_SCN", 120L, "COMMIT_SCN", 130L, "XID", new byte[]{ 2 },
-                        "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", ddl),
-                commit(130, 120, 2)));
-
-        source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
-
-        assertThat(failure.get()).isNull();
-        assertThat(beforeDdl.get()).isNotNull();
-        assertThat(afterDdl.get()).isNotNull().isNotSameAs(beforeDdl.get());
-    }
-
-    @Test
-    void shouldResumeAfterTheLastDeliveredStatementInsideATransaction() throws Exception {
-        records(List.of(dml(101, 90, 120, 1), dml(102, 90, 120, 1), commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.init(offset);
-        assertThat(source.getOffsetContext()).isSameAs(offset);
-        offset.setCommitLsn(120);
-        offset.setTransactionId("01");
-        offset.setEventSerialNo(0);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).hasSize(1);
-        assertThat(delivered.get(0)).containsEntry("change_lsn", 102L).containsEntry("event_serial_no", 1L)
-                .containsEntry("lsn", 90L);
-    }
-
-    @ParameterizedTest
-    @org.junit.jupiter.params.provider.CsvSource({ "false,fixed", "true,fixed", "false,archive_bytes", "true,archive_bytes" })
-    void shouldCacheNewRangesAndReconstructOnlyAtCommit(boolean spill, String strategy) throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
-                .with("log.mining.window.strategy", strategy).with("log.mining.window.max.bytes", 64)
-                .with("log.mining.buffer.memory.bytes", spill ? 512 : 1048576).with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
-        createSource();
-        final var polls = new AtomicInteger();
-        when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
-            if (polls.incrementAndGet() > 3) {
-                running.set(false);
-            }
-            return 120L;
-        });
-        doAnswer(invocation -> {
-            connection.latestArchivedLsn();
-            return List.of(new DamengConnection.ArchiveLogFile("first", 90, 100, 42, 89, 0, 0, 0, 64),
-                    new DamengConnection.ArchiveLogFile("second", 101, 110, 42, 100, 0, 0, 0, 64),
-                    new DamengConnection.ArchiveLogFile("third", 111, 120, 42, 110, 0, 0, 0, 64));
-        }).when(connection).readArchiveLogFiles();
-        final List<Long> starts = new ArrayList<>();
-        doAnswer(invocation -> {
-            final long start = invocation.getArgument(0);
-            final long end = invocation.getArgument(1);
-            starts.add(start);
-            if (end == 100) {
-                records(List.of(dml(95, 92, 0, 1)));
-            }
-            else if (end == 110) {
-                records(List.of(dml(105, 0, 0, 1)));
-            }
-            else if (start == 111) {
-                records(List.of(commit(115, 0, 1)));
-            }
-            else if (start == 92) {
-                records(List.of(dml(95, 92, 115, 1), dml(105, 92, 115, 1), commit(115, 92, 1)));
-            }
-            else {
-                throw new AssertionError("Unexpected historical re-read " + start);
-            }
-            return null;
-        }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isNull();
-        assertThat(starts).containsExactly(90L, 101L, 111L, 92L);
-        assertThat(delivered).extracting(value -> value.get("change_lsn"))
-                .containsExactly(95L, 105L);
-        assertThat(delivered).allSatisfy(value -> assertThat(value).containsEntry("lsn", 92L));
-        assertThat(offset.getLsn()).isEqualTo(120);
-        assertThat(metrics.getMiningSessions()).isEqualTo(4);
-        assertThat(metrics.getReconstructionSessions()).isEqualTo(1);
-        assertThat(metrics.getMinedRows()).isEqualTo(6);
-        assertThat(metrics.getReconstructedRows()).isEqualTo(3);
-        assertThat(metrics.getSpilledTransactions()).isEqualTo(spill ? 2 : 0);
-        try (var files = java.nio.file.Files.list(spillDirectory)) {
-            assertThat(files.toList()).isEmpty();
-        }
-        verify(connection).archiveLogsForRange(92, 110);
-        verify(connection).archiveLogsForRange(92, 120);
-        verify(connection, times(4)).endLogMining();
-    }
-
-    @Test
-    void shouldFailBeforeMiningIfSelectedArchiveSizeIsUnavailable() throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.window.strategy", "archive_bytes").build());
-        createSource();
-        doReturn(List.of(new DamengConnection.ArchiveLogFile("unknown", 1, 150, 42, 0))).when(connection).readArchiveLogFiles();
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).hasMessageContaining("LEN");
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(delivered).isEmpty();
-        verify(connection, never()).startLogMining(anyLong(), anyLong(), anyBoolean());
-    }
-
-    @ParameterizedTest
-    @ValueSource(booleans = { false, true })
-    void shouldKeepTheReplayPositionWhenArchivesOrForwardMiningAreUnavailable(boolean archiveMissing) throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
-                .with("log.mining.window.strategy", "fixed").build());
-        createSource();
-        when(connection.latestArchivedLsn()).thenReturn(110L);
-        final var unavailable = new SQLException("historical range unavailable");
-        if (archiveMissing) {
-            doThrow(unavailable).when(connection).archiveLogsForRange(92, 110);
-        }
-        doAnswer(invocation -> {
-            final long start = invocation.getArgument(0);
-            if (start == 90) {
-                records(List.of(dml(95, 92, 0, 1)));
-            }
-            else {
-                throw unavailable;
-            }
-            return null;
-        }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isSameAs(unavailable);
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(92);
-        assertThat(metrics.getScannedUpperLsn()).isEqualTo(100);
-        assertThat(metrics.getOldestReplayLsn()).isEqualTo(92);
-        if (archiveMissing) {
-            verify(connection, times(1)).startLogMining(anyLong(), anyLong(), eq(false));
-        }
-        else {
-            verify(connection).startLogMining(101, 110, false);
-            verify(connection, times(2)).endLogMining();
-        }
-    }
-
-    @ParameterizedTest
-    @ValueSource(booleans = { false, true })
-    void shouldKeepTheReplayPositionWhenHistoricalReconstructionIsUnavailable(boolean archiveMissing) throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
-                .with("log.mining.window.strategy", "fixed").build());
-        createSource();
-        when(connection.latestArchivedLsn()).thenReturn(110L);
-        final var unavailable = new SQLException("historical range unavailable");
-        if (archiveMissing) {
-            doThrow(unavailable).when(connection).archiveLogsForRange(92, 110);
-        }
-        doAnswer(invocation -> {
-            final long start = invocation.getArgument(0);
-            if (start == 90) {
-                records(List.of(dml(95, 92, 0, 1)));
-            }
-            else if (start == 101) {
-                records(List.of(commit(105, 0, 1)));
-            }
-            else {
-                throw unavailable;
-            }
-            return null;
-        }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isSameAs(unavailable);
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(92);
-        assertThat(metrics.getScannedUpperLsn()).isEqualTo(100);
-        assertThat(metrics.getOldestReplayLsn()).isEqualTo(92);
-        if (archiveMissing) {
-            verify(connection, times(1)).startLogMining(anyLong(), anyLong(), eq(false));
-        }
-        else {
-            verify(connection).startLogMining(92, 110, false);
-            verify(connection, times(3)).endLogMining();
-        }
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = { "path", "quota", "corruption" })
-    void shouldNotAdvanceTheOffsetWhenTemporaryStorageFails(String mode) throws Exception {
-        final var path = mode.equals("path") ? java.nio.file.Files.writeString(spillDirectory.resolve("not-directory"), "keep") : spillDirectory;
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", 512)
-                .with("log.mining.buffer.spill.path", path.toString())
-                .with("log.mining.buffer.spill.max.bytes", mode.equals("quota") ? 1 : 1048576).build());
-        createSource();
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        if (mode.equals("corruption")) {
-            doAnswer(invocation -> {
-                try (var files = java.nio.file.Files.walk(spillDirectory)) {
-                    final var file = files.filter(java.nio.file.Files::isRegularFile).findFirst().orElseThrow();
-                    final var bytes = java.nio.file.Files.readAllBytes(file);
-                    bytes[bytes.length - 1] ^= 1;
-                    java.nio.file.Files.write(file, bytes);
-                }
-                return null;
-            }).when(connection).validateUnchangedPrimary();
-        }
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isNotNull();
-        assertThat(io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer.isStorageFailure(failure.get())).isTrue();
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(offset.getCommitLsn()).isEqualTo(90);
-        if (!mode.equals("path")) {
-            try (var files = java.nio.file.Files.list(spillDirectory)) {
-                assertThat(files.toList()).isEmpty();
-            }
-        }
-    }
-
-    @Test
-    void shouldPinAnEarlierOpenTransactionWhileDeliveringAnotherCommit() throws Exception {
-        records(List.of(dml(101, 90, 0, 1), dml(110, 105, 120, 2), commit(120, 105, 2)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).hasSize(1);
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(delivered.get(0)).containsEntry("lsn", 90L).containsEntry("mining_transaction_id", "02");
-        assertThat(metrics.getOpenTransactions()).isEqualTo(1);
-        assertThat(metrics.getOldestReplayLsn()).isEqualTo(90);
-        assertThat(metrics.getScannedUpperLsn()).isEqualTo(150);
-        assertThat(metrics.getLatestArchivedLsn()).isEqualTo(150);
-        assertThat(metrics.getWindowBufferRecords()).isEqualTo(3);
-        assertThat(metrics.getWindowBufferEstimatedBytes()).isPositive();
-    }
-
-    @Test
-    void shouldNotReplayAnAlreadyCompletedTransaction() throws Exception {
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        offset.setCommitLsn(120);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).isEmpty();
-    }
-
-    @Test
-    void shouldExcludeDispatchedTransactionsFromRestartBufferCapacityWhilePreservingOpenAndNewTransactions() throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.max.transactions", 2).build());
-        createSource();
-        records(List.of(dml(95, 92, 0, 1), dml(96, 94, 100, 2), commit(100, 94, 2),
-                dml(105, 102, 120, 3), commit(120, 102, 3), dml(130, 125, 140, 5), commit(140, 125, 5)));
-        final var offset = new DamengOffsetContext(config, 92);
-        offset.setCommitLsn(120);
-        offset.setTransactionId("04");
-        offset.setEventSerialNo(Long.MAX_VALUE);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).singleElement().satisfies(value -> assertThat(value)
-                .containsEntry("change_lsn", 130L).containsEntry("mining_transaction_id", "05").containsEntry("lsn", 92L));
-        assertThat(offset.getLsn()).isEqualTo(92);
-        assertThat(offset.getCommitLsn()).isEqualTo(140);
-        assertThat(metrics.getOpenTransactions()).isEqualTo(1);
-        assertThat(metrics.getBufferLimitFailures()).isZero();
-        verify(connection).startLogMining(92, 150, false);
-    }
-
-    @Test
-    void shouldExcludeDispatchedTransactionsDuringReconstructionWhilePreservingTheNextOpenTransaction() throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
-                .with("log.mining.buffer.max.transactions", 3).build());
-        createSource();
-        final var polls = new AtomicInteger();
-        when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
-            if (polls.incrementAndGet() > 3) {
-                running.set(false);
-            }
-            return 120L;
-        });
-        final List<Long> starts = new ArrayList<>();
-        doAnswer(invocation -> {
-            final long start = invocation.getArgument(0);
-            starts.add(start);
-            if (start == 90) {
-                records(List.of(dml(95, 92, 0, 1), dml(96, 94, 98, 2), commit(98, 94, 2)));
-            }
-            else if (start == 101) {
-                records(List.of(dml(105, 102, 108, 3), commit(108, 102, 3)));
-            }
-            else if (start == 111) {
-                records(List.of(dml(113, 112, 0, 4), commit(115, 0, 1)));
-            }
-            else if (start == 92) {
-                // The checkpoint transaction remains eligible for END cleanup, alongside the completing and open transactions.
-                records(List.of(dml(95, 92, 115, 1), dml(96, 94, 98, 2), commit(98, 94, 2),
-                        dml(105, 102, 108, 3), commit(108, 102, 3), dml(113, 112, 0, 4), commit(115, 92, 1)));
-            }
-            else {
-                throw new AssertionError("Unexpected mining start " + start);
-            }
-            return null;
-        }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isNull();
-        assertThat(starts).containsExactly(90L, 101L, 111L, 92L);
-        assertThat(delivered).extracting(value -> value.get("change_lsn")).containsExactly(96L, 105L, 95L);
-        assertThat(offset.getLsn()).isEqualTo(112);
-        assertThat(offset.getCommitLsn()).isEqualTo(115);
-        assertThat(metrics.getOpenTransactions()).isEqualTo(1);
-        assertThat(metrics.getReconstructionSessions()).isEqualTo(1);
-        assertThat(metrics.getBufferLimitFailures()).isZero();
-    }
-
-    @Test
-    void shouldFinishRestoredTransactionMetadataWhenItsLastStatementIsAlreadyCheckpointed() throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("provide.transaction.metadata", true).build());
-        createSource();
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        final var saved = new DamengOffsetContext(config, 90);
-        saved.setCommitLsn(120);
-        saved.setTransactionId("01");
-        saved.setEventSerialNo(Long.MAX_VALUE);
-        saved.getTransactionContext().beginTransaction("01");
-        saved.getTransactionContext().event(TABLE_ID);
-        final var offset = new DamengOffsetContext.Loader(config).load(saved.getOffset());
-        final List<SourceRecord> metadata = new ArrayList<>();
-        final var monitor = new TransactionMonitor(config, new DamengEventMetadataProvider(), config.schemaNameAdjuster(), metadata::add, "dm.transaction");
-        doAnswer(invocation -> {
-            monitor.transactionCommittedEvent(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2));
-            return null;
-        }).when(dispatcher).dispatchTransactionCommittedEvent(any(), any(), any());
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).isEmpty();
-        assertThat(metadata).singleElement().satisfies(record -> {
-            final var value = (Struct) record.value();
-            assertThat(value.getString("status")).isEqualTo("END");
-            assertThat(value.getString("id")).isEqualTo("01");
-            assertThat(value.getInt64("event_count")).isEqualTo(1L);
-        });
-        assertThat(offset.getTransactionContext().isTransactionInProgress()).isFalse();
-        assertThat(offset.getTransactionContext().getTotalEventCount()).isZero();
-        assertThat(offset.getOffset()).doesNotContainKey("transaction_id");
-        assertThat(offset.getEventSerialNo()).isEqualTo(Long.MAX_VALUE);
-        assertThat(offset.getLsn()).isEqualTo(150);
-    }
-
-    @Test
-    void shouldWaitForAnArchivedWindowWithoutMiningOrAdvancingTheReplayPosition() throws Exception {
-        when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
-            running.set(false);
-            return 90L;
-        });
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isNull();
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(metrics.getLatestArchivedLsn()).isEqualTo(90);
-        assertThat(delivered).isEmpty();
-        verify(connection, never()).startLogMining(anyLong(), anyLong(), anyBoolean());
-    }
-
-    @Test
-    void shouldNotPublishAWindowMinedFromADemotedPrimary() throws Exception {
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        final var demotion = new SQLException("primary was demoted", "08S01");
-        doThrow(demotion).when(connection).validateUnchangedPrimary();
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isSameAs(demotion);
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(metrics.getWindowBufferRecords()).isEqualTo(2);
-        verify(connection).endLogMining();
-    }
-
-    @Test
-    void shouldNotPublishAWindowMinedAcrossChangedLexicalSettings() throws Exception {
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        final var drift = new IllegalStateException("lexical settings changed during mining");
-        doNothing().doThrow(drift).when(connection).validateUnchangedCompatibility();
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isSameAs(drift);
-        assertThat(delivered).isEmpty();
-        assertThat(schemaOffsets).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(offset.getCommitLsn()).isEqualTo(90);
-        verify(connection).endLogMining();
-    }
-
-    @Test
-    void shouldCloseMiningAndRetainTheReplayPositionWhenTheQueryFails() throws Exception {
-        final var queryFailure = new SQLException("archive read failed", "08S01");
-        when(rows.next()).thenThrow(queryFailure);
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isSameAs(queryFailure);
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(metrics.getScannedUpperLsn()).isEqualTo(90);
-        verify(connection).endLogMining();
-    }
-
-    @Test
-    void shouldKeepTheLastDeliveredOrdinalWhenStoppedDuringDispatch() throws Exception {
-        records(List.of(dml(101, 90, 120, 1), dml(102, 90, 120, 1), commit(120, 90, 1)));
-        stopAfter = 1;
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).hasSize(1);
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(offset.getEventSerialNo()).isZero();
-        assertThat(offset.getTransactionId()).isEqualTo("01");
-        assertThat(metrics.getScannedUpperLsn()).isEqualTo(150);
-        assertThat(metrics.getOldestReplayLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldStopBeforePublishingTheNextCommittedTransaction() throws Exception {
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1), dml(131, 125, 140, 2), commit(140, 125, 2)));
-        doAnswer(invocation -> {
-            running.set(false);
-            return null;
-        }).when(dispatcher).dispatchTransactionCommittedEvent(any(), any(), any());
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).hasSize(1);
-        assertThat(delivered.get(0)).containsEntry("mining_transaction_id", "01");
-        assertThat(offset.getLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldSkipAnUnknownObjectWithoutSkippingTheNextCapturedRow() throws Exception {
-        final var unknown = new java.util.HashMap<>(dml(101, 90, 120, 1));
-        unknown.put("DATA_OBJ#", 99L);
-        records(List.of(unknown, dml(102, 90, 120, 1), commit(120, 90, 1)));
-
-        source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
-
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).singleElement().satisfies(value -> assertThat(value)
-                .containsEntry("change_lsn", 102L).containsEntry("event_serial_no", 1L));
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {
-            "GRANT SELECT ON APP.T TO CDC_USER",
-            "REVOKE SELECT ON APP.T FROM CDC_USER",
-            "// 授予要采集表的 select 权限\nGRANT SELECT ON APP.T TO CDC_USER",
-            "// 回收权限\r\nREVOKE SELECT ON APP.T FROM CDC_USER",
-            "CREATE FORCE VIEW APP.V AS SELECT ID FROM APP.T",
-            "CREATE OR REPLACE FORCE VIEW IF NOT EXISTS APP.V AS SELECT ID FROM APP.T"
-    })
-    void shouldSkipPrivilegeDdlAndContinueDeliveringCapturedChanges(String ddl) throws Exception {
-        final var privilege = Map.<String, Object> of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 110L, "XID", new byte[]{ 1 },
-                "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", ddl);
-        records(List.of(privilege, commit(110, 90, 1), dml(121, 115, 130, 2), commit(130, 115, 2)));
-        final var historicalTable = schema.getTables().forTable(TABLE_ID);
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).singleElement().satisfies(value -> assertThat(value).containsEntry("change_lsn", 121L));
-        assertThat(schemaOffsets).isEmpty();
-        assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(historicalTable);
-        assertThat(offset.getLsn()).isEqualTo(150);
-        assertThat(offset.getCommitLsn()).isEqualTo(130);
-    }
-
-    @Test
-    void shouldRejectForceViewAndTableDdlInOneRecordWithoutAdvancingOffsets() throws Exception {
-        final var compound = Map.<String, Object> of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 110L, "XID", new byte[]{ 1 },
-                "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", "CREATE FORCE VIEW APP.V AS SELECT ID FROM APP.T; ALTER TABLE APP.T ADD V INT");
-        records(List.of(compound, commit(110, 90, 1), dml(121, 115, 130, 2), commit(130, 115, 2)));
-        final var historicalTable = schema.getTables().forTable(TABLE_ID);
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Cannot process Dameng DDL", "LSN 101");
-        assertThat(delivered).isEmpty();
-        assertThat(schemaOffsets).isEmpty();
-        assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(historicalTable);
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(offset.getCommitLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldFailOnUnknownTableDdlAfterPrivilegesWithoutAdvancingPastIt() throws Exception {
-        final var privilege = Map.<String, Object> of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 110L, "XID", new byte[]{ 1 },
-                "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", "GRANT SELECT ON APP.T TO CDC_USER");
-        final var unsupported = Map.<String, Object> of("SCN", 121L, "START_SCN", 115L, "COMMIT_SCN", 130L, "XID", new byte[]{ 2 },
-                "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", "// unsupported table change\nALTER TABLE APP.T MOVE");
-        records(List.of(privilege, commit(110, 90, 1), unsupported, dml(122, 115, 130, 2), commit(130, 115, 2)));
-        final var historicalTable = schema.getTables().forTable(TABLE_ID);
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Unsupported ALTER TABLE");
-        assertThat(delivered).isEmpty();
-        assertThat(schemaOffsets).isEmpty();
-        assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(historicalTable);
-        assertThat(offset.getLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldFailOnMissingRedoInsteadOfAcknowledgingTheCapturedRow() throws Exception {
-        final var missingRedo = new java.util.HashMap<>(dml(101, 90, 120, 1));
-        missingRedo.remove("SQL_REDO");
-        records(List.of(missingRedo, commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining("Missing Dameng SQL_REDO");
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldSampleBufferUsageDuringLargeWindows() throws Exception {
-        final Map<String, Object> sequenceAllocation = Map.of("SCN", 101L, "OPERATION_CODE", 37);
-        records(java.util.Collections.nCopies(1_025, sequenceAllocation));
-        metrics = spy(metrics);
-        source = new DamengStreamingChangeEventSource(config, factory, dispatcher, errorHandler, Clock.SYSTEM, schema, metrics);
-
-        source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
-
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).isEmpty();
-        assertThat(metrics.getWindowBufferRecords()).isEqualTo(1_025);
-        verify(metrics).onBufferUsageUpdated(anyLong(), eq(1_024L));
-    }
-
-    @Test
-    void shouldResumeTheNextTransactionSharingACommitPosition() throws Exception {
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1), dml(110, 105, 120, 2), commit(120, 105, 2)));
-        final var offset = new DamengOffsetContext(config, 90);
-        offset.setCommitLsn(120);
-        offset.setTransactionId("01");
-        offset.setEventSerialNo(Long.MAX_VALUE);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).hasSize(1);
-        assertThat(delivered.get(0)).containsEntry("mining_transaction_id", "02").containsEntry("event_serial_no", 0L);
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = { "SCN", "OPERATION_CODE", "ROLL_BACK", "SSN", "CSF", "DATA_OBJ#" })
-    void shouldRejectNullRequiredNumericFieldsBeforePublishingAnyTransaction(String field) throws Exception {
-        final var invalid = new java.util.HashMap<>(dml(130, 125, 140, 2));
-        invalid.put(field, null);
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1), invalid, commit(140, 125, 2)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining(field);
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(offset.getCommitLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldPreserveNullableMarkerMetadataAndZeroObjectVersion() throws Exception {
-        final var marker = new java.util.HashMap<>(commit(120, 0, 1));
-        marker.put("START_SCN", null);
-        marker.put("COMMIT_SCN", null);
-        marker.put("DATA_OBJV#", 0L);
-        marker.put("RBASQN", 0L);
-        records(List.of(marker));
-        assertThat(rows.next()).isTrue();
-        final var row = source.readRow(rows);
-        assertThat(row.startLsn()).isZero();
-        assertThat(row.commitLsn()).isZero();
-        assertThat(row.objectId()).isZero();
-        assertThat(row.objectVersion()).isZero();
-        assertThat(row.archiveSequence()).isZero();
-        assertThat(row.blockNumber()).isEqualTo(-1);
-        assertThat(row.byteOffset()).isEqualTo(-1);
-    }
-
-    @ParameterizedTest
-    @ValueSource(longs = { 0, -1, 999 })
-    void shouldRejectUnhandledOperationsWithUnresolvedObjectsAndKeepDiagnosticsAfterSpilling(long objectId) throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", 512)
-                .with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
-        createSource();
-        final var unsupported = new java.util.HashMap<>(dml(101, 90, 120, 1));
-        unsupported.put("OPERATION_CODE", 255);
-        unsupported.put("DATA_OBJ#", objectId);
-        unsupported.put("DATA_OBJV#", 2L);
-        unsupported.put("RBASQN", 0L);
-        unsupported.put("RBABLK", 123L);
-        unsupported.put("RBABYTE", 45L);
-        records(List.of(unsupported, commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isInstanceOf(IllegalStateException.class)
-                .hasMessageContainingAll("operation 255", "unresolved table", "LSN 101", "RBABLK=123", "RBABYTE=45", "DATA_OBJV#=2")
-                .hasMessageNotContaining("INSERT INTO");
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(offset.getCommitLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldSkipUnhandledOperationsOnHistoricallyKnownExcludedTables() throws Exception {
-        final var excluded = new TableId(null, "APP", "EXCLUDED");
-        schema.getTables().overwriteTable(schema.getTables().forTable(TABLE_ID).edit().tableId(excluded)
-                .addAttribute(Attribute.editor().name("dameng.object.id").value("8").create()).create());
-        final var unsupported = new java.util.HashMap<>(dml(101, 90, 120, 1));
-        unsupported.put("OPERATION_CODE", 255);
-        unsupported.put("DATA_OBJ#", 8L);
-        records(List.of(unsupported, commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(150);
-    }
-
-    @Test
-    void shouldIndexHistoricalObjectsOnceForManyRowsIncludingUnknownObjects() throws Exception {
-        final var tables = spy(schema.getTables());
-        when(schema.getTables()).thenReturn(tables);
-        final List<Map<String, Object>> input = new ArrayList<>();
-        for (int i = 0; i < 100; i++) {
-            final var change = new java.util.HashMap<>(dml(101, 90, 120, 1));
-            change.put("DATA_OBJ#", i % 2 == 0 ? 7L : 99L);
-            input.add(change);
-        }
-        input.add(commit(120, 90, 1));
-        records(input);
-        source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).hasSize(50);
-        verify(tables, times(1)).tableIds();
-    }
-
-    @Test
-    void shouldRejectDuplicateHistoricalObjectIdentities() throws Exception {
-        schema.getTables().overwriteTable(schema.getTables().forTable(TABLE_ID).edit().tableId(new TableId(null, "APP", "DUPLICATE"))
-                .addAttribute(Attribute.editor().name("dameng.object.id").value("7").create()).create());
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
-        assertThat(failure.get()).hasMessageContaining("Duplicate Dameng historical DATA_OBJ# 7");
-        assertThat(delivered).isEmpty();
-    }
-
-    @ParameterizedTest
-    @ValueSource(ints = { 13, 14, 255, 999 })
-    void shouldFailInsteadOfSkippingAnUnhandledCapturedOperation(int operation) throws Exception {
-        final var unsupported = new java.util.HashMap<>(dml(101, 90, 120, 1));
-        unsupported.put("OPERATION_CODE", operation);
-        records(List.of(unsupported, commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining("Unsupported Dameng LogMiner operation " + operation);
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldKeepTruncateReplayableUntilItsDataEventIsAcknowledged() throws Exception {
-        records(List.of(truncate(), commit(120, 90, 1)));
-        source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
-
-        assertThat(failure.get()).isNull();
-        assertThat(schemaOffsets).hasSize(1);
-        assertThat(schemaOffsets.get(0).get("event_serial_no")).isEqualTo(-1L);
-        assertThat(delivered).singleElement().satisfies(offset -> assertThat(offset)
-                .containsEntry("event_serial_no", 0L).containsEntry("change_lsn", 101L));
-    }
-
-    @Test
-    void shouldReplayTruncateAfterAcknowledgingOnlyItsSchemaEvent() throws Exception {
-        records(List.of(truncate(), commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        offset.setCommitLsn(120);
-        offset.setTransactionId("01");
-        offset.setEventSerialNo(-1);
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).hasSize(1);
-    }
-
-    @Test
-    void shouldPublishBeyondIgnoredLegacyBudgets() throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.max.bytes", 1)
-                .with("log.mining.buffer.max.records", 1).build());
-        createSource();
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).hasSize(1);
-        assertThat(metrics.getBufferLimitFailures()).isZero();
-        assertThat(metrics.getWindowBufferRecords()).isEqualTo(2);
-        assertThat(metrics.getWindowBufferEstimatedBytes()).isGreaterThan(1);
-        assertThat(offset.getLsn()).isEqualTo(150);
-    }
-
-    @Test
-    void shouldFailWithoutPublishingOrAdvancingOffsetsForOversizedSql() throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.max.sql.bytes", 8).build());
-        createSource();
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-        assertThat(failure.get()).hasMessageContaining("max.sql.bytes");
-        assertThat(delivered).isEmpty();
-        assertThat(metrics.getBufferLimitFailures()).isEqualTo(1);
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(offset.getCommitLsn()).isEqualTo(90);
-    }
-
-    @Test
-    void shouldRecordCapacityFailureWithoutPublishingOrHidingItBehindCleanupFailure() throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.max.transactions", 1).build());
-        createSource();
-        records(List.of(dml(101, 90, 110, 1), commit(110, 90, 1), dml(120, 115, 0, 2)));
-        final var cleanupFailure = new SQLException("cleanup connection lost", "08S01");
-        doThrow(cleanupFailure).when(connection).endLogMining();
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining("log.mining.buffer.max.transactions");
-        assertThat(failure.get().getSuppressed()).containsExactly(cleanupFailure);
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(metrics.getBufferLimitFailures()).isEqualTo(1);
-        assertThat(metrics.getWindowBufferRecords()).isEqualTo(3);
-        assertThat(metrics.getPeakWindowBufferRecords()).isEqualTo(3);
-        assertThat(metrics.getScannedUpperLsn()).isEqualTo(90);
-        assertThat(metrics.getOldestReplayLsn()).isEqualTo(90);
-        assertThat(metrics.getLatestArchivedLsn()).isEqualTo(150);
-    }
-
-    @Test
-    void shouldNotReportAFailedMiningSessionAsACompletedScan() throws Exception {
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        final var cleanupFailure = new SQLException("end mining failed");
-        doThrow(cleanupFailure).when(connection).endLogMining();
-        final var offset = new DamengOffsetContext(config, 90);
-        source.execute(context, new DamengPartition("dm"), offset);
-
-        assertThat(failure.get()).isSameAs(cleanupFailure);
-        assertThat(delivered).isEmpty();
-        assertThat(offset.getLsn()).isEqualTo(90);
-        assertThat(metrics.getBufferLimitFailures()).isZero();
-        assertThat(metrics.getScannedUpperLsn()).isEqualTo(90);
-        assertThat(metrics.getWindowBufferRecords()).isEqualTo(2);
-    }
-
-    @Test
-    void shouldKeepLastCompletedScanPositionWhenReadingIsInterrupted() throws Exception {
-        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
-        doAnswer(invocation -> {
-            running.set(false);
-            return new byte[]{ 1 };
-        }).when(rows).getBytes("XID");
-        source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
-
-        assertThat(failure.get()).isNull();
-        assertThat(delivered).isEmpty();
-        assertThat(metrics.getScannedUpperLsn()).isEqualTo(90);
-        assertThat(metrics.getWindowBufferRecords()).isEqualTo(1);
-        assertThat(metrics.getOpenTransactions()).isEqualTo(1);
-    }
-
     private Map<String, Object> truncate() {
         return Map.of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 120L, "XID", new byte[]{ 1 },
                 "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", "TRUNCATE TABLE APP.T");
-    }
-
-    static Stream<Arguments> sqlParsingFailures() {
-        return Stream.of(
-                Arguments.of(5, "/* unclosed"),
-                Arguments.of(5, "ALTER TABLE APP.T ADD X INT UNKNOWN"),
-                Arguments.of(5, "ALTER TABLE APP.T ADD ID INT"),
-                Arguments.of(1, "INSERT INTO \"150\".\"OBJ# 7\"(\"COL 1\") VALUES("),
-                Arguments.of(3, "UPDATE \"150\".\"OBJ# 7\" SET \"COL 1\"="),
-                Arguments.of(2, "DELETE FROM \"150\".\"OBJ# 7\" WHERE \"COL 1\"="))
-                .flatMap(statement -> Stream.of(false, true).map(spill -> Arguments.of(statement.get()[0], statement.get()[1], spill)));
-    }
-
-    @ParameterizedTest
-    @MethodSource("sqlParsingFailures")
-    void shouldLogTheFullAssembledRowAndStackTraceOnSqlParsingFailure(int operation, String sql, boolean spill) throws Exception {
-        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", spill ? 512 : 1048576)
-                .with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
-        createSource();
-        final var prefix = "/*中文😀" + "完整日志".repeat(1500) + "*/\n";
-        final Map<String, Object> first = new HashMap<>(dml(101, 90, 120, 1));
-        first.put("OPERATION_CODE", operation);
-        first.put("SQL_REDO", prefix);
-        first.put("SEG_OWNER", "APP");
-        first.put("TABLE_NAME", "T");
-        first.put("USERNAME", "CDC_USER");
-        first.put("RS_ID", "record-101");
-        first.put("SSN", 0);
-        first.put("CSF", 1);
-        first.put("DATA_OBJV#", 8L);
-        first.put("RBASQN", 9L);
-        first.put("RBABLK", 10L);
-        first.put("RBABYTE", 11L);
-        final Map<String, Object> last = new HashMap<>(first);
-        last.put("SQL_REDO", sql);
-        last.put("SSN", 1);
-        last.put("CSF", 0);
-        records(List.of(first, last, dml(102, 90, 120, 1), commit(120, 90, 1)));
-        final var original = schema.getTables().forTable(TABLE_ID);
-        final var offset = new DamengOffsetContext(config, 90);
-        final var logs = LogInterceptor.forClass(DamengStreamingChangeEventSource.class);
-        try {
-            source.execute(context, new DamengPartition("dm"), offset);
-
-            assertThat(failure.get()).isNotNull();
-            assertThat(logs.getLoggingEvents("Full LogMinerRow:")).singleElement().satisfies(event -> {
-                assertThat(event.getLevel()).isEqualTo(Level.ERROR);
-                assertThat(event.getFormattedMessage()).contains("LogMinerRow[lsn=101, startLsn=90, commitLsn=120, transactionId=01",
-                        "operation=" + operation, "rollback=0", "owner=APP", "tableName=T", "username=CDC_USER", "redo=" + prefix + sql,
-                        "recordSetId=record-101", "sequence=0", "continuation=0",
-                        "timestamp=" + Timestamp.valueOf("2026-09-24 12:00:00").toInstant(),
-                        "objectId=7", "objectVersion=8", "archiveSequence=9", "blockNumber=10", "byteOffset=11");
-                assertThat(event.getThrowableProxy()).isNotNull();
-                final var parsingFailure = operation == 5 ? failure.get().getCause() : failure.get();
-                assertThat(event.getThrowableProxy().getClassName()).isEqualTo(parsingFailure.getClass().getName());
-                assertThat(event.getThrowableProxy().getMessage()).isEqualTo(parsingFailure.getMessage());
-            });
-            assertThat(delivered).isEmpty();
-            assertThat(schemaOffsets).isEmpty();
-            assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(original);
-            assertThat(offset.getLsn()).isEqualTo(90);
-            if (spill) {
-                assertThat(metrics.getSpilledTransactions()).isGreaterThan(0);
-            }
-        }
-        finally {
-            logs.stop();
-            ((Logger) LoggerFactory.getLogger(DamengStreamingChangeEventSource.class)).detachAppender(logs);
-        }
     }
 
     private void records(List<Map<String, Object>> records) throws Exception {
@@ -1170,5 +188,1003 @@ class DamengStreamingChangeEventSourceTest {
 
     private Map<String, Object> commit(long lsn, long start, int xid) {
         return Map.of("SCN", lsn, "START_SCN", start, "COMMIT_SCN", lsn, "XID", new byte[]{ (byte) xid }, "OPERATION_CODE", 7);
+    }
+
+    @Nested
+    class MiningWindows {
+        @ParameterizedTest
+        @ValueSource(strings = { "fixed", "archive_bytes" })
+        void shouldBoundStandbyMiningByCompletedReplayInsteadOfReceivedArchives(String strategy) throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("database.standby.hosts", "replica:5236")
+                    .with("log.mining.window.strategy", strategy).build());
+            createSource();
+            when(connection.readStandbyProgress()).thenReturn(new DamengConnection.StandbyProgress(140, 125));
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isNull();
+            verify(connection).startLogMining(90, 125, false);
+            assertThat(offset.getLsn()).isEqualTo(125);
+            assertThat(delivered).hasSize(1);
+            assertThat(metrics.getLatestArchivedLsn()).isEqualTo(150);
+            assertThat(metrics.getStandbyReplayableLsn()).isEqualTo(140);
+            assertThat(metrics.getStandbyReplayedLsn()).isEqualTo(125);
+            assertThat(metrics.getStandbyMiningUpperLsn()).isEqualTo(125);
+            metrics.reset();
+            assertThat(metrics.getStandbyMiningUpperLsn()).isZero();
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = { "fixed", "archive_bytes" })
+        void shouldRejectAStandbyReplayRegressionBeforePublishingAnyRecords(String strategy) throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("database.standby.hosts", "replica:5236")
+                    .with("log.mining.window.strategy", strategy).build());
+            createSource();
+            when(connection.readStandbyProgress()).thenReturn(new DamengConnection.StandbyProgress(150, 150), new DamengConnection.StandbyProgress(100, 100));
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).hasMessageContaining("replay boundary regressed");
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+        }
+
+        @Test
+        void shouldStopBeforeRebindingACachedWindowToANewPrimaryGeneration() throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("database.standby.hosts", "replica:5236").build());
+            createSource();
+            doThrow(new SQLException("primary changed", "08006")).when(connection).validateUnchangedPrimary();
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).hasMessageContaining("primary changed");
+            verify(connection, times(1)).validatePrimaryStandbyIdentity(offset);
+            verify(connection, never()).startLogMining(anyLong(), anyLong(), anyBoolean());
+            assertThat(offset.getLsn()).isEqualTo(90);
+        }
+
+        @Test
+        void shouldFailBeforeMiningIfSelectedArchiveSizeIsUnavailable() throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.window.strategy", "archive_bytes").build());
+            createSource();
+            doReturn(List.of(new DamengConnection.ArchiveLogFile("unknown", 1, 150, 42, 0))).when(connection).readArchiveLogFiles();
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).hasMessageContaining("LEN");
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(delivered).isEmpty();
+            verify(connection, never()).startLogMining(anyLong(), anyLong(), anyBoolean());
+        }
+
+        @Test
+        void shouldNotPublishAWindowMinedFromADemotedPrimary() throws Exception {
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var demotion = new SQLException("primary was demoted", "08S01");
+            doThrow(demotion).when(connection).validateUnchangedPrimary();
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isSameAs(demotion);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(metrics.getWindowBufferRecords()).isEqualTo(2);
+            verify(connection).endLogMining();
+        }
+
+        @Test
+        void shouldNotPublishAWindowMinedAcrossChangedLexicalSettings() throws Exception {
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var drift = new IllegalStateException("lexical settings changed during mining");
+            doNothing().doThrow(drift).when(connection).validateUnchangedCompatibility();
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isSameAs(drift);
+            assertThat(delivered).isEmpty();
+            assertThat(schemaOffsets).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(offset.getCommitLsn()).isEqualTo(90);
+            verify(connection).endLogMining();
+        }
+
+        @Test
+        void shouldNotReportAFailedMiningSessionAsACompletedScan() throws Exception {
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var cleanupFailure = new SQLException("end mining failed");
+            doThrow(cleanupFailure).when(connection).endLogMining();
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isSameAs(cleanupFailure);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(metrics.getBufferLimitFailures()).isZero();
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(90);
+            assertThat(metrics.getWindowBufferRecords()).isEqualTo(2);
+        }
+
+        @Test
+        void shouldKeepLastCompletedScanPositionWhenReadingIsInterrupted() throws Exception {
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            doAnswer(invocation -> {
+                running.set(false);
+                return new byte[]{ 1 };
+            }).when(rows).getBytes("XID");
+            source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
+
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).isEmpty();
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(90);
+            assertThat(metrics.getWindowBufferRecords()).isEqualTo(1);
+            assertThat(metrics.getOpenTransactions()).isEqualTo(1);
+        }
+    }
+
+    @Nested
+    class MetadataAndDdl {
+        @Test
+        void shouldReusePhysicalMetadataAcrossInterleavedTables() {
+            final var first = schema.getTables().forTable(TABLE_ID);
+            final var second = Table.editor().tableId(new TableId(null, "APP", "OTHER"))
+                    .addColumn(Column.editor().name("VALUE").jdbcType(Types.VARCHAR).type("VARCHAR").length(30).create()).create();
+            final var firstPhysical = source.physicalTable(7, first);
+            final var secondPhysical = source.physicalTable(8, second);
+
+            assertThat(firstPhysical.id().table()).isEqualTo("OBJ# 7");
+            assertThat(secondPhysical.id().table()).isEqualTo("OBJ# 8");
+            assertThat(firstPhysical.columnWithName("COL 1").jdbcType()).isEqualTo(Types.INTEGER);
+            assertThat(secondPhysical.columnWithName("COL 1").jdbcType()).isEqualTo(Types.VARCHAR);
+            assertThat(source.physicalTable(7, first)).isSameAs(firstPhysical);
+            assertThat(source.physicalTable(8, second)).isSameAs(secondPhysical);
+        }
+
+        @Test
+        void shouldRebuildPhysicalMetadataAfterHistoricalSchemaReplacement() {
+            final var original = schema.getTables().forTable(TABLE_ID);
+            final var originalPhysical = source.physicalTable(7, original);
+            final var altered = original.edit()
+                    .addColumn(Column.editor().name("LABEL").jdbcType(Types.CHAR).type("CHAR", "CHAR(10 CHAR)")
+                            .length(10).charsetName("UTF-8").create())
+                    .reorderColumn("LABEL", null).create();
+            final var alteredPhysical = source.physicalTable(7, altered);
+
+            assertThat(alteredPhysical).isNotSameAs(originalPhysical);
+            assertThat(alteredPhysical.retrieveColumnNames()).containsExactly("COL 1", "COL 2");
+            final var label = alteredPhysical.columnWithName("COL 1");
+            assertThat(label.jdbcType()).isEqualTo(Types.CHAR);
+            assertThat(label.typeExpression()).isEqualTo("CHAR(10 CHAR)");
+            assertThat(label.length()).isEqualTo(10);
+            assertThat(label.charsetName()).isEqualTo("UTF-8");
+            assertThat(alteredPhysical.columnWithName("COL 2").jdbcType()).isEqualTo(Types.INTEGER);
+            assertThat(source.physicalTable(7, altered)).isSameAs(alteredPhysical);
+            // Replaying an earlier schema must never return the most recent mapping.
+            final var replayed = source.physicalTable(7, original);
+            assertThat(replayed.retrieveColumnNames()).containsExactly("COL 1");
+            assertThat(replayed.columnWithName("COL 1").jdbcType()).isEqualTo(Types.INTEGER);
+            assertThat(original.retrieveColumnNames()).containsExactly("ID");
+        }
+
+        @Test
+        void shouldRebuildPhysicalMetadataForARecreatedObjectOrEqualSchemaInstance() {
+            final var original = schema.getTables().forTable(TABLE_ID);
+            final var cached = source.physicalTable(7, original);
+            final var replacement = original.edit().create();
+            assertThat(replacement).isEqualTo(original).isNotSameAs(original);
+            final var replaced = source.physicalTable(7, replacement);
+            assertThat(replaced).isNotSameAs(cached);
+            final var recreated = source.physicalTable(99, replacement);
+            assertThat(recreated).isNotSameAs(replaced);
+            assertThat(recreated.id().table()).isEqualTo("OBJ# 99");
+            assertThat(source.physicalTable(99, replacement)).isSameAs(recreated);
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = { "ALTER TABLE APP.T ADD NAME VARCHAR(30)", "DROP TABLE APP.T", "ALTER TABLE APP.T RENAME TO T2", "TRUNCATE TABLE APP.T" })
+        void shouldReleaseCachedPhysicalMetadataWhenApplyingDdl(String ddl) throws Exception {
+            final var table = schema.getTables().forTable(TABLE_ID);
+            final var beforeDdl = new AtomicReference<Table>();
+            final var afterDdl = new AtomicReference<Table>();
+            doAnswer(invocation -> {
+                beforeDdl.compareAndSet(null, source.physicalTable(7, table));
+                return true;
+            }).when(dispatcher).dispatchDataChangeEvent(any(), any(), any());
+            doAnswer(invocation -> {
+                afterDdl.set(source.physicalTable(7, table));
+                return null;
+            }).when(dispatcher).dispatchSchemaChangeEvent(any(), any(), any(TableId.class), any());
+            records(List.of(dml(101, 90, 110, 1), commit(110, 90, 1),
+                    Map.of("SCN", 121L, "START_SCN", 120L, "COMMIT_SCN", 130L, "XID", new byte[]{ 2 },
+                            "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", ddl),
+                    commit(130, 120, 2)));
+
+            source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
+
+            assertThat(failure.get()).isNull();
+            assertThat(beforeDdl.get()).isNotNull();
+            assertThat(afterDdl.get()).isNotNull().isNotSameAs(beforeDdl.get());
+        }
+
+        @Test
+        void shouldFinishRestoredTransactionMetadataWhenItsLastStatementIsAlreadyCheckpointed() throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("provide.transaction.metadata", true).build());
+            createSource();
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var saved = new DamengOffsetContext(config, 90);
+            saved.setCommitLsn(120);
+            saved.setTransactionId("01");
+            saved.setEventSerialNo(Long.MAX_VALUE);
+            saved.getTransactionContext().beginTransaction("01");
+            saved.getTransactionContext().event(TABLE_ID);
+            final var offset = new DamengOffsetContext.Loader(config).load(saved.getOffset());
+            final List<SourceRecord> metadata = new ArrayList<>();
+            final var monitor = new TransactionMonitor(config, new DamengEventMetadataProvider(), config.schemaNameAdjuster(), metadata::add, "dm.transaction");
+            doAnswer(invocation -> {
+                monitor.transactionCommittedEvent(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2));
+                return null;
+            }).when(dispatcher).dispatchTransactionCommittedEvent(any(), any(), any());
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).isEmpty();
+            assertThat(metadata).singleElement().satisfies(record -> {
+                final var value = (Struct) record.value();
+                assertThat(value.getString("status")).isEqualTo("END");
+                assertThat(value.getString("id")).isEqualTo("01");
+                assertThat(value.getInt64("event_count")).isEqualTo(1L);
+            });
+            assertThat(offset.getTransactionContext().isTransactionInProgress()).isFalse();
+            assertThat(offset.getTransactionContext().getTotalEventCount()).isZero();
+            assertThat(offset.getOffset()).doesNotContainKey("transaction_id");
+            assertThat(offset.getEventSerialNo()).isEqualTo(Long.MAX_VALUE);
+            assertThat(offset.getLsn()).isEqualTo(150);
+        }
+
+        @Test
+        void shouldSkipAnUnknownObjectWithoutSkippingTheNextCapturedRow() throws Exception {
+            final var unknown = new java.util.HashMap<>(dml(101, 90, 120, 1));
+            unknown.put("DATA_OBJ#", 99L);
+            records(List.of(unknown, dml(102, 90, 120, 1), commit(120, 90, 1)));
+
+            source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
+
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).singleElement().satisfies(value -> assertThat(value)
+                    .containsEntry("change_lsn", 102L).containsEntry("event_serial_no", 1L));
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = {
+                "GRANT SELECT ON APP.T TO CDC_USER",
+                "REVOKE SELECT ON APP.T FROM CDC_USER",
+                "// 授予要采集表的 select 权限\nGRANT SELECT ON APP.T TO CDC_USER",
+                "// 回收权限\r\nREVOKE SELECT ON APP.T FROM CDC_USER",
+                "CREATE FORCE VIEW APP.V AS SELECT ID FROM APP.T",
+                "CREATE OR REPLACE FORCE VIEW IF NOT EXISTS APP.V AS SELECT ID FROM APP.T"
+        })
+        void shouldSkipPrivilegeDdlAndContinueDeliveringCapturedChanges(String ddl) throws Exception {
+            final var privilege = Map.<String, Object> of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 110L, "XID", new byte[]{ 1 },
+                    "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", ddl);
+            records(List.of(privilege, commit(110, 90, 1), dml(121, 115, 130, 2), commit(130, 115, 2)));
+            final var historicalTable = schema.getTables().forTable(TABLE_ID);
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).singleElement().satisfies(value -> assertThat(value).containsEntry("change_lsn", 121L));
+            assertThat(schemaOffsets).isEmpty();
+            assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(historicalTable);
+            assertThat(offset.getLsn()).isEqualTo(150);
+            assertThat(offset.getCommitLsn()).isEqualTo(130);
+        }
+
+        @Test
+        void shouldRejectForceViewAndTableDdlInOneRecordWithoutAdvancingOffsets() throws Exception {
+            final var compound = Map.<String, Object> of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 110L, "XID", new byte[]{ 1 },
+                    "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", "CREATE FORCE VIEW APP.V AS SELECT ID FROM APP.T; ALTER TABLE APP.T ADD V INT");
+            records(List.of(compound, commit(110, 90, 1), dml(121, 115, 130, 2), commit(130, 115, 2)));
+            final var historicalTable = schema.getTables().forTable(TABLE_ID);
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Cannot process Dameng DDL", "LSN 101");
+            assertThat(delivered).isEmpty();
+            assertThat(schemaOffsets).isEmpty();
+            assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(historicalTable);
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(offset.getCommitLsn()).isEqualTo(90);
+        }
+
+        @Test
+        void shouldFailOnUnknownTableDdlAfterPrivilegesWithoutAdvancingPastIt() throws Exception {
+            final var privilege = Map.<String, Object> of("SCN", 101L, "START_SCN", 90L, "COMMIT_SCN", 110L, "XID", new byte[]{ 1 },
+                    "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", "GRANT SELECT ON APP.T TO CDC_USER");
+            final var unsupported = Map.<String, Object> of("SCN", 121L, "START_SCN", 115L, "COMMIT_SCN", 130L, "XID", new byte[]{ 2 },
+                    "OPERATION_CODE", 5, "DATA_OBJ#", 7L, "SQL_REDO", "// unsupported table change\nALTER TABLE APP.T MOVE");
+            records(List.of(privilege, commit(110, 90, 1), unsupported, dml(122, 115, 130, 2), commit(130, 115, 2)));
+            final var historicalTable = schema.getTables().forTable(TABLE_ID);
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Unsupported ALTER TABLE");
+            assertThat(delivered).isEmpty();
+            assertThat(schemaOffsets).isEmpty();
+            assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(historicalTable);
+            assertThat(offset.getLsn()).isEqualTo(90);
+        }
+
+        @Test
+        void shouldFailOnMissingRedoInsteadOfAcknowledgingTheCapturedRow() throws Exception {
+            final var missingRedo = new java.util.HashMap<>(dml(101, 90, 120, 1));
+            missingRedo.remove("SQL_REDO");
+            records(List.of(missingRedo, commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining("Missing Dameng SQL_REDO");
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = { "SCN", "OPERATION_CODE", "ROLL_BACK", "SSN", "CSF", "DATA_OBJ#" })
+        void shouldRejectNullRequiredNumericFieldsBeforePublishingAnyTransaction(String field) throws Exception {
+            final var invalid = new java.util.HashMap<>(dml(130, 125, 140, 2));
+            invalid.put(field, null);
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1), invalid, commit(140, 125, 2)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining(field);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(offset.getCommitLsn()).isEqualTo(90);
+        }
+
+        @Test
+        void shouldPreserveNullableMarkerMetadataAndZeroObjectVersion() throws Exception {
+            final var marker = new java.util.HashMap<>(commit(120, 0, 1));
+            marker.put("START_SCN", null);
+            marker.put("COMMIT_SCN", null);
+            marker.put("DATA_OBJV#", 0L);
+            marker.put("RBASQN", 0L);
+            records(List.of(marker));
+            assertThat(rows.next()).isTrue();
+            final var row = source.readRow(rows);
+            assertThat(row.startLsn()).isZero();
+            assertThat(row.commitLsn()).isZero();
+            assertThat(row.objectId()).isZero();
+            assertThat(row.objectVersion()).isZero();
+            assertThat(row.archiveSequence()).isZero();
+            assertThat(row.blockNumber()).isEqualTo(-1);
+            assertThat(row.byteOffset()).isEqualTo(-1);
+        }
+
+        @ParameterizedTest
+        @ValueSource(longs = { 0, -1, 999 })
+        void shouldRejectUnhandledOperationsWithUnresolvedObjectsAndKeepDiagnosticsAfterSpilling(long objectId) throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", 512)
+                    .with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
+            createSource();
+            final var unsupported = new java.util.HashMap<>(dml(101, 90, 120, 1));
+            unsupported.put("OPERATION_CODE", 255);
+            unsupported.put("DATA_OBJ#", objectId);
+            unsupported.put("DATA_OBJV#", 2L);
+            unsupported.put("RBASQN", 0L);
+            unsupported.put("RBABLK", 123L);
+            unsupported.put("RBABYTE", 45L);
+            records(List.of(unsupported, commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContainingAll("operation 255", "unresolved table", "LSN 101", "RBABLK=123", "RBABYTE=45", "DATA_OBJV#=2")
+                    .hasMessageNotContaining("INSERT INTO");
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(offset.getCommitLsn()).isEqualTo(90);
+        }
+
+        @Test
+        void shouldSkipUnhandledOperationsOnHistoricallyKnownExcludedTables() throws Exception {
+            final var excluded = new TableId(null, "APP", "EXCLUDED");
+            schema.getTables().overwriteTable(schema.getTables().forTable(TABLE_ID).edit().tableId(excluded)
+                    .addAttribute(Attribute.editor().name("dameng.object.id").value("8").create()).create());
+            final var unsupported = new java.util.HashMap<>(dml(101, 90, 120, 1));
+            unsupported.put("OPERATION_CODE", 255);
+            unsupported.put("DATA_OBJ#", 8L);
+            records(List.of(unsupported, commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(150);
+        }
+
+        @Test
+        void shouldIndexHistoricalObjectsOnceForManyRowsIncludingUnknownObjects() throws Exception {
+            final var tables = spy(schema.getTables());
+            when(schema.getTables()).thenReturn(tables);
+            final List<Map<String, Object>> input = new ArrayList<>();
+            for (int i = 0; i < 100; i++) {
+                final var change = new java.util.HashMap<>(dml(101, 90, 120, 1));
+                change.put("DATA_OBJ#", i % 2 == 0 ? 7L : 99L);
+                input.add(change);
+            }
+            input.add(commit(120, 90, 1));
+            records(input);
+            source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).hasSize(50);
+            verify(tables, times(1)).tableIds();
+        }
+
+        @Test
+        void shouldRejectDuplicateHistoricalObjectIdentities() throws Exception {
+            schema.getTables().overwriteTable(schema.getTables().forTable(TABLE_ID).edit().tableId(new TableId(null, "APP", "DUPLICATE"))
+                    .addAttribute(Attribute.editor().name("dameng.object.id").value("7").create()).create());
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
+            assertThat(failure.get()).hasMessageContaining("Duplicate Dameng historical DATA_OBJ# 7");
+            assertThat(delivered).isEmpty();
+        }
+
+        @ParameterizedTest
+        @ValueSource(ints = { 13, 14, 255, 999 })
+        void shouldFailInsteadOfSkippingAnUnhandledCapturedOperation(int operation) throws Exception {
+            final var unsupported = new java.util.HashMap<>(dml(101, 90, 120, 1));
+            unsupported.put("OPERATION_CODE", operation);
+            records(List.of(unsupported, commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining("Unsupported Dameng LogMiner operation " + operation);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+        }
+    }
+
+    @Nested
+    class ReplayAndAcknowledgment {
+        @Test
+        void shouldResumeAfterTheLastDeliveredStatementInsideATransaction() throws Exception {
+            records(List.of(dml(101, 90, 120, 1), dml(102, 90, 120, 1), commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.init(offset);
+            assertThat(source.getOffsetContext()).isSameAs(offset);
+            offset.setCommitLsn(120);
+            offset.setTransactionId("01");
+            offset.setEventSerialNo(0);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).hasSize(1);
+            assertThat(delivered.get(0)).containsEntry("change_lsn", 102L).containsEntry("event_serial_no", 1L)
+                    .containsEntry("lsn", 90L);
+        }
+
+        @ParameterizedTest
+        @org.junit.jupiter.params.provider.CsvSource({ "false,fixed", "true,fixed", "false,archive_bytes", "true,archive_bytes" })
+        void shouldCacheNewRangesAndReconstructOnlyAtCommit(boolean spill, String strategy) throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
+                    .with("log.mining.window.strategy", strategy).with("log.mining.window.max.bytes", 64)
+                    .with("log.mining.buffer.memory.bytes", spill ? 512 : 1048576).with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
+            createSource();
+            final var polls = new AtomicInteger();
+            when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
+                if (polls.incrementAndGet() > 3) {
+                    running.set(false);
+                }
+                return 120L;
+            });
+            doAnswer(invocation -> {
+                connection.latestArchivedLsn();
+                return List.of(new DamengConnection.ArchiveLogFile("first", 90, 100, 42, 89, 0, 0, 0, 64),
+                        new DamengConnection.ArchiveLogFile("second", 101, 110, 42, 100, 0, 0, 0, 64),
+                        new DamengConnection.ArchiveLogFile("third", 111, 120, 42, 110, 0, 0, 0, 64));
+            }).when(connection).readArchiveLogFiles();
+            final List<Long> starts = new ArrayList<>();
+            doAnswer(invocation -> {
+                final long start = invocation.getArgument(0);
+                final long end = invocation.getArgument(1);
+                starts.add(start);
+                if (end == 100) {
+                    records(List.of(dml(95, 92, 0, 1)));
+                }
+                else if (end == 110) {
+                    records(List.of(dml(105, 0, 0, 1)));
+                }
+                else if (start == 111) {
+                    records(List.of(commit(115, 0, 1)));
+                }
+                else if (start == 92) {
+                    records(List.of(dml(95, 92, 115, 1), dml(105, 92, 115, 1), commit(115, 92, 1)));
+                }
+                else {
+                    throw new AssertionError("Unexpected historical re-read " + start);
+                }
+                return null;
+            }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(starts).containsExactly(90L, 101L, 111L, 92L);
+            assertThat(delivered).extracting(value -> value.get("change_lsn"))
+                    .containsExactly(95L, 105L);
+            assertThat(delivered).allSatisfy(value -> assertThat(value).containsEntry("lsn", 92L));
+            assertThat(offset.getLsn()).isEqualTo(120);
+            assertThat(metrics.getMiningSessions()).isEqualTo(4);
+            assertThat(metrics.getReconstructionSessions()).isEqualTo(1);
+            assertThat(metrics.getMinedRows()).isEqualTo(6);
+            assertThat(metrics.getReconstructedRows()).isEqualTo(3);
+            assertThat(metrics.getSpilledTransactions()).isEqualTo(spill ? 2 : 0);
+            try (var files = java.nio.file.Files.list(spillDirectory)) {
+                assertThat(files.toList()).isEmpty();
+            }
+            verify(connection).archiveLogsForRange(92, 110);
+            verify(connection).archiveLogsForRange(92, 120);
+            verify(connection, times(4)).endLogMining();
+        }
+
+        @ParameterizedTest
+        @ValueSource(booleans = { false, true })
+        void shouldKeepTheReplayPositionWhenArchivesOrForwardMiningAreUnavailable(boolean archiveMissing) throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
+                    .with("log.mining.window.strategy", "fixed").build());
+            createSource();
+            when(connection.latestArchivedLsn()).thenReturn(110L);
+            final var unavailable = new SQLException("historical range unavailable");
+            if (archiveMissing) {
+                doThrow(unavailable).when(connection).archiveLogsForRange(92, 110);
+            }
+            doAnswer(invocation -> {
+                final long start = invocation.getArgument(0);
+                if (start == 90) {
+                    records(List.of(dml(95, 92, 0, 1)));
+                }
+                else {
+                    throw unavailable;
+                }
+                return null;
+            }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isSameAs(unavailable);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(92);
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(100);
+            assertThat(metrics.getOldestReplayLsn()).isEqualTo(92);
+            if (archiveMissing) {
+                verify(connection, times(1)).startLogMining(anyLong(), anyLong(), eq(false));
+            }
+            else {
+                verify(connection).startLogMining(101, 110, false);
+                verify(connection, times(2)).endLogMining();
+            }
+        }
+
+        @ParameterizedTest
+        @ValueSource(booleans = { false, true })
+        void shouldKeepTheReplayPositionWhenHistoricalReconstructionIsUnavailable(boolean archiveMissing) throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
+                    .with("log.mining.window.strategy", "fixed").build());
+            createSource();
+            when(connection.latestArchivedLsn()).thenReturn(110L);
+            final var unavailable = new SQLException("historical range unavailable");
+            if (archiveMissing) {
+                doThrow(unavailable).when(connection).archiveLogsForRange(92, 110);
+            }
+            doAnswer(invocation -> {
+                final long start = invocation.getArgument(0);
+                if (start == 90) {
+                    records(List.of(dml(95, 92, 0, 1)));
+                }
+                else if (start == 101) {
+                    records(List.of(commit(105, 0, 1)));
+                }
+                else {
+                    throw unavailable;
+                }
+                return null;
+            }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isSameAs(unavailable);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(92);
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(100);
+            assertThat(metrics.getOldestReplayLsn()).isEqualTo(92);
+            if (archiveMissing) {
+                verify(connection, times(1)).startLogMining(anyLong(), anyLong(), eq(false));
+            }
+            else {
+                verify(connection).startLogMining(92, 110, false);
+                verify(connection, times(3)).endLogMining();
+            }
+        }
+
+        @Test
+        void shouldPinAnEarlierOpenTransactionWhileDeliveringAnotherCommit() throws Exception {
+            records(List.of(dml(101, 90, 0, 1), dml(110, 105, 120, 2), commit(120, 105, 2)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).hasSize(1);
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(delivered.get(0)).containsEntry("lsn", 90L).containsEntry("mining_transaction_id", "02");
+            assertThat(metrics.getOpenTransactions()).isEqualTo(1);
+            assertThat(metrics.getOldestReplayLsn()).isEqualTo(90);
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(150);
+            assertThat(metrics.getLatestArchivedLsn()).isEqualTo(150);
+            assertThat(metrics.getWindowBufferRecords()).isEqualTo(3);
+            assertThat(metrics.getWindowBufferEstimatedBytes()).isPositive();
+        }
+
+        @Test
+        void shouldNotReplayAnAlreadyCompletedTransaction() throws Exception {
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            offset.setCommitLsn(120);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).isEmpty();
+        }
+
+        @Test
+        void shouldExcludeDispatchedTransactionsDuringReconstructionWhilePreservingTheNextOpenTransaction() throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
+                    .with("log.mining.buffer.max.transactions", 3).build());
+            createSource();
+            final var polls = new AtomicInteger();
+            when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
+                if (polls.incrementAndGet() > 3) {
+                    running.set(false);
+                }
+                return 120L;
+            });
+            final List<Long> starts = new ArrayList<>();
+            doAnswer(invocation -> {
+                final long start = invocation.getArgument(0);
+                starts.add(start);
+                if (start == 90) {
+                    records(List.of(dml(95, 92, 0, 1), dml(96, 94, 98, 2), commit(98, 94, 2)));
+                }
+                else if (start == 101) {
+                    records(List.of(dml(105, 102, 108, 3), commit(108, 102, 3)));
+                }
+                else if (start == 111) {
+                    records(List.of(dml(113, 112, 0, 4), commit(115, 0, 1)));
+                }
+                else if (start == 92) {
+                    // The checkpoint transaction remains eligible for END cleanup, alongside the completing and open transactions.
+                    records(List.of(dml(95, 92, 115, 1), dml(96, 94, 98, 2), commit(98, 94, 2),
+                            dml(105, 102, 108, 3), commit(108, 102, 3), dml(113, 112, 0, 4), commit(115, 92, 1)));
+                }
+                else {
+                    throw new AssertionError("Unexpected mining start " + start);
+                }
+                return null;
+            }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(starts).containsExactly(90L, 101L, 111L, 92L);
+            assertThat(delivered).extracting(value -> value.get("change_lsn")).containsExactly(96L, 105L, 95L);
+            assertThat(offset.getLsn()).isEqualTo(112);
+            assertThat(offset.getCommitLsn()).isEqualTo(115);
+            assertThat(metrics.getOpenTransactions()).isEqualTo(1);
+            assertThat(metrics.getReconstructionSessions()).isEqualTo(1);
+            assertThat(metrics.getBufferLimitFailures()).isZero();
+        }
+
+        @Test
+        void shouldWaitForAnArchivedWindowWithoutMiningOrAdvancingTheReplayPosition() throws Exception {
+            when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
+                running.set(false);
+                return 90L;
+            });
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(metrics.getLatestArchivedLsn()).isEqualTo(90);
+            assertThat(delivered).isEmpty();
+            verify(connection, never()).startLogMining(anyLong(), anyLong(), anyBoolean());
+        }
+
+        @Test
+        void shouldCloseMiningAndRetainTheReplayPositionWhenTheQueryFails() throws Exception {
+            final var queryFailure = new SQLException("archive read failed", "08S01");
+            when(rows.next()).thenThrow(queryFailure);
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isSameAs(queryFailure);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(90);
+            verify(connection).endLogMining();
+        }
+
+        @Test
+        void shouldKeepTheLastDeliveredOrdinalWhenStoppedDuringDispatch() throws Exception {
+            records(List.of(dml(101, 90, 120, 1), dml(102, 90, 120, 1), commit(120, 90, 1)));
+            stopAfter = 1;
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).hasSize(1);
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(offset.getEventSerialNo()).isZero();
+            assertThat(offset.getTransactionId()).isEqualTo("01");
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(150);
+            assertThat(metrics.getOldestReplayLsn()).isEqualTo(90);
+        }
+
+        @Test
+        void shouldStopBeforePublishingTheNextCommittedTransaction() throws Exception {
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1), dml(131, 125, 140, 2), commit(140, 125, 2)));
+            doAnswer(invocation -> {
+                running.set(false);
+                return null;
+            }).when(dispatcher).dispatchTransactionCommittedEvent(any(), any(), any());
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).hasSize(1);
+            assertThat(delivered.get(0)).containsEntry("mining_transaction_id", "01");
+            assertThat(offset.getLsn()).isEqualTo(90);
+        }
+
+        @Test
+        void shouldResumeTheNextTransactionSharingACommitPosition() throws Exception {
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1), dml(110, 105, 120, 2), commit(120, 105, 2)));
+            final var offset = new DamengOffsetContext(config, 90);
+            offset.setCommitLsn(120);
+            offset.setTransactionId("01");
+            offset.setEventSerialNo(Long.MAX_VALUE);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).hasSize(1);
+            assertThat(delivered.get(0)).containsEntry("mining_transaction_id", "02").containsEntry("event_serial_no", 0L);
+        }
+
+        @Test
+        void shouldKeepTruncateReplayableUntilItsDataEventIsAcknowledged() throws Exception {
+            records(List.of(truncate(), commit(120, 90, 1)));
+            source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
+
+            assertThat(failure.get()).isNull();
+            assertThat(schemaOffsets).hasSize(1);
+            assertThat(schemaOffsets.get(0).get("event_serial_no")).isEqualTo(-1L);
+            assertThat(delivered).singleElement().satisfies(offset -> assertThat(offset)
+                    .containsEntry("event_serial_no", 0L).containsEntry("change_lsn", 101L));
+        }
+
+        @Test
+        void shouldReplayTruncateAfterAcknowledgingOnlyItsSchemaEvent() throws Exception {
+            records(List.of(truncate(), commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            offset.setCommitLsn(120);
+            offset.setTransactionId("01");
+            offset.setEventSerialNo(-1);
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).hasSize(1);
+        }
+    }
+
+    @Nested
+    class CapacityAndStorage {
+        @ParameterizedTest
+        @ValueSource(strings = { "path", "quota", "corruption" })
+        void shouldNotAdvanceTheOffsetWhenTemporaryStorageFails(String mode) throws Exception {
+            final var path = mode.equals("path") ? java.nio.file.Files.writeString(spillDirectory.resolve("not-directory"), "keep") : spillDirectory;
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", 512)
+                    .with("log.mining.buffer.spill.path", path.toString())
+                    .with("log.mining.buffer.spill.max.bytes", mode.equals("quota") ? 1 : 1048576).build());
+            createSource();
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            if (mode.equals("corruption")) {
+                doAnswer(invocation -> {
+                    try (var files = java.nio.file.Files.walk(spillDirectory)) {
+                        final var file = files.filter(java.nio.file.Files::isRegularFile).findFirst().orElseThrow();
+                        final var bytes = java.nio.file.Files.readAllBytes(file);
+                        bytes[bytes.length - 1] ^= 1;
+                        java.nio.file.Files.write(file, bytes);
+                    }
+                    return null;
+                }).when(connection).validateUnchangedPrimary();
+            }
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isNotNull();
+            assertThat(io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer.isStorageFailure(failure.get())).isTrue();
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(offset.getCommitLsn()).isEqualTo(90);
+            if (!mode.equals("path")) {
+                try (var files = java.nio.file.Files.list(spillDirectory)) {
+                    assertThat(files.toList()).isEmpty();
+                }
+            }
+        }
+
+        @Test
+        void shouldExcludeDispatchedTransactionsFromRestartBufferCapacityWhilePreservingOpenAndNewTransactions() throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.max.transactions", 2).build());
+            createSource();
+            records(List.of(dml(95, 92, 0, 1), dml(96, 94, 100, 2), commit(100, 94, 2),
+                    dml(105, 102, 120, 3), commit(120, 102, 3), dml(130, 125, 140, 5), commit(140, 125, 5)));
+            final var offset = new DamengOffsetContext(config, 92);
+            offset.setCommitLsn(120);
+            offset.setTransactionId("04");
+            offset.setEventSerialNo(Long.MAX_VALUE);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).singleElement().satisfies(value -> assertThat(value)
+                    .containsEntry("change_lsn", 130L).containsEntry("mining_transaction_id", "05").containsEntry("lsn", 92L));
+            assertThat(offset.getLsn()).isEqualTo(92);
+            assertThat(offset.getCommitLsn()).isEqualTo(140);
+            assertThat(metrics.getOpenTransactions()).isEqualTo(1);
+            assertThat(metrics.getBufferLimitFailures()).isZero();
+            verify(connection).startLogMining(92, 150, false);
+        }
+
+        @Test
+        void shouldSampleBufferUsageDuringLargeWindows() throws Exception {
+            final Map<String, Object> sequenceAllocation = Map.of("SCN", 101L, "OPERATION_CODE", 37);
+            records(java.util.Collections.nCopies(1_025, sequenceAllocation));
+            metrics = spy(metrics);
+            source = new DamengStreamingChangeEventSource(config, factory, dispatcher, errorHandler, Clock.SYSTEM, schema, metrics);
+
+            source.execute(context, new DamengPartition("dm"), new DamengOffsetContext(config, 90));
+
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).isEmpty();
+            assertThat(metrics.getWindowBufferRecords()).isEqualTo(1_025);
+            verify(metrics).onBufferUsageUpdated(anyLong(), eq(1_024L));
+        }
+
+        @Test
+        void shouldPublishBeyondIgnoredLegacyBudgets() throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.max.bytes", 1)
+                    .with("log.mining.buffer.max.records", 1).build());
+            createSource();
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).hasSize(1);
+            assertThat(metrics.getBufferLimitFailures()).isZero();
+            assertThat(metrics.getWindowBufferRecords()).isEqualTo(2);
+            assertThat(metrics.getWindowBufferEstimatedBytes()).isGreaterThan(1);
+            assertThat(offset.getLsn()).isEqualTo(150);
+        }
+
+        @Test
+        void shouldFailWithoutPublishingOrAdvancingOffsetsForOversizedSql() throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.max.sql.bytes", 8).build());
+            createSource();
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+            assertThat(failure.get()).hasMessageContaining("max.sql.bytes");
+            assertThat(delivered).isEmpty();
+            assertThat(metrics.getBufferLimitFailures()).isEqualTo(1);
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(offset.getCommitLsn()).isEqualTo(90);
+        }
+
+        @Test
+        void shouldRecordCapacityFailureWithoutPublishingOrHidingItBehindCleanupFailure() throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.max.transactions", 1).build());
+            createSource();
+            records(List.of(dml(101, 90, 110, 1), commit(110, 90, 1), dml(120, 115, 0, 2)));
+            final var cleanupFailure = new SQLException("cleanup connection lost", "08S01");
+            doThrow(cleanupFailure).when(connection).endLogMining();
+            final var offset = new DamengOffsetContext(config, 90);
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining("log.mining.buffer.max.transactions");
+            assertThat(failure.get().getSuppressed()).containsExactly(cleanupFailure);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(metrics.getBufferLimitFailures()).isEqualTo(1);
+            assertThat(metrics.getWindowBufferRecords()).isEqualTo(3);
+            assertThat(metrics.getPeakWindowBufferRecords()).isEqualTo(3);
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(90);
+            assertThat(metrics.getOldestReplayLsn()).isEqualTo(90);
+            assertThat(metrics.getLatestArchivedLsn()).isEqualTo(150);
+        }
+    }
+
+    @Nested
+    class FailureDiagnostics {
+        @ParameterizedTest
+        @MethodSource("sqlParsingFailures")
+        void shouldLogTheFullAssembledRowAndStackTraceOnSqlParsingFailure(int operation, String sql, boolean spill) throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", spill ? 512 : 1048576)
+                    .with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
+            createSource();
+            final var prefix = "/*中文😀" + "完整日志".repeat(1500) + "*/\n";
+            final Map<String, Object> first = new HashMap<>(dml(101, 90, 120, 1));
+            first.put("OPERATION_CODE", operation);
+            first.put("SQL_REDO", prefix);
+            first.put("SEG_OWNER", "APP");
+            first.put("TABLE_NAME", "T");
+            first.put("USERNAME", "CDC_USER");
+            first.put("RS_ID", "record-101");
+            first.put("SSN", 0);
+            first.put("CSF", 1);
+            first.put("DATA_OBJV#", 8L);
+            first.put("RBASQN", 9L);
+            first.put("RBABLK", 10L);
+            first.put("RBABYTE", 11L);
+            final Map<String, Object> last = new HashMap<>(first);
+            last.put("SQL_REDO", sql);
+            last.put("SSN", 1);
+            last.put("CSF", 0);
+            records(List.of(first, last, dml(102, 90, 120, 1), commit(120, 90, 1)));
+            final var original = schema.getTables().forTable(TABLE_ID);
+            final var offset = new DamengOffsetContext(config, 90);
+            final var logs = LogInterceptor.forClass(DamengStreamingChangeEventSource.class);
+            try {
+                source.execute(context, new DamengPartition("dm"), offset);
+
+                assertThat(failure.get()).isNotNull();
+                assertThat(logs.getLoggingEvents("Full LogMinerRow:")).singleElement().satisfies(event -> {
+                    assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+                    assertThat(event.getFormattedMessage()).contains("LogMinerRow[lsn=101, startLsn=90, commitLsn=120, transactionId=01",
+                            "operation=" + operation, "rollback=0", "owner=APP", "tableName=T", "username=CDC_USER", "redo=" + prefix + sql,
+                            "recordSetId=record-101", "sequence=0", "continuation=0",
+                            "timestamp=" + Timestamp.valueOf("2026-09-24 12:00:00").toInstant(),
+                            "objectId=7", "objectVersion=8", "archiveSequence=9", "blockNumber=10", "byteOffset=11");
+                    assertThat(event.getThrowableProxy()).isNotNull();
+                    final var parsingFailure = operation == 5 ? failure.get().getCause() : failure.get();
+                    assertThat(event.getThrowableProxy().getClassName()).isEqualTo(parsingFailure.getClass().getName());
+                    assertThat(event.getThrowableProxy().getMessage()).isEqualTo(parsingFailure.getMessage());
+                });
+                assertThat(delivered).isEmpty();
+                assertThat(schemaOffsets).isEmpty();
+                assertThat(schema.getTables().forTable(TABLE_ID)).isSameAs(original);
+                assertThat(offset.getLsn()).isEqualTo(90);
+                if (spill) {
+                    assertThat(metrics.getSpilledTransactions()).isGreaterThan(0);
+                }
+            }
+            finally {
+                logs.stop();
+                ((Logger) LoggerFactory.getLogger(DamengStreamingChangeEventSource.class)).detachAppender(logs);
+            }
+        }
+
+        static Stream<Arguments> sqlParsingFailures() {
+            return Stream.of(
+                    Arguments.of(5, "/* unclosed"),
+                    Arguments.of(5, "ALTER TABLE APP.T ADD X INT UNKNOWN"),
+                    Arguments.of(5, "ALTER TABLE APP.T ADD ID INT"),
+                    Arguments.of(1, "INSERT INTO \"150\".\"OBJ# 7\"(\"COL 1\") VALUES("),
+                    Arguments.of(3, "UPDATE \"150\".\"OBJ# 7\" SET \"COL 1\"="),
+                    Arguments.of(2, "DELETE FROM \"150\".\"OBJ# 7\" WHERE \"COL 1\"="))
+                    .flatMap(statement -> Stream.of(false, true).map(spill -> Arguments.of(statement.get()[0], statement.get()[1], spill)));
+        }
     }
 }

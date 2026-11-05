@@ -34,7 +34,7 @@ import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
 
 class DamengLobValueConvertersTest {
-    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
             .with("unavailable.value.placeholder", "missing:未获取").build());
     private final DamengValueConverters converters = new DamengValueConverters(config);
 

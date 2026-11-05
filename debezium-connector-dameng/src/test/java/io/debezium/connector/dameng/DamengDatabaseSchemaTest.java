@@ -35,7 +35,7 @@ class DamengDatabaseSchemaTest {
     @NullAndEmptySource
     @ValueSource(strings = { "0", "-1", "invalid" })
     void shouldRejectMissingOrInvalidHistoricalObjectIdentity(String identity) throws Exception {
-        final var configuration = DamengConnectorConfigTest.configuration()
+        final var configuration = DamengTestConfiguration.configuration()
                 .with("schema.history.internal", MemorySchemaHistory.class.getName()).build();
         final var config = new DamengConnectorConfig(configuration);
         final var editor = table("CAPTURED").edit();
@@ -57,7 +57,7 @@ class DamengDatabaseSchemaTest {
     @ParameterizedTest
     @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
     void shouldRecoverNonRowLifecycleAndOrdinaryRecreationAtTheirHistoricalOffsets(DamengTableType kind) throws Exception {
-        final var configuration = DamengConnectorConfigTest.configuration()
+        final var configuration = DamengTestConfiguration.configuration()
                 .with("schema.history.internal", MemorySchemaHistory.class.getName()).build();
         final var config = new DamengConnectorConfig(configuration);
         final var partition = new DamengPartition(config.getLogicalName());
@@ -100,7 +100,7 @@ class DamengDatabaseSchemaTest {
 
     @Test
     void shouldRemoveRenamedAndDroppedTablesFromMetadataAndSchemas() throws Exception {
-        final var configuration = DamengConnectorConfigTest.configuration()
+        final var configuration = DamengTestConfiguration.configuration()
                 .with("schema.history.internal", MemorySchemaHistory.class.getName()).build();
         final var config = new DamengConnectorConfig(configuration);
         final var partition = new DamengPartition(config.getLogicalName());

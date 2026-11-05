@@ -64,7 +64,7 @@ import io.debezium.util.Clock;
 class DamengStreamingFilterBoundaryTest {
     private static final TableId INCLUDED = new TableId(null, "APP", "A");
     private static final TableId EXCLUDED = new TableId(null, "APP", "B");
-    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengConnectorConfigTest.configuration()
+    private final DamengConnectorConfig config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
             .with("log.mining.window.strategy", "fixed")
             .with("table.include.list", "APP.A")
             .with("schema.history.internal", MemorySchemaHistory.class.getName())
