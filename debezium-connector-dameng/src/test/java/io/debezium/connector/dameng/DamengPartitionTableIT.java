@@ -15,9 +15,13 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -27,6 +31,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import io.debezium.config.Configuration;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
@@ -169,6 +176,131 @@ class DamengPartitionTableIT extends AbstractAsyncEngineConnectorTest {
                 "RANGE_T:u:4:restart", "RANGE_T:c:4:refilled", "LIST_T:u:4:restart", "LIST_T:c:4:refilled",
                 "MULTI_T:u:4:restart", "MULTI_T:c:4:refilled", "NEW_T:c:1:new",
                 "SUB_T:c:1:sub1", "SUB_T:c:2:sub2", "SUB_T:c:1:refilled", "MARKER:c:4:marker");
+    }
+
+    static Stream<Arguments> exchangeCaptureScopes() {
+        return Stream.of("PARTITION P1", "SUBPARTITION S1")
+                .flatMap(kind -> Stream.of("both", "root", "peer", "neither").map(scope -> Arguments.of(kind, scope)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("exchangeCaptureScopes")
+    void shouldFilterBothExchangeParticipantsAndReplayOptedInExchangesAcrossRestarts(String kind, String scope) throws Exception {
+        writer = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password());
+        writer.setAutoCommit(true);
+        final var exchangeSchema = "DBZ_EX_" + UUID.randomUUID().toString().replace("-", "").substring(0, 10).toUpperCase(Locale.ROOT);
+        final var root = exchangeSchema + ".ROOT_T";
+        final var peerSchema = exchangeSchema + "_P";
+        final var peer = peerSchema + ".PEER_T";
+        final var markerTable = exchangeSchema + ".MARKER";
+        final boolean captureRoot = scope.equals("root") || scope.equals("both");
+        final boolean capturePeer = scope.equals("peer") || scope.equals("both");
+        execute("CREATE SCHEMA " + exchangeSchema);
+        execute("CREATE SCHEMA " + peerSchema);
+        final var definition = kind.startsWith("SUBPARTITION")
+                ? "PARTITION BY RANGE(K) SUBPARTITION BY RANGE(ID)(PARTITION P1 VALUES LESS THAN(MAXVALUE)"
+                        + "(SUBPARTITION S1 VALUES LESS THAN(10),SUBPARTITION SM VALUES LESS THAN(MAXVALUE)))"
+                : RANGE;
+        execute("CREATE TABLE " + root + "(ID INT,K INT,V VARCHAR(30)) " + definition);
+        execute("CREATE TABLE " + peer + "(ID INT,K INT,V VARCHAR(30))");
+        execute("CREATE TABLE " + markerTable + "(ID INT PRIMARY KEY,K INT,V VARCHAR(30))");
+        execute("INSERT INTO " + root + " VALUES(1,1,'original')");
+        execute("INSERT INTO " + peer + " VALUES(2,2,'incoming')");
+        execute("INSERT INTO " + markerTable + " VALUES(0,0,'marker')");
+        final List<String> included = new ArrayList<>();
+        included.add(Pattern.quote(markerTable));
+        if (captureRoot) {
+            included.add(Pattern.quote(root));
+        }
+        if (capturePeer) {
+            included.add(Pattern.quote(peer));
+        }
+        config = Configuration.create().with("topic.prefix", "dameng")
+                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
+                .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
+                .with("table.include.list", String.join(",", included)).with("snapshot.mode", "initial")
+                .with("schema.history.internal", FileSchemaHistory.class.getName())
+                .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
+                .with("schema.history.internal.store.only.captured.tables.ddl", true)
+                .with("schema.history.internal.skip.unparseable.ddl", captureRoot || capturePeer)
+                .with(DamengConnectorConfig.PARTITION_DROP_IGNORE, true)
+                .with("poll.interval.ms", 100).with("offset.flush.interval.ms", 100)
+                .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
+        startEngine();
+        final List<String> snapshots = new ArrayList<>();
+        final List<String> expectedSnapshots = new ArrayList<>(List.of("MARKER:r:0:marker"));
+        if (captureRoot) {
+            expectedSnapshots.add("ROOT_T:r:1:original");
+        }
+        if (capturePeer) {
+            expectedSnapshots.add("PEER_T:r:2:incoming");
+        }
+        for (int index = 0; index < expectedSnapshots.size(); index++) {
+            snapshots.add(signature(nextDataRecord()));
+        }
+        assertThat(snapshots).containsExactlyInAnyOrderElementsOf(expectedSnapshots);
+        execute("INSERT INTO " + markerTable + " VALUES(1,0,'marker')");
+        final var baseline = throughMarker(1).get(0);
+        checkpointExchange(baseline);
+        final var historyBefore = java.nio.file.Files.readAllLines(directory.resolve("history.dat"));
+
+        final var sql = "ALTER TABLE " + (scope.equals("both") ? "ROOT_T" : root) + " EXCHANGE " + kind
+                + " WITH TABLE " + (scope.equals("peer") ? "PEER_T" : peer);
+        if (scope.equals("both") || scope.equals("peer")) {
+            execute("SET SCHEMA " + (scope.equals("peer") ? peerSchema : exchangeSchema));
+        }
+        startEngine();
+        execute(sql);
+        if (captureRoot || capturePeer) {
+            Awaitility.await("exchange rejected despite generic DDL skipping").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(100))
+                    .until(() -> failure.get() != null);
+            assertThat(failure.get()).hasStackTraceContaining("partition.exchange.ignore=true").hasStackTraceContaining(sql);
+            stopConnector();
+            storeOffsets(config, Map.of(baseline.sourcePartition(), baseline.sourceOffset()));
+            consumedLines.clear();
+            assertThat(java.nio.file.Files.readAllLines(directory.resolve("history.dat"))).isEqualTo(historyBefore);
+            config = config.edit().with(DamengConnectorConfig.PARTITION_EXCHANGE_IGNORE, true).build();
+            startEngine();
+        }
+        final List<String> expected = new ArrayList<>();
+        for (final var table : List.of(root, peer)) {
+            execute("UPDATE " + table + " SET V='changed'");
+            execute("INSERT INTO " + table + " VALUES(3,3,'after')");
+            execute("DELETE FROM " + table + " WHERE ID=3");
+            if (table.equals(root) ? captureRoot : capturePeer) {
+                final var name = table.equals(root) ? "ROOT_T" : "PEER_T";
+                expected.addAll(List.of(name + ":u:" + (table.equals(root) ? 2 : 1) + ":changed", name + ":c:3:after", name + ":d:3:after"));
+            }
+        }
+        execute("INSERT INTO " + markerTable + " VALUES(2,0,'marker')");
+        expected.add("MARKER:c:2:marker");
+        final var replayed = throughMarker(2);
+        assertThat(replayed.stream().map(DamengPartitionTableIT::signature)).containsExactlyElementsOf(expected);
+        checkpointExchange(replayed.get(replayed.size() - 1));
+        assertThat(java.nio.file.Files.readAllLines(directory.resolve("history.dat"))).isEqualTo(historyBefore);
+
+        config = config.edit().with(DamengConnectorConfig.PARTITION_EXCHANGE_IGNORE, false).build();
+        startEngine();
+        execute("UPDATE " + root + " SET V='restarted'");
+        execute("UPDATE " + peer + " SET V='restarted'");
+        execute("INSERT INTO " + markerTable + " VALUES(3,0,'marker')");
+        final List<String> expectedRestart = new ArrayList<>();
+        if (captureRoot) {
+            expectedRestart.add("ROOT_T:u:2:restarted");
+        }
+        if (capturePeer) {
+            expectedRestart.add("PEER_T:u:1:restarted");
+        }
+        expectedRestart.add("MARKER:c:3:marker");
+        assertThat(throughMarker(3).stream().map(DamengPartitionTableIT::signature)).containsExactlyElementsOf(expectedRestart);
+        assertThat(failure.get()).isNull();
+    }
+
+    private void checkpointExchange(SourceRecord record) throws Exception {
+        stopConnector();
+        storeOffsets(config, Map.of(record.sourcePartition(), record.sourceOffset()));
+        consumedLines.clear();
     }
 
     private static void assertRelocationInserts(List<SourceRecord> records) {

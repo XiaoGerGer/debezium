@@ -22,6 +22,7 @@ import io.debezium.connector.dameng.DamengTableType;
 import io.debezium.connector.dameng.antlr.DamengDdlParser.Type;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.CascadeDropException;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Impact;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.PartitionExchangeException;
 import io.debezium.connector.dameng.compatibility.DamengIdentifierRules;
 import io.debezium.relational.Attribute;
 import io.debezium.relational.Table;
@@ -954,8 +955,63 @@ class DamengDdlStatementAnalyzerTest {
     })
     void shouldNotAllowPartitionExchangeUsingTheDataRemovalOptIn(String sql) {
         assertUnsupported(sql);
-        assertThat(analyzer.analyze(sql, "APP").failure()).hasMessageContaining("partition")
+        assertThat(analyzer.analyze(sql, "APP").failure()).isInstanceOf(PartitionExchangeException.class).hasMessageContaining("partition.exchange.ignore=true")
                 .isNotInstanceOf(DamengDdlStatementAnalyzer.PartitionDataRemovalException.class);
+    }
+
+    static Stream<Arguments> partitionExchangeStatements() {
+        return Stream.of("PARTITION", "SUBPARTITION").flatMap(kind -> Stream.of(
+                Arguments.of("ALTER TABLE APP.T EXCHANGE " + kind + " P1 WITH TABLE OTHER.U", "APP", "T", "OTHER", "U", "P1", kind),
+                Arguments.of("ALTER TABLE \"App\".\"T\" EXCHANGE " + kind + " \"p\"\"1\" WITH TABLE \"Other\".\"u\";",
+                        "App", "T", "Other", "u", "p\"1", kind),
+                Arguments.of("ALTER TABLE T EXCHANGE " + kind + " P1 WITH TABLE U", null, "T", null, "U", "P1", kind),
+                Arguments.of("ALTER TABLE APP.T EXCHANGE " + kind + " P1 WITH TABLE U", "APP", "T", null, "U", "P1", kind)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("partitionExchangeStatements")
+    void shouldRetainBothExchangeReferencesWithoutGuessingTheirSchemas(String sql, String leftSchema, String leftName,
+                                                                       String rightSchema, String rightName, String partitionName, String kind) {
+        final var analysis = analyzer.analyze(sql, "SESSION_SCHEMA");
+        assertThat(analysis.impact()).isEqualTo(Impact.UNSUPPORTED);
+        assertThat(analysis.failure()).isInstanceOf(PartitionExchangeException.class)
+                .hasMessageContaining("EXCHANGE " + kind, "per-row DML", "object-ID mappings", "wrong table downstream", "partition.exchange.ignore=true");
+        final var exchange = (PartitionExchangeException) analysis.failure();
+        assertThat(exchange.tableId()).isEqualTo(new TableId(null, leftSchema, leftName));
+        assertThat(exchange.exchangeTableId()).isEqualTo(new TableId(null, rightSchema, rightName));
+        assertThat(exchange.partitionName()).isEqualTo(partitionName);
+        assertThat(exchange.operation()).isEqualTo("EXCHANGE " + kind);
+        final var parser = new DamengDdlParser();
+        final var tables = new Tables();
+        parser.parse("CREATE TABLE APP.T(ID INT); CREATE TABLE OTHER.U(ID INT)", tables, "APP");
+        final var before = tables.clone();
+        assertThatThrownBy(() -> parser.plan(analysis, tables)).isSameAs(exchange);
+        assertThatThrownBy(() -> parser.parse(sql, tables, "APP")).isInstanceOf(PartitionExchangeException.class);
+        assertThat(tables.forTable(new TableId(null, "APP", "T"))).isSameAs(before.forTable(new TableId(null, "APP", "T")));
+        assertThat(tables.forTable(new TableId(null, "OTHER", "U"))).isSameAs(before.forTable(new TableId(null, "OTHER", "U")));
+    }
+
+    @Test
+    void shouldCanonicalizeBothExchangeReferencesForCaseInsensitiveDatabases() {
+        final var insensitive = new DamengDdlStatementAnalyzer(false, new DamengIdentifierRules(true));
+        final var analysis = insensitive.analyze("ALTER TABLE \"App\".\"t\" EXCHANGE PARTITION \"p1\" WITH TABLE \"Other\".\"u\"", "SESSION_SCHEMA");
+        final var exchange = (PartitionExchangeException) analysis.failure();
+        assertThat(exchange.tableId()).isEqualTo(new TableId(null, "APP", "T"));
+        assertThat(exchange.exchangeTableId()).isEqualTo(new TableId(null, "OTHER", "U"));
+        assertThat(exchange.partitionName()).isEqualTo("P1");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "ALTER TABLE APP.T EXCHANGE", "ALTER TABLE APP.T EXCHANGE PARTITION P1 WITH TABLE",
+            "ALTER TABLE APP.T EXCHANGE SUBPARTITION WITH TABLE APP.U", "ALTER TABLE APP.T EXCHANGE PARTITION P1 WITH TABLE APP.U UNKNOWN",
+            "ALTER TABLE APP.T EXCHANGE PARTITION P1 WITH TABLE APP.U; DROP TABLE APP.T",
+            "ALTER TABLE APP.T EXCHANGE PARTITION P1 WITH TABLE APP.U INSERT INTO APP.T VALUES(1)",
+            "DROP TABLE APP.U; ALTER TABLE APP.T EXCHANGE PARTITION P1 WITH TABLE APP.U"
+    })
+    void shouldNotClassifyIncompleteUnknownOrCompoundStatementsAsOptInExchanges(String sql) {
+        assertUnsupported(sql);
+        assertThat(analyzer.analyze(sql, "APP").failure()).isNotInstanceOf(PartitionExchangeException.class);
     }
 
     @ParameterizedTest

@@ -26,9 +26,11 @@ import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Analysis;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.CascadeDropException;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Impact;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.PartitionDataRemovalException;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.PartitionExchangeException;
 import io.debezium.connector.dameng.logminer.LogMinerArchiveWindow;
 import io.debezium.connector.dameng.logminer.LogMinerRow;
 import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer;
+import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer.DispatchProgress;
 import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer.Transaction;
 import io.debezium.connector.dameng.logminer.events.EventType;
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser;
@@ -246,7 +248,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
     }
 
     private void readBatch(ChangeEventSourceContext context, long start, long end, LogMinerTransactionBuffer buffer, boolean reconstruction) throws SQLException {
-        buffer.beginWindow();
+        buffer.beginWindow(new DispatchProgress(offset.getCommitLsn(), offset.getTransactionId()));
         final long started = System.nanoTime();
         Throwable failure = null;
         long readRows = 0;
@@ -348,9 +350,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
         final long previousCommit = offset.getCommitLsn();
         final long previousSerial = offset.getEventSerialNo();
         final String previousTransaction = offset.getTransactionId();
-        if (transaction.commitLsn() < previousCommit
-                || (transaction.commitLsn() == previousCommit && (previousTransaction == null
-                        || transaction.id().compareTo(previousTransaction) < 0))) {
+        if (new DispatchProgress(previousCommit, previousTransaction).canDiscard(transaction.commitLsn(), transaction.id())) {
             return;
         }
         long serial = 0;
@@ -517,6 +517,10 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
             return ddlParser.analyze(row.redo(), row.owner() == null ? row.username() : row.owner());
         }
         catch (IllegalArgumentException failure) {
+            if (failure instanceof PartitionExchangeException exchange) {
+                handlePartitionExchange(row, exchange);
+                return null;
+            }
             if (failure instanceof CascadeDropException) {
                 if (!config.isCascadeDropIgnored()) {
                     throw ddlFailure(row, failure);
@@ -540,6 +544,46 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
             }
             throw ddlFailure(row, failure);
         }
+    }
+
+    private void handlePartitionExchange(LogMinerRow row, PartitionExchangeException exchange) {
+        var table = exchange.tableId();
+        if (table.schema() == null && row.owner() != null && !row.owner().isBlank()) {
+            table = new TableId(table.catalog(), row.owner(), table.table());
+        }
+        var peer = exchange.exchangeTableId();
+        if (peer.schema() == null) {
+            // DM 8.1.3.162 reports the peer's DATA_OBJ#, while SEG_OWNER names the root schema.
+            final var historicalPeer = tableId(row);
+            if (historicalPeer != null && historicalPeer.table().equals(peer.table())) {
+                peer = historicalPeer;
+            }
+        }
+        if (table.schema() == null || table.schema().isBlank() || peer.schema() == null || peer.schema().isBlank()) {
+            throw ddlFailure(row, new IllegalArgumentException("Cannot resolve both Dameng exchange table identities for " + table + " and " + peer
+                    + "; qualify both table names, or restore the matching peer history for this DATA_OBJ#. "
+                    + "SEG_OWNER is not a reliable default schema for WITH TABLE; refusing to ignore an exchange with unknown scope", exchange));
+        }
+        final boolean tableRelevant = isExchangeTableRelevant(table, row.lsn());
+        final boolean peerRelevant = isExchangeTableRelevant(peer, row.lsn());
+        if (!tableRelevant && !peerRelevant) {
+            LOGGER.debug("Skipping Dameng {} {} between {} and {} outside processing scope at LSN {}, DATA_OBJ# {}. SQL_REDO: '{}'",
+                    exchange.operation(), exchange.partitionName(), table, peer, row.lsn(), row.objectId(), row.redo());
+            return;
+        }
+        if (!config.isPartitionExchangeIgnored()) {
+            throw ddlFailure(row, exchange);
+        }
+        LOGGER.warn("Ignoring Dameng {} {} between {} and {} at LSN {}, XID {}, DATA_OBJ# {} because partition.exchange.ignore=true. "
+                + "SQL_REDO: '{}'; reason: {}",
+                exchange.operation(), exchange.partitionName(), table, peer, row.lsn(), row.transactionId(), row.objectId(), row.redo(), exchange.getMessage());
+    }
+
+    private boolean isExchangeTableRelevant(TableId table, long lsn) {
+        if (config.isInternalTableExcluded(table) || (captureScopeChange != null && captureScopeChange.excludes(table, 0, lsn))) {
+            return false;
+        }
+        return config.getTableFilters().dataCollectionFilter().isIncluded(table) || schema.getTables().forTable(table) != null;
     }
 
     private List<DamengDdlParser.SchemaChange> planDdl(Analysis analysis, LogMinerRow row) {
@@ -568,6 +612,11 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
             if (onlineObjectId != row.objectId()) {
                 throw new IllegalStateException("Online table object identity does not match the CTAS redo");
             }
+            // Resolve CTAS columns and types through the online dictionary instead of inferring arbitrary AS SELECT queries.
+            // This exposes the current schema, not the historical schema at the CTAS LSN.
+            // The surrounding DATA_OBJ# checks detect object identity changes, but ALTER TABLE can preserve that identity.
+            // If later ALTERs have already executed, replaying this CTAS can install a newer schema and misinterpret subsequent redo.
+            // The target must retain its creation-time structure until this CTAS is first consumed.
             final var table = connection.readTableSchema(tableId);
             onlineObjectId = connection.getTableObjectId(tableId);
             if (onlineObjectId != row.objectId()) {

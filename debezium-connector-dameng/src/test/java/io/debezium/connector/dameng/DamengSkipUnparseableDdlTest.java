@@ -40,6 +40,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.CascadeDropException;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.PartitionExchangeException;
 import io.debezium.connector.dameng.logminer.parser.DmlParserException;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.junit.logging.LogInterceptor;
@@ -83,6 +84,72 @@ class DamengSkipUnparseableDdlTest {
     private ChangeEventSourceContext context;
     private EventDispatcher<DamengPartition, TableId> dispatcher;
     private ResultSet rows;
+
+    static Stream<Arguments> partitionExchangeSettings() {
+        return Stream.of("ALTER TABLE APP.A EXCHANGE PARTITION P1 WITH TABLE OTHER.B",
+                "ALTER TABLE OTHER.B EXCHANGE SUBPARTITION S1 WITH TABLE APP.A")
+                .flatMap(sql -> Stream.of(false, true).map(skip -> Arguments.of(sql, skip)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("partitionExchangeSettings")
+    void shouldRequireTheExchangeOptInEvenWhenOtherIgnoreSettingsAreEnabled(String sql, boolean skip) throws Exception {
+        configure(Boolean.toString(skip), true, true);
+        final var original = schema.getTables().forTable(CAPTURED);
+        final var before = offset.getOffset();
+        run(List.of(ddl(101, 120, sql), dml(102, 120, false), commit(120)));
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasCauseInstanceOf(PartitionExchangeException.class)
+                .hasMessageContaining("partition.exchange.ignore=true", "APP.A", "OTHER.B", "LSN 101", "XID 78", "DATA_OBJ# 7", sql);
+        assertThat(logs.containsErrorMessage(sql)).isTrue();
+        assertThat(logs.containsWarnMessage(sql)).isFalse();
+        assertThat(deliveredTables).isEmpty();
+        assertThat(schemaStatements).isEmpty();
+        assertThat(schema.getTables().forTable(CAPTURED)).isSameAs(original);
+        assertThat(offset.getOffset()).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @MethodSource("partitionExchangeSettings")
+    void shouldIgnoreExchangesOnlyWhenEnabledAndResumeWithUnchangedHistory(String sql, boolean skip) throws Exception {
+        configure(Boolean.toString(skip), false, false, true);
+        final var original = schema.getTables().forTable(CAPTURED);
+        final var exchange = ddl(101, 120, sql);
+        run(List.of(exchange, dml(102, 120, false), commit(120)));
+        assertThat(failure.get()).isNull();
+        assertThat(logs.containsWarnMessage("partition.exchange.ignore=true")).isTrue();
+        assertThat(logs.containsWarnMessage(sql)).isTrue();
+        assertThat(logs.containsWarnMessage("wrong table downstream")).isTrue();
+        assertThat(deliveredTables).containsExactly(original);
+        assertThat(schemaStatements).isEmpty();
+        assertThat(recover().forTable(CAPTURED)).isEqualTo(original);
+        assertThat(offset.getCommitLsn()).isEqualTo(120);
+
+        offset = new DamengOffsetContext.Loader(config).load(deliveredOffsets.get(0));
+        deliveredTables.clear();
+        polls.set(0);
+        running.set(true);
+        run(List.of(exchange, dml(102, 120, false), commit(120), dml(131, 140, false), commit(140)));
+        assertThat(failure.get()).isNull();
+        assertThat(deliveredTables).containsExactly(original);
+        assertThat(recover().forTable(CAPTURED)).isEqualTo(original);
+        assertThat(offset.getCommitLsn()).isEqualTo(140);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "ALTER TABLE OTHER.B EXCHANGE PARTITION P1 WITH TABLE APP.A UNKNOWN",
+            "ALTER TABLE OTHER.B EXCHANGE PARTITION P1 WITH TABLE APP.A; DROP TABLE APP.A",
+            "ALTER TABLE OTHER.B EXCHANGE PARTITION P1 WITH TABLE"
+    })
+    void shouldNotUseTheExchangeOptInForIncompleteOrCompoundStatements(String sql) throws Exception {
+        configure("false", false, false, true);
+        final var before = offset.getOffset();
+        run(List.of(ddl(101, 120, sql), commit(120)));
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasCauseInstanceOf(IllegalArgumentException.class);
+        assertThat(failure.get().getCause()).isNotInstanceOf(PartitionExchangeException.class);
+        assertThat(schemaStatements).isEmpty();
+        assertThat(offset.getOffset()).isEqualTo(before);
+    }
 
     static Stream<Arguments> cascadeDropSettings() {
         return Stream.of(
@@ -510,12 +577,17 @@ class DamengSkipUnparseableDdlTest {
     }
 
     private void configure(String setting, boolean ignorePartitionDrops, boolean ignoreCascadeDrops) throws Exception {
+        configure(setting, ignorePartitionDrops, ignoreCascadeDrops, false);
+    }
+
+    private void configure(String setting, boolean ignorePartitionDrops, boolean ignoreCascadeDrops, boolean ignorePartitionExchanges) throws Exception {
         final var builder = DamengConnectorConfigTest.configuration()
                 .with("log.mining.window.strategy", "fixed")
                 .with("poll.interval.ms", 1)
                 .with("table.include.list", "APP.A")
                 .with(DamengConnectorConfig.PARTITION_DROP_IGNORE, ignorePartitionDrops)
                 .with(DamengConnectorConfig.CASCADE_DROP_IGNORE, ignoreCascadeDrops)
+                .with(DamengConnectorConfig.PARTITION_EXCHANGE_IGNORE, ignorePartitionExchanges)
                 .with("schema.history.internal", MemorySchemaHistory.class.getName())
                 .with("schema.history.internal.store.only.captured.tables.ddl", true);
         if (setting != null) {

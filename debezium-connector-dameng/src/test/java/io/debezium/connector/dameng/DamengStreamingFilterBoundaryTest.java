@@ -30,16 +30,21 @@ import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.CommonConnectorConfig;
+import io.debezium.config.Configuration;
 import io.debezium.connector.dameng.antlr.DamengDdlParser;
+import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.PartitionExchangeException;
 import io.debezium.jdbc.MainConnectionProvidingConnectionFactory;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
@@ -136,6 +141,139 @@ class DamengStreamingFilterBoundaryTest {
     @AfterEach
     void closeSchema() {
         schema.close();
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = { -1, 0, 7, 99 })
+    void shouldSkipAnExchangeOutsideBothTableScopesRegardlessOfItsObjectNumber(long objectId) throws Exception {
+        final var original = schema.getTables().forTable(INCLUDED);
+        final Map<String, Object> exchange = new HashMap<>(ddl(101, "ALTER TABLE APP.B EXCHANGE PARTITION P1 WITH TABLE OTHER.C"));
+        exchange.put("DATA_OBJ#", objectId);
+        run(List.of(exchange, dml(102), commit()));
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(publishedSchemas).isEmpty();
+        assertThat(schema.getTables().forTable(INCLUDED)).isSameAs(original);
+        assertThat(recover().tableIds()).containsExactly(INCLUDED);
+        assertThat(offset.getCommitLsn()).isEqualTo(120);
+        verify(connection, never()).readTableSchema(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "ALTER TABLE APP.A EXCHANGE PARTITION P1 WITH TABLE OTHER.B",
+            "ALTER TABLE OTHER.B EXCHANGE SUBPARTITION S1 WITH TABLE APP.A",
+            "ALTER TABLE APP.A EXCHANGE PARTITION P1 WITH TABLE APP.MTAB$_IGNORED"
+    })
+    void shouldRejectAnExchangeWhenEitherParticipantIsCaptured(String sql) throws Exception {
+        offset.validateDatabaseMagic(0);
+        final Map<String, ?> before = offset.getOffset();
+        final Map<String, Object> exchange = new HashMap<>(ddl(101, sql));
+        exchange.put("DATA_OBJ#", 99L);
+        run(List.of(exchange, dml(102), commit()));
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasCauseInstanceOf(PartitionExchangeException.class);
+        assertThat(offset.getOffset()).isEqualTo(before);
+        assertThat(delivered).isEmpty();
+        assertThat(publishedSchemas).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "ALTER TABLE APP.B EXCHANGE PARTITION P1 WITH TABLE OTHER.C",
+            "ALTER TABLE OTHER.C EXCHANGE PARTITION P1 WITH TABLE APP.B"
+    })
+    void shouldProtectRetainedHistoricalTablesOutsideTheCurrentCaptureFilter(String sql) throws Exception {
+        final var historical = schema.getTables().forTable(INCLUDED).edit().tableId(EXCLUDED)
+                .addAttribute(Attribute.editor().name("dameng.object.id").value("9").create()).create();
+        schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, offset, "DAMENG", historical));
+        final var retained = schema.getTables().forTable(EXCLUDED);
+        offset.validateDatabaseMagic(0);
+        final var before = offset.getOffset();
+        run(List.of(ddl(101, sql), commit()));
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasCauseInstanceOf(PartitionExchangeException.class);
+        assertThat(offset.getOffset()).isEqualTo(before);
+        assertThat(schema.getTables().forTable(EXCLUDED)).isSameAs(retained);
+        assertThat(publishedSchemas).isEmpty();
+    }
+
+    @Test
+    void shouldKeepExcludedInternalTableHistoryOutsideExchangeProcessingScope() throws Exception {
+        final var internal = schema.getTables().forTable(INCLUDED).edit().tableId(new TableId(null, "APP", "MTAB$_IGNORED"))
+                .addAttribute(Attribute.editor().name("dameng.object.id").value("9").create()).create();
+        schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, offset, "DAMENG", internal));
+        run(List.of(ddl(101, "ALTER TABLE APP.MTAB$_IGNORED EXCHANGE PARTITION P1 WITH TABLE OTHER.C"), dml(102), commit()));
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(publishedSchemas).isEmpty();
+    }
+
+    static Stream<Arguments> exchangeActivationBoundaries() {
+        return Stream.of(Arguments.of(false, false), Arguments.of(true, false), Arguments.of(false, true), Arguments.of(true, true));
+    }
+
+    @ParameterizedTest
+    @MethodSource("exchangeActivationBoundaries")
+    void shouldApplyActivationBoundariesSeparatelyToBothExchangeParticipants(boolean leftExcluded, boolean rightExcluded) throws Exception {
+        configureSource(config.getConfig().edit().with("table.include.list", "APP\\..*").build());
+        final var scope = mock(DamengCaptureScopeChange.class);
+        when(scope.excludes(INCLUDED, 0, 101)).thenReturn(leftExcluded);
+        when(scope.excludes(EXCLUDED, 0, 101)).thenReturn(rightExcluded);
+        source.setCaptureScopeChange(scope);
+        run(List.of(ddl(101, "ALTER TABLE APP.A EXCHANGE PARTITION P1 WITH TABLE APP.B"), commit()));
+        if (leftExcluded && rightExcluded) {
+            assertThat(failure.get()).isNull();
+            assertThat(offset.getCommitLsn()).isEqualTo(120);
+        }
+        else {
+            assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasCauseInstanceOf(PartitionExchangeException.class);
+            assertThat(offset.getCommitLsn()).isLessThan(120);
+        }
+        verify(scope).excludes(INCLUDED, 0, 101);
+        verify(scope).excludes(EXCLUDED, 0, 101);
+        assertThat(publishedSchemas).isEmpty();
+    }
+
+    @Test
+    void shouldResolveAnUnqualifiedExchangePeerFromHistoryRatherThanTheRootSchema() throws Exception {
+        configureSource(config.getConfig().edit().with(DamengConnectorConfig.PARTITION_EXCHANGE_IGNORE, true).build());
+        final Map<String, Object> exchange = new HashMap<>(ddl(101, "ALTER TABLE OTHER.B EXCHANGE PARTITION P1 WITH TABLE A"));
+        exchange.put("SEG_OWNER", "OTHER");
+        run(List.of(exchange, dml(102), commit()));
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).containsExactly(INCLUDED);
+        assertThat(publishedSchemas).isEmpty();
+        assertThat(recover().tableIds()).containsExactly(INCLUDED);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "unknownObject", "wrongName", "missingRootOwner" })
+    void shouldRejectUnknownExchangeIdentitiesEvenWithBothSkippingOptionsEnabled(String reason) throws Exception {
+        configureSource(config.getConfig().edit().with(DamengConnectorConfig.PARTITION_EXCHANGE_IGNORE, true)
+                .with("schema.history.internal.skip.unparseable.ddl", true).build());
+        final var sql = reason.equals("missingRootOwner") ? "ALTER TABLE B EXCHANGE PARTITION P1 WITH TABLE APP.A"
+                : "ALTER TABLE OTHER.B EXCHANGE PARTITION P1 WITH TABLE " + (reason.equals("wrongName") ? "UNKNOWN" : "A");
+        final Map<String, Object> exchange = new HashMap<>(ddl(101, sql));
+        exchange.put("SEG_OWNER", reason.equals("missingRootOwner") ? null : "OTHER");
+        exchange.put("USERNAME", "50331649");
+        exchange.put("DATA_OBJ#", reason.equals("unknownObject") ? 99L : 7L);
+        offset.validateDatabaseMagic(0);
+        final var before = offset.getOffset();
+        run(List.of(exchange, dml(102), commit()));
+        assertThat(failure.get()).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Cannot resolve both", "unknown scope");
+        assertThat(offset.getOffset()).isEqualTo(before);
+        assertThat(delivered).isEmpty();
+        assertThat(publishedSchemas).isEmpty();
+    }
+
+    private void configureSource(Configuration configuration) {
+        final var sourceConfig = new DamengConnectorConfig(configuration);
+        final var handler = mock(ErrorHandler.class);
+        doAnswer(invocation -> {
+            failure.set(invocation.getArgument(0));
+            return null;
+        }).when(handler).setProducerThrowable(any());
+        source = new DamengStreamingChangeEventSource(sourceConfig, factory, dispatcher, handler, Clock.SYSTEM, schema,
+                mock(DamengStreamingChangeEventSourceMetrics.class));
     }
 
     @ParameterizedTest

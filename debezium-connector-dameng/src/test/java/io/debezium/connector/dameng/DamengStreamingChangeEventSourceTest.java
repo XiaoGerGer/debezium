@@ -37,6 +37,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -54,6 +56,7 @@ import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.ChangeEventSource.ChangeEventSourceContext;
 import io.debezium.pipeline.spi.ChangeRecordEmitter;
+import io.debezium.pipeline.txmetadata.TransactionMonitor;
 import io.debezium.relational.Attribute;
 import io.debezium.relational.Column;
 import io.debezium.relational.Table;
@@ -517,6 +520,114 @@ class DamengStreamingChangeEventSourceTest {
         source.execute(context, new DamengPartition("dm"), offset);
         assertThat(failure.get()).isNull();
         assertThat(delivered).isEmpty();
+    }
+
+    @Test
+    void shouldExcludeDispatchedTransactionsFromRestartBufferCapacityWhilePreservingOpenAndNewTransactions() throws Exception {
+        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.max.transactions", 2).build());
+        createSource();
+        records(List.of(dml(95, 92, 0, 1), dml(96, 94, 100, 2), commit(100, 94, 2),
+                dml(105, 102, 120, 3), commit(120, 102, 3), dml(130, 125, 140, 5), commit(140, 125, 5)));
+        final var offset = new DamengOffsetContext(config, 92);
+        offset.setCommitLsn(120);
+        offset.setTransactionId("04");
+        offset.setEventSerialNo(Long.MAX_VALUE);
+
+        source.execute(context, new DamengPartition("dm"), offset);
+
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).singleElement().satisfies(value -> assertThat(value)
+                .containsEntry("change_lsn", 130L).containsEntry("mining_transaction_id", "05").containsEntry("lsn", 92L));
+        assertThat(offset.getLsn()).isEqualTo(92);
+        assertThat(offset.getCommitLsn()).isEqualTo(140);
+        assertThat(metrics.getOpenTransactions()).isEqualTo(1);
+        assertThat(metrics.getBufferLimitFailures()).isZero();
+        verify(connection).startLogMining(92, 150, false);
+    }
+
+    @Test
+    void shouldExcludeDispatchedTransactionsDuringReconstructionWhilePreservingTheNextOpenTransaction() throws Exception {
+        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
+                .with("log.mining.buffer.max.transactions", 3).build());
+        createSource();
+        final var polls = new AtomicInteger();
+        when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
+            if (polls.incrementAndGet() > 3) {
+                running.set(false);
+            }
+            return 120L;
+        });
+        final List<Long> starts = new ArrayList<>();
+        doAnswer(invocation -> {
+            final long start = invocation.getArgument(0);
+            starts.add(start);
+            if (start == 90) {
+                records(List.of(dml(95, 92, 0, 1), dml(96, 94, 98, 2), commit(98, 94, 2)));
+            }
+            else if (start == 101) {
+                records(List.of(dml(105, 102, 108, 3), commit(108, 102, 3)));
+            }
+            else if (start == 111) {
+                records(List.of(dml(113, 112, 0, 4), commit(115, 0, 1)));
+            }
+            else if (start == 92) {
+                // The checkpoint transaction remains eligible for END cleanup, alongside the completing and open transactions.
+                records(List.of(dml(95, 92, 115, 1), dml(96, 94, 98, 2), commit(98, 94, 2),
+                        dml(105, 102, 108, 3), commit(108, 102, 3), dml(113, 112, 0, 4), commit(115, 92, 1)));
+            }
+            else {
+                throw new AssertionError("Unexpected mining start " + start);
+            }
+            return null;
+        }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
+        final var offset = new DamengOffsetContext(config, 90);
+
+        source.execute(context, new DamengPartition("dm"), offset);
+
+        assertThat(failure.get()).isNull();
+        assertThat(starts).containsExactly(90L, 101L, 111L, 92L);
+        assertThat(delivered).extracting(value -> value.get("change_lsn")).containsExactly(96L, 105L, 95L);
+        assertThat(offset.getLsn()).isEqualTo(112);
+        assertThat(offset.getCommitLsn()).isEqualTo(115);
+        assertThat(metrics.getOpenTransactions()).isEqualTo(1);
+        assertThat(metrics.getReconstructionSessions()).isEqualTo(1);
+        assertThat(metrics.getBufferLimitFailures()).isZero();
+    }
+
+    @Test
+    void shouldFinishRestoredTransactionMetadataWhenItsLastStatementIsAlreadyCheckpointed() throws Exception {
+        config = new DamengConnectorConfig(config.getConfig().edit().with("provide.transaction.metadata", true).build());
+        createSource();
+        records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+        final var saved = new DamengOffsetContext(config, 90);
+        saved.setCommitLsn(120);
+        saved.setTransactionId("01");
+        saved.setEventSerialNo(Long.MAX_VALUE);
+        saved.getTransactionContext().beginTransaction("01");
+        saved.getTransactionContext().event(TABLE_ID);
+        final var offset = new DamengOffsetContext.Loader(config).load(saved.getOffset());
+        final List<SourceRecord> metadata = new ArrayList<>();
+        final var monitor = new TransactionMonitor(config, new DamengEventMetadataProvider(), config.schemaNameAdjuster(), metadata::add, "dm.transaction");
+        doAnswer(invocation -> {
+            monitor.transactionCommittedEvent(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2));
+            return null;
+        }).when(dispatcher).dispatchTransactionCommittedEvent(any(), any(), any());
+
+        source.execute(context, new DamengPartition("dm"), offset);
+
+        assertThat(failure.get()).isNull();
+        assertThat(delivered).isEmpty();
+        assertThat(metadata).singleElement().satisfies(record -> {
+            final var value = (Struct) record.value();
+            assertThat(value.getString("status")).isEqualTo("END");
+            assertThat(value.getString("id")).isEqualTo("01");
+            assertThat(value.getInt64("event_count")).isEqualTo(1L);
+        });
+        assertThat(offset.getTransactionContext().isTransactionInProgress()).isFalse();
+        assertThat(offset.getTransactionContext().getTotalEventCount()).isZero();
+        assertThat(offset.getOffset()).doesNotContainKey("transaction_id");
+        assertThat(offset.getEventSerialNo()).isEqualTo(Long.MAX_VALUE);
+        assertThat(offset.getLsn()).isEqualTo(150);
     }
 
     @Test

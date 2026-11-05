@@ -8,6 +8,7 @@ package io.debezium.connector.dameng;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -19,6 +20,18 @@ import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.TableId;
 
 class DamengConnectorConfigTest {
+    @Test
+    void shouldRequireAnExplicitPartitionExchangeOptIn() {
+        assertThat(new DamengConnectorConfig(configuration().build()).isPartitionExchangeIgnored()).isFalse();
+        assertThat(new DamengConnectorConfig(configuration().with(DamengConnectorConfig.PARTITION_EXCHANGE_IGNORE, true).build())
+                .isPartitionExchangeIgnored()).isTrue();
+        final var key = DamengConnectorConfig.configDef().configKeys().get("partition.exchange.ignore");
+        assertThat(key.defaultValue).isEqualTo(false);
+        assertThat(key.importance).isEqualTo(Importance.HIGH);
+        assertThat(configuration().with(DamengConnectorConfig.PARTITION_EXCHANGE_IGNORE, "invalid").build()
+                .validate(DamengConnectorConfig.ALL_FIELDS).get("partition.exchange.ignore").errorMessages()).isNotEmpty();
+    }
+
     @Test
     void shouldRequireAnExplicitCascadeDropOptIn() {
         assertThat(new DamengConnectorConfig(configuration().build()).isCascadeDropIgnored()).isFalse();

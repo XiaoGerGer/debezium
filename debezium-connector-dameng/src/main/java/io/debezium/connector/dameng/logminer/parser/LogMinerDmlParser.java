@@ -24,8 +24,7 @@ import io.debezium.relational.Table;
  */
 public class LogMinerDmlParser {
     private static final Pattern NUMBER = Pattern.compile("[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?");
-    private static final Set<String> FUNCTIONS = Set.of("TO_DATE", "TO_TIMESTAMP", "TO_TIMESTAMP_TZ", "TO_NUMBER", "HEXTORAW", "UNISTR",
-            "EMPTY_BLOB", "EMPTY_CLOB");
+    private static final Set<String> FUNCTIONS = Set.of("TO_DATE", "TO_TIMESTAMP", "TO_TIMESTAMP_TZ", "TO_NUMBER", "HEXTORAW", "UNISTR");
     private static final Set<String> INTERVAL_FIELDS = Set.of("YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND");
 
     /**
@@ -210,6 +209,13 @@ public class LogMinerDmlParser {
             }
             if (takeWord("OUT_CLOB") || takeWord("OUT_BLOB")) {
                 return new SqlExpression(token.value());
+            }
+            if (takeWord("EMPTY_CLOB") || takeWord("EMPTY_BLOB")) {
+                // DM SQL_REDO also emits empty LOB markers without parentheses.
+                if (takeSymbol("(")) {
+                    expectSymbol(")");
+                }
+                return new SqlExpression(token.value().toUpperCase(Locale.ROOT) + "()");
             }
             if (takeWord("N")) {
                 if (peek().kind() != Kind.STRING) {

@@ -43,6 +43,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     private int fragmentSequence;
     private StringBuilder sql;
     private RuntimeException inputFailure;
+    private DispatchProgress dispatchProgress;
 
     public LogMinerTransactionBuffer(long memoryLimit, long maxSqlBytes, long maxTransactions, Path spillPath, long spillLimit) {
         this(memoryLimit, maxSqlBytes, maxTransactions, spillPath, spillLimit, 0);
@@ -61,9 +62,14 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     }
 
     public void beginWindow() {
+        beginWindow(null);
+    }
+
+    public void beginWindow(DispatchProgress progress) {
         finishWindow();
         windowBytes = 0;
         windowRecords = 0;
+        dispatchProgress = progress;
     }
 
     public void add(LogMinerRow row) {
@@ -196,7 +202,12 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         tx.startLsn = Math.min(tx.startLsn, row.startLsn() > 0 ? row.startLsn() : row.lsn());
         tx.startLsn = Math.max(tx.startLsn, recoveryBaselineLsn);
         switch (eventType) {
-            case COMMIT, XA_COMMIT -> tx.commitLsn = row.lsn();
+            case COMMIT, XA_COMMIT -> {
+                tx.commitLsn = row.lsn();
+                if (dispatchProgress != null && dispatchProgress.canDiscard(tx.commitLsn, tx.id)) {
+                    release(tx);
+                }
+            }
             case ROLLBACK -> {
                 // Tested DM versions use RS_ID=-1 for the terminal full rollback.
                 // START itself can be marked rolled back by ROLLBACK TO an early
@@ -249,6 +260,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         }
         initialWindow = true;
         reconstructionRequired = false;
+        dispatchProgress = null;
     }
 
     private void requireValidatedHistory() {
@@ -320,6 +332,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         }
         transactions.values().forEach(tx -> tx.carried = true);
         initialWindow = false;
+        dispatchProgress = null;
         return transactions.values().stream().mapToLong(tx -> tx.startLsn).min().orElse(end);
     }
 
@@ -379,6 +392,21 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
             bufferedRecords = 0;
             fragment = null;
             sql = null;
+            dispatchProgress = null;
+        }
+    }
+
+    /**
+     * Fixed delivery frontier for a mining read. Keep the checkpoint transaction
+     * for the dispatcher's row resume and transaction metadata completion hooks.
+     */
+    public record DispatchProgress(long commitLsn, String transactionId) {
+        public boolean canDiscard(long candidateCommitLsn, String candidateId) {
+            if (candidateCommitLsn != commitLsn) {
+                return candidateCommitLsn < commitLsn;
+            }
+            // A snapshot frontier covers every transaction through its LSN.
+            return transactionId == null || candidateId.compareTo(transactionId) < 0;
         }
     }
 

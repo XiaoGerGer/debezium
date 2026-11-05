@@ -20,6 +20,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer.DispatchProgress;
 import io.debezium.connector.dameng.logminer.events.EventType;
 
 class LogMinerTransactionBufferTest {
@@ -146,6 +147,203 @@ class LogMinerTransactionBufferTest {
             assertThat(buffer.bufferedRecords()).isZero();
         }
         assertEmptyDirectory();
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = { 512, 4096 })
+    void shouldReleasePreviouslyDispatchedTransactionsOnlyAtCommit(long memory) throws Exception {
+        try (var buffer = buffer(memory)) {
+            buffer.beginWindow(new DispatchProgress(100, "checkpoint"));
+            for (int operation : List.of(7, 38)) {
+                buffer.add(row("old", 11, 10, 1, 0, "already dispatched"));
+                buffer.add(row("old", 12, 10, 15, 0, null));
+                buffer.add(row("old", 13, 10, 36, 0, null));
+                assertThat(buffer.openTransactions()).isEqualTo(1);
+                assertThat(buffer.bufferedRecords()).isEqualTo(1);
+                assertThat(buffer.memoryBytes()).isPositive();
+                if (memory == 512) {
+                    assertThat(buffer.diskBytes()).isPositive();
+                }
+                else {
+                    assertThat(buffer.diskBytes()).isZero();
+                }
+
+                buffer.add(row("old", 20, 10, operation, 0, null));
+
+                assertThat(buffer.committedTransactions()).isEmpty();
+                assertThat(buffer.openTransactions()).isZero();
+                assertThat(buffer.bufferedRecords()).isZero();
+                assertThat(buffer.memoryBytes()).isZero();
+                assertThat(buffer.diskBytes()).isZero();
+                try (var files = Files.walk(directory)) {
+                    assertThat(files.filter(Files::isRegularFile).toList()).isEmpty();
+                }
+            }
+            assertThat(buffer.completeWindow(100)).isEqualTo(100);
+        }
+        assertEmptyDirectory();
+    }
+
+    @Test
+    void shouldRejectTheWindowIfDiscardingADispatchedTransactionCannotDeleteItsSpillFile() throws Exception {
+        try (var buffer = buffer(512)) {
+            buffer.beginWindow(new DispatchProgress(100, "checkpoint"));
+            buffer.add(row("old", 11, 10, 1, 0, "already dispatched"));
+            buffer.finishWindow();
+            final Path file;
+            try (var files = Files.walk(directory)) {
+                file = files.filter(Files::isRegularFile).findFirst().orElseThrow();
+            }
+            Files.delete(file);
+            Files.createDirectory(file);
+            final var obstruction = Files.writeString(file.resolve("obstruction"), "prevent deletion");
+            try {
+                assertThatThrownBy(() -> buffer.add(row("old", 20, 10, 7, 0, null)))
+                        .isInstanceOf(LogMinerSpillStore.StorageException.class);
+                assertThatThrownBy(buffer::finishWindow).isInstanceOf(LogMinerSpillStore.StorageException.class);
+                assertThatThrownBy(buffer::committedTransactions).isInstanceOf(LogMinerSpillStore.StorageException.class);
+                assertThatThrownBy(() -> buffer.completeWindow(100)).isInstanceOf(LogMinerSpillStore.StorageException.class);
+            }
+            finally {
+                Files.delete(obstruction);
+                Files.delete(file);
+            }
+        }
+        assertEmptyDirectory();
+    }
+
+    @Test
+    void shouldRetainTheCheckpointTransactionAndLaterTransactionsForDispatch() {
+        try (var buffer = buffer(4096)) {
+            buffer.beginWindow(new DispatchProgress(100, "b"));
+            buffer.add(row("z", 90, 90, 1, 0, "earlier commit"));
+            buffer.add(row("a", 91, 91, 1, 0, "earlier transaction"));
+            buffer.add(row("b", 92, 92, 1, 0, "checkpoint transaction"));
+            buffer.add(row("c", 93, 93, 1, 0, "later transaction"));
+            buffer.add(row("z", 99, 90, 7, 0, null));
+            buffer.add(row("a", 100, 91, 7, 0, null));
+            buffer.add(row("b", 100, 92, 7, 0, null));
+            buffer.add(row("c", 100, 93, 7, 0, null));
+
+            final var committed = buffer.committedTransactions();
+            assertThat(committed).extracting(LogMinerTransactionBuffer.Transaction::id).containsExactly("b", "c");
+            // Even a fully dispatched checkpoint transaction must reach the dispatcher
+            // to finish restored transaction metadata and invoke commit callbacks.
+            assertThat(read(committed.get(0))).extracting(LogMinerRow::redo).containsExactly("checkpoint transaction");
+            assertThat(read(committed.get(1))).extracting(LogMinerRow::redo).containsExactly("later transaction");
+        }
+    }
+
+    @Test
+    void shouldDiscardTransactionsThroughASnapshotCommitBoundaryWithoutATransactionId() {
+        try (var buffer = buffer(4096)) {
+            buffer.beginWindow(new DispatchProgress(100, null));
+            buffer.add(row("before", 90, 90, 1, 0, "before snapshot"));
+            buffer.add(row("boundary", 91, 91, 1, 0, "at snapshot"));
+            buffer.add(row("after", 92, 92, 1, 0, "after snapshot"));
+            buffer.add(row("before", 99, 90, 7, 0, null));
+            buffer.add(row("boundary", 100, 91, 38, 0, null));
+            buffer.add(row("after", 101, 92, 7, 0, null));
+
+            final var committed = buffer.committedTransactions();
+            assertThat(committed).extracting(LogMinerTransactionBuffer.Transaction::id).containsExactly("after");
+            assertThat(read(committed.get(0))).extracting(LogMinerRow::redo).containsExactly("after snapshot");
+        }
+    }
+
+    @Test
+    void shouldPreserveOlderOpenTransactionsAndTransactionsThatCommitAfterTheCheckpoint() {
+        try (var buffer = buffer(4096)) {
+            buffer.beginWindow(new DispatchProgress(100, "checkpoint"));
+            buffer.add(row("later", 11, 10, 1, 0, "old row with a later commit"));
+            buffer.add(row("open", 21, 20, 1, 0, "still pending"));
+            assertThat(buffer.openTransactions()).isEqualTo(2);
+            buffer.add(row("later", 110, 10, 7, 0, null));
+
+            final var committed = buffer.committedTransactions();
+            assertThat(committed).extracting(LogMinerTransactionBuffer.Transaction::id).containsExactly("later");
+            assertThat(read(committed.get(0))).extracting(LogMinerRow::redo).containsExactly("old row with a later commit");
+            buffer.release(committed.get(0));
+            assertThat(buffer.openTransactions()).isEqualTo(1);
+            assertThat(buffer.bufferedRecords()).isEqualTo(1);
+            assertThat(buffer.completeWindow(120)).isEqualTo(20);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = { 1024, 4096 })
+    void shouldReconstructPreviouslyDispatchedHistoryWithoutExhaustingTheTransactionLimit(long memory) throws Exception {
+        try (var buffer = new LogMinerTransactionBuffer(memory, 8192, 3, directory, 1048576)) {
+            buffer.beginWindow();
+            buffer.add(row("long", 11, 10, 1, 0, "pending long transaction"));
+            buffer.add(row("a", 12, 12, 1, 0, "first short transaction"));
+            buffer.add(row("a", 13, 12, 7, 0, null));
+            buffer.release(buffer.committedTransactions().get(0));
+            assertThat(buffer.completeWindow(20)).isEqualTo(10);
+
+            buffer.beginWindow(new DispatchProgress(13, "a"));
+            buffer.add(row("b", 22, 21, 1, 0, "second short transaction"));
+            buffer.add(row("b", 24, 21, 7, 0, null));
+            buffer.release(buffer.committedTransactions().get(0));
+            assertThat(buffer.completeWindow(30)).isEqualTo(10);
+
+            buffer.beginWindow(new DispatchProgress(24, "b"));
+            buffer.add(row("c", 32, 31, 1, 0, "checkpoint transaction"));
+            buffer.add(row("c", 34, 31, 7, 0, null));
+            buffer.release(buffer.committedTransactions().get(0));
+            assertThat(buffer.completeWindow(40)).isEqualTo(10);
+
+            buffer.beginWindow(new DispatchProgress(34, "c"));
+            buffer.add(row("long", 45, 0, 7, 0, null));
+            assertThat(buffer.requiresReconstruction()).isTrue();
+            buffer.resetForReconstruction();
+            buffer.beginWindow(new DispatchProgress(34, "c"));
+            // A real full-range replay also includes the short transactions that
+            // were dispatched and released in the earlier forward windows.
+            buffer.add(row("long", 11, 10, 1, 0, "pending long transaction"));
+            buffer.add(row("a", 12, 12, 1, 0, "first short transaction"));
+            buffer.add(row("a", 13, 12, 7, 0, null));
+            buffer.add(row("b", 22, 21, 1, 0, "second short transaction"));
+            buffer.add(row("b", 24, 21, 7, 0, null));
+            buffer.add(row("c", 32, 31, 1, 0, "checkpoint transaction"));
+            buffer.add(row("c", 34, 31, 7, 0, null));
+            buffer.add(row("long", 45, 10, 7, 0, null));
+
+            final var committed = buffer.committedTransactions();
+            assertThat(committed).extracting(LogMinerTransactionBuffer.Transaction::id).containsExactly("c", "long");
+            assertThat(read(committed.get(0))).extracting(LogMinerRow::redo).containsExactly("checkpoint transaction");
+            assertThat(read(committed.get(1))).extracting(LogMinerRow::redo).containsExactly("pending long transaction");
+            committed.forEach(buffer::release);
+            assertThat(buffer.completeWindow(50)).isEqualTo(50);
+            assertThat(buffer.memoryBytes()).isZero();
+            assertThat(buffer.diskBytes()).isZero();
+            assertThat(buffer.bufferedRecords()).isZero();
+            assertThat(buffer.isCapacityExceeded()).isFalse();
+        }
+        assertEmptyDirectory();
+    }
+
+    @Test
+    void shouldUseTheDispatchProgressProvidedForEachWindow() {
+        try (var buffer = buffer(4096)) {
+            buffer.beginWindow(new DispatchProgress(100, "z"));
+            buffer.add(row("a", 11, 10, 1, 0, "discard"));
+            buffer.add(row("a", 20, 10, 7, 0, null));
+            assertThat(buffer.committedTransactions()).isEmpty();
+            buffer.completeWindow(20);
+
+            buffer.beginWindow();
+            buffer.add(row("b", 21, 21, 1, 0, "no checkpoint"));
+            buffer.add(row("b", 30, 21, 7, 0, null));
+            assertThat(buffer.committedTransactions()).extracting(LogMinerTransactionBuffer.Transaction::id).containsExactly("b");
+            buffer.release(buffer.committedTransactions().get(0));
+            buffer.completeWindow(30);
+
+            buffer.beginWindow(new DispatchProgress(30, "b"));
+            buffer.add(row("c", 31, 31, 1, 0, "new checkpoint"));
+            buffer.add(row("c", 40, 31, 7, 0, null));
+            assertThat(buffer.committedTransactions()).extracting(LogMinerTransactionBuffer.Transaction::id).containsExactly("c");
+        }
     }
 
     @Test

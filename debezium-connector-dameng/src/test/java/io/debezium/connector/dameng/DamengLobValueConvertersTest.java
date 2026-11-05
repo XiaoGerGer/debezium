@@ -12,6 +12,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.sql.Types;
 import java.util.BitSet;
+import java.util.stream.Stream;
 
 import javax.sql.rowset.serial.SerialBlob;
 import javax.sql.rowset.serial.SerialClob;
@@ -19,7 +20,11 @@ import javax.sql.rowset.serial.SerialClob;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.errors.DataException;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
+import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser;
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser.DmlEntry;
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser.SqlExpression;
 import io.debezium.data.Envelope.Operation;
@@ -80,6 +85,33 @@ class DamengLobValueConvertersTest {
         final var emitter = new DamengChangeRecordEmitter(new DamengPartition("test"), new DamengOffsetContext(config, 1), entry,
                 Clock.system(), config, table);
         assertThat(emitter.getNewColumnValues()).containsExactly(1, new SqlExpression("OUT_CLOB"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("lobUpdateValues")
+    void shouldDistinguishParsedEmptyLobsAndNullsFromMissingImages(String textExpression, String binaryExpression,
+                                                                   String expectedText, ByteBuffer expectedBinary) {
+        final var table = Table.editor().tableId(new TableId(null, "APP", "LOBS"))
+                .addColumn(column("ID", Types.INTEGER, 1)).addColumn(column("TEXT_VALUE", Types.CLOB, 2))
+                .addColumn(column("BINARY_VALUE", Types.BLOB, 3)).create();
+        final var entry = new LogMinerDmlParser().parse("UPDATE APP.LOBS SET TEXT_VALUE=" + textExpression
+                + ", BINARY_VALUE=" + binaryExpression + " WHERE ID=1", table);
+        final var emitter = new DamengChangeRecordEmitter(new DamengPartition("test"), new DamengOffsetContext(config, 1), entry,
+                Clock.system(), config, table);
+        final Object[] before = emitter.getOldColumnValues();
+        final Object[] after = emitter.getNewColumnValues();
+
+        assertThat(convert(Types.CLOB, before[1])).isEqualTo("missing:未获取");
+        assertThat(convert(Types.BLOB, before[2]))
+                .isEqualTo(ByteBuffer.wrap("missing:未获取".getBytes(StandardCharsets.UTF_8)));
+        assertThat(convert(Types.CLOB, after[1])).isEqualTo(expectedText);
+        assertThat(convert(Types.BLOB, after[2])).isEqualTo(expectedBinary);
+    }
+
+    static Stream<Arguments> lobUpdateValues() {
+        return Stream.of(
+                Arguments.of("EMPTY_CLOB", "EMPTY_BLOB", "", ByteBuffer.wrap(new byte[0])),
+                Arguments.of("NULL", "NULL", null, null));
     }
 
     @Test

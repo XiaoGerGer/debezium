@@ -354,6 +354,10 @@ Connector 读取已归档的日志，未归档尾部造成的延迟不能靠扩�
 未完成事务跨窗口保留，普通窗口只读新增范围。
 早先窗口的事务遇到 COMMIT、XA COMMIT 或 operation 36 时，在发布该窗口事务之前按完整安全范围重建缓存，替换包括落盘内容在内的临时行像，排除后来确认回滚的 DML。
 重建从所有待处理事务的最老安全位置开始，不只从触发事务开始；同窗口多个边界合并重建，不同窗口仍可能重复读历史。
+每次读取窗口固定一份当前 Task 的分发进度；启动恢复后的首轮重放和事务重建读取也使用该进度。
+读到 COMMIT 或 XA COMMIT 后，提交位置和事务 ID 排序早于该进度的事务立即释放缓存及临时文件，不再保留到整轮读取结束。
+与进度相同的事务继续交由分发流程完成事务内续传和事务元数据收尾；未提交事务和提交位置更晚的事务继续保留。
+这不会提前提交 Kafka offset 或缩短所需归档范围；单笔历史事务在读到提交记录前仍会占用缓存，仍可能触及资源限制。
 
 当前支持 SAVEPOINT 的有效结果恢复。测试版本的 operation 36 同时用于用户保存点、普通 UPDATE/DELETE 内部标记及回滚相关操作，不能仅凭该码拒绝 SAVEPOINT。
 ROLL_BACK 表示这条记录已被回滚，不表示它本身是一条回滚命令。早期保存点回滚也可能标记 START，因此 START 的回滚标记不足以认定整个事务终止。
@@ -550,13 +554,18 @@ DM 8.1.3.162 原生模式实测，分区 DML 的 `DATA_OBJ#` 指向根表，跨�
 `DROP PARTITION/SUBPARTITION` 和 `TRUNCATE PARTITION/SUBPARTITION` 默认明确报错，因为这些操作可能移除数据而没有逐行 DELETE redo。公开配置 `partition.drop.ignore` 默认为 `false`；设为 `true` 时忽略完整解析的分区删除、分区清空语句，包括 `TRUNCATE TABLE ... PARTITION ...`。ERROR 日志包含具体操作类型、LSN、对象编号、完整 `SQL_REDO`，并提示设置 `partition.drop.ignore=true` 可以忽略该语句继续 CDC。开启后以 WARN 记录被忽略的 SQL 和原因，保留根表模型并继续处理后续 DML。它不补发下游删除事件，被删除或清空分区的旧数据需要下游自行处理。
 专用开关关闭时，即使 `schema.history.internal.skip.unparseable.ddl=true`，已识别的分区删除、清空也不会被跳过。该开关不允许残缺或复合语句，也不授权 `EXCHANGE PARTITION/SUBPARTITION`；忽略分区清空不会输出整表 TRUNCATE 事件。DM 8.1.3.162 实测分区清空 DDL 的 `DATA_OBJ#` 可以指向子分区对象，策略判断按 SQL 在对象过滤前完成。切换开关后可以从尚未越过的错误位置重启继续，已持久化越过的分区删除、清空不会自动补发。
 
+`EXCHANGE PARTITION/SUBPARTITION` 完整解析后，在该条 redo 的 LSN 分别判断分区根表与 `WITH TABLE` 对端表是否需要处理。两端均无需处理时直接跳过；判断包括当前采集过滤、保留的历史模型和两端各自的采集激活 LSN 边界。任意一端仍需处理时，公开配置 `partition.exchange.ignore` 默认为 `false`，记录 ERROR 并停止，提示涉及的表、分区、LSN、事务 ID、DATA_OBJ#、完整 SQL 和开启参数的风险。仍保留在历史模型中的已排除表按需要维护处理；内置排除表沿用既有排除规则。
+设为 `true` 后以 WARN 忽略该条 EXCHANGE，保留历史模型和对象 ID 映射，不写该语句的 schema history，不补发交换造成的行 INSERT/DELETE，也不输出整表 TRUNCATE。下游可能缺失交换进入的行或保留已交换出去的行，后续解码仍可能失败或产生错误数据。忽略不绕过后续 DML 和身份校验，也不自动校准下游。offset 沿用正常事务和确认机制；持久化越过后关闭参数不会重放交换或修复旧数据。
+DM 8.1.3.162 原生模式探针实测 EXCHANGE 的 `DATA_OBJ#` 指向对端表，不能只据此排除根表的影响；交换本身没有完整逐行 DML，后续两端 DML 仍按各自表 ID 归属。`WITH TABLE` 未限定 schema 时可能使用会话 schema，而 DDL 的 `SEG_OWNER` 指向根表 schema，因此不使用它猜测对端。未限定的根表可由 `SEG_OWNER` 补齐；未限定的对端必须由匹配对象 ID 和表名的历史模型确认。无法确认任意一端身份时始终报错，即使开启专用忽略或通用 DDL 跳过；建议在 SQL 中显式限定两端 schema。
+该参数只覆盖完整识别的单条 EXCHANGE，不授权残缺语句、未知尾部或复合语句。`partition.drop.ignore` 和 `cascade.drop.ignore` 不控制 EXCHANGE。专用策略优先于 `schema.history.internal.skip.unparseable.ddl`，此前依赖通用跳过开关忽略采集相关 EXCHANGE 的用户，现在必须显式启用 `partition.exchange.ignore`。
+
 `DROP USER/SCHEMA/DOMAIN/TYPE/CLASS ... CASCADE` 完整解析后产生专用的级联删除错误，在表过滤之前处理。公开配置 `cascade.drop.ignore` 默认为 `false`：记录 ERROR 并停止，提示设置 `cascade.drop.ignore=true`；开启后记录 WARN 并忽略该条 DDL，继续处理后续日志。错误和警告包含操作、目标对象、LSN、事务 ID、DATA_OBJ#、完整 SQL 和后果说明。即使发起对象所在模式不采集，也不能由此推断依赖表不在采集范围内。
 忽略时保留现有历史表结构和对象 ID 映射，不写该语句的 schema history，不补发受影响表的删除或 schema 事件，也不查询当前在线字典猜测历史依赖关系。下游数据可能残留；历史模型中可能保留已被删除的表，同名 CREATE/CTAS 仍可能因表已存在而报错，对象 ID 复用也可能造成冲突或错误解码。该设置只允许跳过指定 DDL，不保证后续 CDC 一定成功或数据正确，不绕过后续 DML、表身份或其他结构校验。
 该开关仅覆盖以上五族对象删除，不按 CASCADE 关键字泛化处理，不允许残缺语句、未知尾部或单条 LogMiner 记录中的复合语句。`DROP TABLE ... CASCADE CONSTRAINTS` 继续按删表更新历史；`DROP TYPE BODY ... CASCADE`、`DROP PROFILE ... CASCADE` 保持原处理。`DROP CLASS BODY ... CASCADE`、`TRUNCATE ... CASCADE` 和外键 `ON DELETE CASCADE` 不由此开关放开或改变。
 级联删除专用策略优先于 `schema.history.internal.skip.unparseable.ddl`。此前通过通用跳过开关越过这些语句的用户，现在必须显式启用 `cascade.drop.ignore`。offset 按正常事务和确认机制推进，忽略不代表立即持久化；持久化越过后再关闭开关不会自动重放、补发删除或修复历史模型，必要时需重新校准下游数据并重建采集基线。
 DM 8.1.3.162 原生模式独立探针验证了以上五族级联删除的原始 SQL_REDO；USER、SCHEMA、TYPE 和 CLASS 样本删除了依赖表，DOMAIN 样本保留了表和原有行。TYPE 的直接和间接依赖删除不会逐表输出 DROP TABLE。具体影响依赖语句和对象关系，错误提示因此使用“可能删除依赖对象”。
 
-`schema.history.internal.skip.unparseable.ddl` 默认为 `false`。显式设为 `true` 时，流式处理会跳过 DDL 语句分析或历史表模型规划阶段的解析/不支持错误，并以 WARN 记录 LSN、DATA_OBJ#、原始 SQL 和失败原因。已识别的分区删除/清空和上述对象级联删除分别由专用参数控制。
+`schema.history.internal.skip.unparseable.ddl` 默认为 `false`。显式设为 `true` 时，流式处理会跳过 DDL 语句分析或历史表模型规划阶段的解析/不支持错误，并以 WARN 记录 LSN、DATA_OBJ#、原始 SQL 和失败原因。已识别的分区删除/清空、分区交换和上述对象级联删除分别由专用参数控制。
 跳过时保留原历史表模型，不为该语句写入 schema history，不从当前 JDBC 元数据补齐结构；后续记录继续处理，offset 按正常确认机制推进。仅跳过语句不保证 offset 已立即持久化。
 该参数不跳过 SQL 缺失、已识别捕获表 DDL 的无效对象编号、归档读取失败、DML 解析错误，也不绕过捕获范围或身份边界校验。未知对象的 DDL 不一定有合法表对象编号，仍可能在语句分析阶段被显式跳过。重启仍从结构化 `TableChanges` 恢复历史模型，不重新解析被跳过的 DDL，也不会补回它造成的结构变化；offset 已持久化越过该位置后，再设回 `false` 也不会自动重放该语句。
 
@@ -577,7 +586,7 @@ DM 8.1.3.162 原生模式独立探针验证了以上五族级联删除的原始 
 |非表对象 |已识别的用户、目录、上下文、LIBRARY、DOMAIN、PROFILE、空 SCHEMA、STAT、LINK、OPERATOR、表空间和程序对象可分类为不改变采集表结构。具体语法边界和删除限制见上文；数据库拒绝的语法不能算作 Connector 已验证支持。
 |多表复合 DDL |单条 LogMiner DDL 最多一个受支持表语句。CREATE SCHEMA 内嵌 CREATE TABLE/VIEW/GRANT 仍不支持。USER/SCHEMA/DOMAIN/TYPE/CLASS 级联删除默认拒绝，可显式设 cascade.drop.ignore=true 跳过整条语句；保留旧模型且不补发依赖表删除，不代表完整支持级联结构更新。
 |特殊表与列 |临时表和外部表仅保留类型、对象编号及生命周期元数据，自动跳过数据快照、增量快照及行事件，不发布它们的 schema 事件；不需要设置 skip.unparseable.ddl。临时表已识别的 CREATE/ALTER/TRUNCATE/DROP/RENAME 不阻断业务表 CDC，删除后同名重建的普通表恢复正常采集。HUGE 表及虚拟/生成列仍拒绝。DM 8.1.3.162 原生模式实测两种 ON COMMIT 策略的临时表只有 CREATE/ALTER/DROP DDL，没有 INSERT/UPDATE/DELETE SQL_REDO，提交或会话关闭清空也不产生逐行 DELETE；虚拟列 redo 值为 NULL。
-|分区维护 |分区根表按普通表保存列结构和对象编号。合并、拆分、增加分区、修改模板/列表值、分区改名/移动和 ROW MOVEMENT 解析后跳过 DDL；其后 INSERT/UPDATE/DELETE 照常输出，包括搬迁产生的重复 INSERT。删除或清空分区默认拒绝，可用 `partition.drop.ignore=true` 显式忽略。分区 EXCHANGE 仍不支持。
+|分区维护 |分区根表按普通表保存列结构和对象编号。合并、拆分、增加分区、修改模板/列表值、分区改名/移动和 ROW MOVEMENT 解析后跳过 DDL；其后 INSERT/UPDATE/DELETE 照常输出，包括搬迁产生的重复 INSERT。删除或清空分区默认拒绝，可用 `partition.drop.ignore=true` 显式忽略。EXCHANGE 分别检查两端处理范围，采集或历史相关时默认拒绝，可用 `partition.exchange.ignore=true` 显式忽略，不补发交换造成的数据变化。
 |DEFAULT ON NULL |解析器有支持和单测，但基线旧数据库拒绝该语法，尚非目标数据库端到端验收结论。
 |JSON CHECK |支持字符串列的 `IS [NOT] JSON`，可带 `STRICT` / `LAX`（也可加括号）及 `WITH/WITHOUT UNIQUE KEYS`；不代表新增 JSON/JSONB 物理类型映射。
 |隐式辅助表 |高级日志的 `WITH/WITHOUT/TRUNCATE ADVANCED LOG` 仍明确拒绝，不能按普通单表 ALTER 跳过。位图连接索引 DDL 跳过，其 `BMJ$_` 辅助表默认排除。
@@ -1221,6 +1230,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`table.exclude.list` |未指定 |排除的 schema.table 正则列表，不与 include 同用。
 |`table.ignore.builtin` |`true` |应用内置系统表过滤，包括 `MTAB$_`、`MLOG$_`、`BMJ$_` 内部表；false 不会自动授予目录权限或启用内部表 CDC。
 |`partition.drop.ignore` |`false` |显式忽略 DROP PARTITION/SUBPARTITION、TRUNCATE PARTITION/SUBPARTITION（含 TRUNCATE TABLE ... PARTITION）并继续后续 DML，不补发逐行删除或整表清空事件；被移除的旧数据可能留在下游。默认报错并打印 SQL 和开启此参数的提示，通用 skip.unparseable.ddl 不绕过此限制；不允许分区 EXCHANGE。
+|`partition.exchange.ignore` |`false` |显式忽略完整解析且两端身份可确认的 EXCHANGE PARTITION/SUBPARTITION。两端均在处理范围外时直接跳过；任意一端采集或仍需维护历史时默认报错，开启后 WARN 并保留旧模型和对象映射，不补发交换造成的行事件或整表清空。下游可能缺失或残留数据，后续解码可能失败或错误。通用 skip.unparseable.ddl 不绕过此策略，也不能绕过无法确认的交换范围。
 |`cascade.drop.ignore` |`false` |显式忽略完整解析的 DROP USER/SCHEMA/DOMAIN/TYPE/CLASS ... CASCADE。默认报错，通用 skip.unparseable.ddl 不绕过此限制。开启后 WARN 并保留旧历史模型和对象 ID 映射，不补发依赖表删除；下游数据可能残留，同名重建、对象 ID 复用及后续解析可能失败或产生错误数据。关闭后不自动修复已跳过的变化。不允许复合语句或 cascading TRUNCATE，不改变现有受支持的 TABLE、TYPE BODY 和 PROFILE 操作。
 |`database.include.list`、`database.exclude.list` |未指定 |公共过滤输入，也计入 capture_scope；达梦表标识无 catalog，不用它们代替 schema/table 过滤或选择数据库。
 |`column.include.list` |未指定 |保留的 schema.table.column 正则列表；不要排除事件 Key 必需的列。
@@ -1350,7 +1360,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`schema.history.internal.kafka.query.timeout.ms` |`3000` |Kafka 管理查询超时。
 |`schema.history.internal.kafka.create.timeout.ms` |`30000` |创建 history Topic 超时；Kafka 2.0 应提前创建，不靠延长超时修复协议差异。
 |`schema.history.internal.kafka.buffer.batch.size` |`1024` |history 启用批量缓冲期间的记录数阈值，不是业务事件 batch。
-|`schema.history.internal.skip.unparseable.ddl` |`false` |显式设为 true 时跳过实时 DDL 分析/历史模型规划的解析或不支持错误，WARN 记录 LSN、DATA_OBJ#、SQL 和原因。保留旧模型且不写该语句的 history；可能造成后续数据错误。不绕过 partition.drop.ignore 和 cascade.drop.ignore 专用策略，不跳过缺失 SQL、已识别捕获表 DDL 的无效对象编号、归档、DML 或捕获范围/身份校验错误。详见 <<dameng-ddl,DDL 支持边界>>。
+|`schema.history.internal.skip.unparseable.ddl` |`false` |显式设为 true 时跳过实时 DDL 分析/历史模型规划的解析或不支持错误，WARN 记录 LSN、DATA_OBJ#、SQL 和原因。保留旧模型且不写该语句的 history；可能造成后续数据错误。不绕过 partition.drop.ignore、partition.exchange.ignore 和 cascade.drop.ignore 专用策略，不跳过缺失 SQL、已识别捕获表 DDL 的无效对象编号、归档、DML 或捕获范围/身份校验错误。详见 <<dameng-ddl,DDL 支持边界>>。
 |`schema.history.internal.store.only.captured.tables.ddl` |`false` |当前达梦初始 history 仍仅记录采集表；false 不增加未捕获表结构。
 |`schema.history.internal.store.only.captured.databases.ddl` |`false` |公共 history 字段，不提供达梦跨数据库捕获能力。
 |`schema.history.internal.producer.*` |客户端默认及 history 固定设置 |history producer 参数透传，如安全协议、SASL/SSL 配置；不影响 Worker 业务 producer。

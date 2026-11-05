@@ -60,6 +60,43 @@ public final class DamengDdlStatementAnalyzer {
         }
     }
 
+    /** Carries both exchange participants to streaming for scope and opt-in checks. */
+    public static final class PartitionExchangeException extends IllegalArgumentException {
+        private static final long serialVersionUID = 1L;
+        private final TableId tableId;
+        private final TableId exchangeTableId;
+        private final String partitionName;
+        private final String operation;
+
+        private PartitionExchangeException(ParserRuleContext context, TableId tableId, TableId exchangeTableId, String partitionName, String operation) {
+            super(DamengParseTree.error(context, "Unsupported " + operation + " " + partitionName + " between " + tableId + " and " + exchangeTableId
+                    + ": changes logical rows without complete per-row DML; cannot treat it as whole-table TRUNCATE or physical maintenance. "
+                    + "Ignoring preserves historical schemas and object-ID mappings and emits no exchange row or truncate events; "
+                    + "exchanged rows may be missing or remain under the wrong table downstream, and subsequent decoding may fail or be incorrect. "
+                    + "Set partition.exchange.ignore=true to ignore this statement and continue CDC while accepting these consequences").getMessage());
+            this.tableId = tableId;
+            this.exchangeTableId = exchangeTableId;
+            this.partitionName = partitionName;
+            this.operation = operation;
+        }
+
+        public TableId tableId() {
+            return tableId;
+        }
+
+        public TableId exchangeTableId() {
+            return exchangeTableId;
+        }
+
+        public String partitionName() {
+            return partitionName;
+        }
+
+        public String operation() {
+            return operation;
+        }
+    }
+
     public record Analysis(String sql, List<DamengSqlToken> tokens, Impact impact, TableId tableId, TableId renamedTableId,
             IllegalArgumentException failure, DamengSqlParser.TableStatementContext tableStatement, String defaultSchema) {
         public Analysis(String sql, List<DamengSqlToken> tokens, Impact impact, TableId tableId, TableId renamedTableId,
@@ -155,9 +192,10 @@ public final class DamengDdlStatementAnalyzer {
                             maintenance.SUBPARTITION().isEmpty() ? "TRUNCATE PARTITION" : "TRUNCATE SUBPARTITION");
                 }
                 if (maintenance.EXCHANGE() != null) {
-                    throw DamengParseTree.error(maintenance,
-                            "Unsupported partition " + maintenance.getStart().getText()
-                                    + ": changes logical rows without complete per-row DML; cannot treat it as whole-table TRUNCATE or physical maintenance");
+                    // SEG_OWNER belongs to the root; an unqualified peer can belong to a different session schema.
+                    throw new PartitionExchangeException(maintenance, tableId(target(table), null), tableId(maintenance.qualifiedName(), null),
+                            DamengParseTree.identifier(maintenance.identifier(0), identifiers),
+                            maintenance.SUBPARTITION().isEmpty() ? "EXCHANGE PARTITION" : "EXCHANGE SUBPARTITION");
                 }
                 return noTableChange(sql, DamengParseTree.tokens(statement), defaultSchema);
             }

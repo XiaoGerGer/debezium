@@ -140,6 +140,10 @@ class LogMinerDmlParserTest {
                 Arguments.of("'0x00FF'", "0x00FF"),
                 Arguments.of("'OUT_CLOB'", "OUT_CLOB"),
                 Arguments.of("'OUT_BLOB'", "OUT_BLOB"),
+                Arguments.of("'EMPTY_CLOB'", "EMPTY_CLOB"),
+                Arguments.of("'EMPTY_BLOB'", "EMPTY_BLOB"),
+                Arguments.of("'EMPTY_CLOB()'", "EMPTY_CLOB()"),
+                Arguments.of("'EMPTY_BLOB()'", "EMPTY_BLOB()"),
                 Arguments.of("N'达梦😀数据库'", "达梦😀数据库"),
                 Arguments.of("'line1\nline2\\folder'", "line1\nline2\\folder"));
     }
@@ -170,6 +174,44 @@ class LogMinerDmlParserTest {
         final var entry = parser.parse("INSERT INTO APP.EVENTS(TS) VALUES(" + expression + ")", table);
 
         assertThat(entry.newValues()[3]).isEqualTo(new SqlExpression(expression));
+    }
+
+    @ParameterizedTest
+    @MethodSource("emptyLobMarkers")
+    void shouldNormalizeEmptyLobMarkersInInsertAndUpdate(String marker, String expected) {
+        final var lobTable = table("ID", "LOB_VALUE");
+        final var inserted = parser.parse("INSERT INTO APP.EVENTS(ID,LOB_VALUE) VALUES(1," + marker + ")", lobTable);
+        final var updated = parser.parse("UPDATE APP.EVENTS SET LOB_VALUE=" + marker + " WHERE ID=1", lobTable);
+
+        assertThat(inserted.newValues()).containsExactly("1", new SqlExpression(expected));
+        assertThat(inserted.newPresent()).isEqualTo(bits(0, 1));
+        assertThat(updated.newValues()).containsExactly("1", new SqlExpression(expected));
+        assertThat(updated.newPresent()).isEqualTo(bits(0, 1));
+        assertThat(updated.oldValues()).containsExactly("1", null);
+        assertThat(updated.oldPresent()).isEqualTo(bits(0));
+    }
+
+    static Stream<Arguments> emptyLobMarkers() {
+        return Stream.of(
+                Arguments.of("EMPTY_CLOB", "EMPTY_CLOB()"),
+                Arguments.of("EMPTY_BLOB", "EMPTY_BLOB()"),
+                Arguments.of("EMPTY_CLOB()", "EMPTY_CLOB()"),
+                Arguments.of("EMPTY_BLOB()", "EMPTY_BLOB()"),
+                Arguments.of("EMPTY_CLOB( )", "EMPTY_CLOB()"),
+                Arguments.of("EMPTY_BLOB( )", "EMPTY_BLOB()"),
+                Arguments.of("EMPTY_CLOB(/* comment */)", "EMPTY_CLOB()"),
+                Arguments.of("EMPTY_BLOB(/* comment */)", "EMPTY_BLOB()"),
+                Arguments.of("empty_clob", "EMPTY_CLOB()"),
+                Arguments.of("empty_blob()", "EMPTY_BLOB()"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "EMPTY_CLOB('abc')", "EMPTY_BLOB('abc')", "EMPTY_CLOB(NULL)", "EMPTY_BLOB(1)", "EMPTY_CLOB(", "EMPTY_BLOB(" })
+    void shouldRejectMalformedEmptyLobMarkers(String marker) {
+        assertThatThrownBy(() -> parser.parse("INSERT INTO APP.EVENTS(NAME) VALUES(" + marker + ")", table))
+                .isInstanceOf(DmlParserException.class);
+        assertThatThrownBy(() -> parser.parse("UPDATE APP.EVENTS SET NAME=" + marker + " WHERE ID=1", table))
+                .isInstanceOf(DmlParserException.class);
     }
 
     @ParameterizedTest
