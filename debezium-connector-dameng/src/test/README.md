@@ -36,3 +36,9 @@ Select a complete nested suite with `-Dit.test=DamengConnectorIT`. Run method-fi
 Surefire writes unit reports under `target/surefire-reports`; Failsafe writes integration reports under `target/failsafe-reports`. Use a clean run when collecting coverage with `dameng-coverage` so previous JaCoCo data is not included. A targeted run does not establish complete regression coverage.
 
 See the [Dameng manual](../../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-testing) for images, offline preparation and coverage checks. [testing.adoc](testing.adoc) contains the applicability matrix and performance properties; [regression-history.adoc](regression-history.adoc) preserves dated execution records.
+
+Oracle compatibility regression uses `-Pdameng-tests -Dit.test=DamengOracleCompatibilityIT,DamengCaseSensitivityIT -Ddameng.compatible.mode=2`.
+The fixture accepts `-Ddameng.test.ini.FLOAT_MODE=0|1`, `-Ddameng.test.ini.ORA_DATE_FMT=0|1` and `-Ddameng.test.ini.NUMBER_MODE=0|1` (choose one value for each).
+Add `DamengOracleNumberModeIT` with `-Ddameng.test.ini.NUMBER_MODE=1` to verify decimal FLOAT values and defaults, database precision rounding, offline DDL/CRUD and recovery in precise, string and double decimal modes.
+The dedicated engine test checks timestamp DATE values and defaults, numeric aliases, archived CREATE/ALTER and CRUD, NULL transitions and restart recovery in sqlstring/adaptive modes.
+Run the four parameter combinations separately and preserve their reports. One-off diagnostic scripts belong outside the repository.

@@ -10,7 +10,7 @@ import java.util.Set;
 
 import io.debezium.connector.dameng.antlr.DamengDdlParser;
 
-/** Identifier, length and lexical rules shared by the native and PostgreSQL modes. */
+/** Identifier, length and lexical rules shared by the supported DM modes. */
 abstract class AbstractDamengCompatibilityProfile implements DamengCompatibilityProfile {
     @Override
     public Set<String> parameterNames() {
@@ -58,6 +58,11 @@ abstract class AbstractDamengCompatibilityProfile implements DamengCompatibility
                 // Case-insensitive databases preserve spelling inconsistently (keywords can
                 // be uppercased). Use the same canonical names as JDBC metadata ingestion.
                 new DamengIdentifierRules("0".equals(environment.parameter("CASE_SENSITIVE"))
-                        || "1".equals(environment.parameter("IDENTIFIER_MODE"))));
+                        || "1".equals(environment.parameter("IDENTIFIER_MODE"))),
+                typeRules(environment));
+    }
+
+    protected DamengTypeRules typeRules(DamengCompatibilityEnvironment environment) {
+        return DamengTypeRules.NATIVE;
     }
 }

@@ -24,6 +24,8 @@ import java.time.ZoneOffset;
 import java.util.stream.Stream;
 
 import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -33,6 +35,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.connector.dameng.antlr.DamengDdlParser;
 import io.debezium.connector.dameng.logminer.parser.LogMinerDmlParser.SqlExpression;
+import io.debezium.data.VariableScaleDecimal;
 import io.debezium.relational.Column;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
@@ -44,6 +47,37 @@ import io.debezium.time.ZonedTimestamp;
 class DamengValueConvertersTest {
     private final DamengValueConverters converters = new DamengValueConverters(
             new DamengConnectorConfig(DamengTestConfiguration.configuration().build()));
+
+    @ParameterizedTest
+    @ValueSource(strings = { "precise", "string", "double" })
+    void shouldPreserveDecimalFloatValuesAndDefaults(String decimalMode) {
+        final var values = new DamengValueConverters(new DamengConnectorConfig(DamengTestConfiguration.configuration()
+                .with("decimal.handling.mode", decimalMode).build()));
+        final var column = Column.editor().name("F").jdbcType(Types.DECIMAL).type("FLOAT").length(126).optional(true).create();
+        final var schema = values.schemaBuilder(column).optional().build();
+        final var converter = values.converter(column, new Field("F", 0, schema));
+        for (var literal : new String[]{ "12345678901234567890.123456789012345678", "1E-120", "-9.876543210987654321E120" }) {
+            final var expected = new BigDecimal(literal);
+            final Object converted = converter.convert(literal);
+            assertThat(converted).isEqualTo(converter.convert(expected));
+            if (decimalMode.equals("precise")) {
+                assertThat(new DamengDefaultValueConverter(values).parseDefaultValue(column, literal)).isEmpty();
+                assertThat(schema.name()).isEqualTo(VariableScaleDecimal.LOGICAL_NAME);
+                assertThat(VariableScaleDecimal.toLogical((Struct) converted).getDecimalValue()).contains(expected);
+            }
+            else if (decimalMode.equals("string")) {
+                assertThat(new DamengDefaultValueConverter(values).parseDefaultValue(column, literal)).contains(converted);
+                assertThat(schema.type()).isEqualTo(Schema.Type.STRING);
+                assertThat(new BigDecimal((String) converted)).isEqualByComparingTo(expected);
+            }
+            else {
+                assertThat(new DamengDefaultValueConverter(values).parseDefaultValue(column, literal)).contains(converted);
+                assertThat(schema.type()).isEqualTo(Schema.Type.FLOAT64);
+                assertThat(converted).isEqualTo(expected.doubleValue());
+            }
+        }
+        assertThat(converter.convert(null)).isNull();
+    }
 
     @ParameterizedTest
     @MethodSource("numbers")

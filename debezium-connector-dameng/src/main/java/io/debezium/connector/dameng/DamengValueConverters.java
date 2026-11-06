@@ -14,6 +14,7 @@ import java.sql.Clob;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.time.DateTimeException;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
@@ -75,8 +76,12 @@ public final class DamengValueConverters extends JdbcValueConverters {
         if (useWideTimestampIsoString(column)) {
             return IsoTimestamp.builder();
         }
-        if (hasVariableScale(column) && decimalMode == DecimalMode.PRECISE) {
-            return VariableScaleDecimal.builder();
+        if (hasVariableScale(column)) {
+            return switch (decimalMode) {
+                case PRECISE -> VariableScaleDecimal.builder();
+                case STRING -> SchemaBuilder.string();
+                case DOUBLE -> SchemaBuilder.float64();
+            };
         }
         final SchemaBuilder builder = super.schemaBuilder(column);
         if (builder == null) {
@@ -140,7 +145,8 @@ public final class DamengValueConverters extends JdbcValueConverters {
     }
 
     private static boolean hasVariableScale(Column column) {
-        return (column.jdbcType() == Types.NUMERIC || column.jdbcType() == Types.DECIMAL) && column.length() <= 0;
+        return (column.jdbcType() == Types.NUMERIC || column.jdbcType() == Types.DECIMAL)
+                && (column.length() <= 0 || column.scale().isEmpty());
     }
 
     private static boolean isLocalTimeZone(Column column) {
@@ -282,6 +288,11 @@ public final class DamengValueConverters extends JdbcValueConverters {
         return super.getTimePrecision(column);
     }
 
+    static boolean isTemporalExpression(String expression) {
+        return TEMPORAL_FUNCTION.matcher(expression).matches() || DATE_LITERAL.matcher(expression).matches()
+                || TIMESTAMP_LITERAL.matcher(expression).matches() || TIME_LITERAL.matcher(expression).matches();
+    }
+
     private Object convertExpression(String expression, Column column, ValueConverter converter) {
         final String text = expression.trim();
         if (text.equalsIgnoreCase("NAN")) {
@@ -315,11 +326,16 @@ public final class DamengValueConverters extends JdbcValueConverters {
             }
             final Matcher temporal = TEMPORAL_FUNCTION.matcher(text);
             if (temporal.matches()) {
-                return converter.convert(parseTemporalFunction(temporal.group(1), temporal.group(2).replace("''", "'"), temporal.group(3)));
+                final var value = parseTemporalFunction(temporal.group(1), temporal.group(2).replace("''", "'"), temporal.group(3));
+                return converter.convert(column.jdbcType() == Types.TIMESTAMP && value instanceof LocalDate date ? date.atStartOfDay() : value);
             }
             final Matcher dateLiteral = DATE_LITERAL.matcher(text);
             if (dateLiteral.matches()) {
-                return converter.convert(DamengTemporalValues.date(dateLiteral.group(1)));
+                final var literal = dateLiteral.group(1);
+                if (column.jdbcType() == Types.TIMESTAMP) {
+                    return converter.convert(literal.contains(" ") ? parseTimestamp(literal) : DamengTemporalValues.date(literal).atStartOfDay());
+                }
+                return converter.convert(DamengTemporalValues.date(literal));
             }
             final Matcher timestampLiteral = TIMESTAMP_LITERAL.matcher(text);
             if (timestampLiteral.matches()) {

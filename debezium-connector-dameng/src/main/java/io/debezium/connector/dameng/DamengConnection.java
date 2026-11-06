@@ -11,6 +11,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.OffsetTime;
@@ -388,7 +389,7 @@ public class DamengConnection extends JdbcConnection {
     }
 
     public DamengCompatibilityEnvironment getCompatibilityEnvironment() throws SQLException {
-        final var mode = new DamengCompatibilityMode(getIniParameter("COMPATIBLE_MODE"));
+        final var mode = DamengCompatibilityMode.parse(getIniParameter("COMPATIBLE_MODE"));
         final var profile = DamengCompatibilityRegistry.builtIn().resolve(mode);
         final Map<String, String> parameters = new HashMap<>();
         for (var name : profile.parameterNames()) {
@@ -846,6 +847,25 @@ public class DamengConnection extends JdbcConnection {
                 editor.jdbcType(Types.OTHER);
             }
         });
+        if (column.isPresent() && column.get().jdbcType() == Types.FLOAT && "FLOAT".equalsIgnoreCase(column.get().typeName())) {
+            final var editor = column.get();
+            prepareQuery("SELECT DATA_TYPE FROM ALL_TAB_COLUMNS WHERE OWNER=? AND TABLE_NAME=? AND COLUMN_NAME=?",
+                    statement -> {
+                        statement.setString(1, tableId.schema());
+                        statement.setString(2, tableId.table());
+                        statement.setString(3, editor.name());
+                    }, result -> {
+                        if (!result.next()) {
+                            throw new SQLException("Cannot resolve physical numeric type for " + tableId + "." + editor.name());
+                        }
+                        // The JDBC FLOAT code also describes NUMBER_MODE=1 decimals.
+                        // Inspect the stored column, since older binary FLOAT columns can
+                        // coexist with decimal FLOAT after a database parameter change.
+                        if ("NUMBER".equalsIgnoreCase(result.getString(1))) {
+                            editor.jdbcType(Types.DECIMAL).scale(null);
+                        }
+                    });
+        }
         if (column.isPresent() && (column.get().jdbcType() == Types.CHAR || column.get().jdbcType() == Types.NCHAR)) {
             final var editor = column.get();
             editor.charsetName(getDatabaseCharset().name());
@@ -876,7 +896,12 @@ public class DamengConnection extends JdbcConnection {
             // The driver's java.sql.Date/Timestamp conversion loses BCE era information.
             // Its textual representation retains the stored calendar, including the 1582 transition.
             case Types.DATE -> DamengTemporalValues.date(resultSet.getString(columnIndex));
-            case Types.TIMESTAMP -> DamengTemporalValues.timestamp(resultSet.getString(columnIndex));
+            // ORA_DATE_FMT=1 exposes an Oracle-mode DATE as JDBC DATE in a row,
+            // while table metadata correctly describes TIMESTAMP(0). getString()
+            // omits its time; the JDBC 4.2 getter retains both time and BCE era.
+            case Types.TIMESTAMP -> resultSet.getMetaData().getColumnType(columnIndex) == Types.DATE
+                    ? resultSet.getObject(columnIndex, LocalDateTime.class)
+                    : DamengTemporalValues.timestamp(resultSet.getString(columnIndex));
             case Types.TIME -> resultSet.getObject(columnIndex, LocalTime.class);
             case Types.TIMESTAMP_WITH_TIMEZONE -> resultSet.getObject(columnIndex, OffsetDateTime.class);
             case Types.TIME_WITH_TIMEZONE -> resultSet.getObject(columnIndex, OffsetTime.class);

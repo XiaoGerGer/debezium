@@ -300,7 +300,7 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
                 assertThat(logs.containsMessage("Connected to " + version.productName() + " database version " + version.productVersion())).isTrue();
                 assertThat(logs.containsMessage("matches tested JDBC version: " + version.isTested())).isTrue();
                 assertThat(logs.containsWarnMessage("has not been tested")).isEqualTo(!version.isTested());
-                final var mode = new DamengCompatibilityMode(Integer.toString(DamengTestDatabase.requestedCompatibilityMode()));
+                final var mode = DamengCompatibilityMode.parse(Integer.toString(DamengTestDatabase.requestedCompatibilityMode()));
                 final var profile = DamengCompatibilityRegistry.builtIn().resolve(mode);
                 assertThat(logs.containsMessage("Dameng COMPATIBLE_MODE=" + mode + " selected compatibility profile " + profile.id())).isTrue();
             }

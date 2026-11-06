@@ -22,13 +22,13 @@ import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
 
 class DamengPostgresCompatibilityTest {
-    private final DamengCompatibilityProfile profile = DamengCompatibilityRegistry.builtIn().resolve(new DamengCompatibilityMode("7"));
+    private final DamengCompatibilityProfile profile = DamengCompatibilityRegistry.builtIn().resolve(DamengCompatibilityMode.POSTGRES);
 
     private DamengCompatibilityEnvironment environment(Map<String, String> overrides) {
         final Map<String, String> parameters = new HashMap<>(Map.of("CASE_SENSITIVE", "1", "LENGTH_IN_CHAR", "0",
                 "BACKSLASH_ESCAPE", "0", "NESTED_C_STYLE_COMMENT", "0", "FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0"));
         parameters.putAll(overrides);
-        return new DamengCompatibilityEnvironment(new DamengCompatibilityMode("7"), parameters);
+        return new DamengCompatibilityEnvironment(DamengCompatibilityMode.POSTGRES, parameters);
     }
 
     @Test
@@ -36,7 +36,7 @@ class DamengPostgresCompatibilityTest {
         assertThat(profile.id()).isEqualTo("postgres-v1");
         assertThat(profile.parameterNames()).contains("FLOAT_MODE", "NUMBER_MODE", "ORA_DATE_FMT", "IDENTIFIER_MODE", "BACKSLASH_ESCAPE");
         assertThat(environment(Map.of()).signature()).isNotEqualTo(
-                new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), environment(Map.of()).parameters()).signature());
+                new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, environment(Map.of()).parameters()).signature());
     }
 
     @Test
@@ -70,7 +70,7 @@ class DamengPostgresCompatibilityTest {
         }
         final Map<String, String> parameters = new HashMap<>(environment(Map.of()).parameters());
         parameters.remove(name);
-        assertThatThrownBy(() -> profile.validate(new DamengCompatibilityEnvironment(new DamengCompatibilityMode("7"), parameters)))
+        assertThatThrownBy(() -> profile.validate(new DamengCompatibilityEnvironment(DamengCompatibilityMode.POSTGRES, parameters)))
                 .hasMessageContaining(name + "=0");
     }
 
@@ -97,7 +97,7 @@ class DamengPostgresCompatibilityTest {
                 parameters.put(name, value);
             }
             if (value != null || !name.equals("IDENTIFIER_MODE")) {
-                assertThatThrownBy(() -> profile.createDdlParser(new DamengCompatibilityEnvironment(new DamengCompatibilityMode("7"), parameters),
+                assertThatThrownBy(() -> profile.createDdlParser(new DamengCompatibilityEnvironment(DamengCompatibilityMode.POSTGRES, parameters),
                         StandardCharsets.UTF_8)).hasMessageContaining(name);
             }
         }

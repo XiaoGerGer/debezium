@@ -16,6 +16,7 @@ import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Impact;
 import io.debezium.connector.dameng.antlr.listener.ColumnDefinitionParser;
 import io.debezium.connector.dameng.antlr.listener.DamengDdlParserListener;
 import io.debezium.connector.dameng.compatibility.DamengIdentifierRules;
+import io.debezium.connector.dameng.compatibility.DamengTypeRules;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
@@ -43,10 +44,15 @@ public final class DamengDdlParser {
 
     public DamengDdlParser(Charset databaseCharset, boolean characterSemanticsEnabled, boolean defaultCharacterLength, boolean nationalCharacterLength,
                            boolean nestedComments, DamengIdentifierRules identifierRules) {
+        this(databaseCharset, characterSemanticsEnabled, defaultCharacterLength, nationalCharacterLength, nestedComments, identifierRules, DamengTypeRules.NATIVE);
+    }
+
+    public DamengDdlParser(Charset databaseCharset, boolean characterSemanticsEnabled, boolean defaultCharacterLength, boolean nationalCharacterLength,
+                           boolean nestedComments, DamengIdentifierRules identifierRules, DamengTypeRules typeRules) {
         this.identifierRules = identifierRules;
         this.analyzer = new DamengDdlStatementAnalyzer(nestedComments, identifierRules);
         this.columns = new ColumnDefinitionParser(databaseCharset, characterSemanticsEnabled, defaultCharacterLength,
-                nationalCharacterLength, identifierRules);
+                nationalCharacterLength, identifierRules, typeRules);
     }
 
     public enum Type {

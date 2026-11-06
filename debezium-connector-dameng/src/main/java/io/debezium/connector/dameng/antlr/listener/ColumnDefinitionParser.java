@@ -17,6 +17,7 @@ import org.antlr.v4.runtime.ParserRuleContext;
 import io.debezium.connector.dameng.DamengInterval;
 import io.debezium.connector.dameng.antlr.DamengParseTree;
 import io.debezium.connector.dameng.compatibility.DamengIdentifierRules;
+import io.debezium.connector.dameng.compatibility.DamengTypeRules;
 import io.debezium.ddl.parser.dameng.generated.DamengSqlParser.ColumnAttributeContext;
 import io.debezium.ddl.parser.dameng.generated.DamengSqlParser.ColumnConstraintContext;
 import io.debezium.ddl.parser.dameng.generated.DamengSqlParser.ColumnDefinitionContext;
@@ -44,15 +45,17 @@ public final class ColumnDefinitionParser {
     private final boolean defaultCharacterLength;
     private final boolean nationalCharacterLength;
     private final DamengIdentifierRules identifierRules;
+    private final DamengTypeRules typeRules;
 
     public ColumnDefinitionParser(Charset databaseCharset, boolean characterSemanticsEnabled,
                                   boolean defaultCharacterLength, boolean nationalCharacterLength,
-                                  DamengIdentifierRules identifierRules) {
+                                  DamengIdentifierRules identifierRules, DamengTypeRules typeRules) {
         this.databaseCharset = databaseCharset;
         this.characterSemanticsEnabled = characterSemanticsEnabled;
         this.defaultCharacterLength = defaultCharacterLength;
         this.nationalCharacterLength = nationalCharacterLength;
         this.identifierRules = identifierRules;
+        this.typeRules = typeRules;
     }
 
     public void addDefinitions(TableEditor table, TableDefinitionContext definition) {
@@ -283,6 +286,14 @@ public final class ColumnDefinitionParser {
         }
         boolean timeZone = false;
         boolean localTimeZone = false;
+        if (typeRules.decimalFloat() && (name.equals("FLOAT") || name.equals("REAL")
+                || name.equals("DOUBLE") && type.PRECISION() != null)) {
+            // NUMBER_MODE=1 stores these declarations as variable-scale NUMBER.
+            // JDBC calls them FLOAT and reports their original binary precision.
+            column.jdbcType(Types.DECIMAL).type("FLOAT", expression(type))
+                    .length(length < 0 ? name.equals("REAL") ? 63 : 126 : length).scale(null);
+            return;
+        }
         if (name.equals("TIMESTAMP") || name.equals("DATETIME") || name.equals("TIME") || name.equals("DATETIME2")) {
             timeZone = type.WITH() != null;
             localTimeZone = type.LOCAL() != null;
@@ -302,8 +313,8 @@ public final class ColumnDefinitionParser {
             case "TINYINT", "BYTE" -> Types.TINYINT;
             case "NUMERIC", "NUMBER", "DEC", "DECIMAL" -> Types.DECIMAL;
             case "FLOAT" -> length > 0 && length <= 24 ? Types.REAL : Types.FLOAT;
-            case "DOUBLE" -> Types.DOUBLE;
-            case "REAL" -> Types.REAL;
+            case "DOUBLE", "BINARY_DOUBLE" -> Types.DOUBLE;
+            case "REAL", "BINARY_FLOAT" -> Types.REAL;
             case "BIT" -> Types.BIT;
             case "BOOLEAN" -> Types.BOOLEAN;
             case "CHAR", "NCHAR" -> Types.CHAR;
@@ -312,7 +323,7 @@ public final class ColumnDefinitionParser {
             case "BLOB", "IMAGE", "LONGVARBINARY" -> Types.BLOB;
             case "BINARY" -> Types.BINARY;
             case "RAW", "VARBINARY" -> Types.VARBINARY;
-            case "DATE" -> Types.DATE;
+            case "DATE" -> typeRules.dateAsTimestamp() ? Types.TIMESTAMP : Types.DATE;
             case "TIME" -> timeZone ? Types.TIME_WITH_TIMEZONE : Types.TIME;
             case "TIMESTAMP", "DATETIME", "DATETIME2" -> timeZone && !localTimeZone ? Types.TIMESTAMP_WITH_TIMEZONE : Types.TIMESTAMP;
             default -> throw error(type, "Unsupported DM column type " + name);
@@ -337,7 +348,19 @@ public final class ColumnDefinitionParser {
                 Types.TINYINT, Types.DATE, Types.BIT, Types.BOOLEAN).contains(jdbcType)) {
             scale = 0;
         }
-        if (name.equals("RAW")) {
+        if (name.equals("DATE") && typeRules.dateAsTimestamp()) {
+            name = "TIMESTAMP";
+            length = 32;
+            scale = 0;
+        }
+        else if (name.equals("BINARY_FLOAT")) {
+            length = 4;
+        }
+        else if (name.equals("BINARY_DOUBLE")) {
+            name = "DOUBLE";
+            length = 53;
+        }
+        else if (name.equals("RAW")) {
             name = "VARBINARY";
         }
         else if (name.equals("FLOAT") && jdbcType == Types.REAL) {

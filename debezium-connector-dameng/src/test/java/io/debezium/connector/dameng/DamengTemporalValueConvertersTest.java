@@ -30,6 +30,19 @@ class DamengTemporalValueConvertersTest {
             new DamengConnectorConfig(DamengTestConfiguration.configuration().build()));
 
     @ParameterizedTest
+    @ValueSource(strings = { "DATE'2000-02-29'", "TO_DATE('2000-02-29','YYYY-MM-DD')" })
+    void shouldUseMidnightForDateOnlyOracleTimestampDefaults(String expression) {
+        assertThat(convert(Types.TIMESTAMP, new SqlExpression(expression))).isEqualTo("2000-02-29 00:00:00");
+        assertThat(convert(Types.DATE, new SqlExpression(expression))).isEqualTo("2000-02-29");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "DATE'2000-02-29 12:34:56'", "TO_DATE('2000-02-29 12:34:56','YYYY-MM-DD HH24:MI:SS')" })
+    void shouldRetainTimeInOracleDateExpressions(String expression) {
+        assertThat(convert(Types.TIMESTAMP, new SqlExpression(expression))).isEqualTo("2000-02-29 12:34:56");
+    }
+
+    @ParameterizedTest
     @MethodSource("zonedValues")
     void shouldNormalizeTimestampInstantToUtcAndPreserveFractionalPrecision(Object value, String expected) {
         assertThat(convert(Types.TIMESTAMP_WITH_TIMEZONE, value)).isEqualTo(expected);

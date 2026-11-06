@@ -19,7 +19,7 @@ final class DamengPostgresCompatibilityProfile extends AbstractDamengCompatibili
 
     @Override
     public Set<DamengCompatibilityMode> modes() {
-        return Set.of(new DamengCompatibilityMode("7"));
+        return Set.of(DamengCompatibilityMode.POSTGRES);
     }
 
     @Override

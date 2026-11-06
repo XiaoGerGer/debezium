@@ -44,7 +44,7 @@ class DamengCompatibilitySafetyTest {
         if (identifier != null) {
             parameters.put("IDENTIFIER_MODE", identifier);
         }
-        return new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), parameters);
+        return new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, parameters);
     }
 
     @Test
@@ -56,7 +56,7 @@ class DamengCompatibilitySafetyTest {
         final Map<String, String> insensitive = new HashMap<>(environment("0").parameters());
         insensitive.put("CASE_SENSITIVE", "0");
         assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(
-                new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), insensitive)))
+                new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, insensitive)))
                 .hasMessageContaining("differ from the stored offset");
         assertThat(recovered.getOffset()).isEqualTo(offset.getOffset());
         assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(environment("1"))).hasMessageContaining("differ from the stored offset");
@@ -94,49 +94,71 @@ class DamengCompatibilitySafetyTest {
         assertThat(tables.forTable(id)).isSameAs(original);
     }
 
-    @Test
-    void shouldPersistPostgresSettingsAndRejectSwitchingSupportedModes() {
+    @ParameterizedTest
+    @ValueSource(strings = { "2", "7" })
+    void shouldPersistTypeSettingsAndRejectSwitchingSupportedModes(String mode) {
         final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
         parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0"));
-        final var postgres = new DamengCompatibilityEnvironment(new DamengCompatibilityMode("7"), parameters);
+        final var compatible = new DamengCompatibilityEnvironment(DamengCompatibilityMode.parse(mode), parameters);
         final var offset = new DamengOffsetContext(config, 100);
-        offset.validateCompatibilityEnvironment(postgres);
+        offset.validateCompatibilityEnvironment(compatible);
         final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
-        recovered.validateCompatibilityEnvironment(postgres);
+        recovered.validateCompatibilityEnvironment(compatible);
         assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(environment(null))).hasMessageContaining("differ from the stored offset");
+        final var otherMode = mode.equals("2") ? "7" : "2";
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(new DamengCompatibilityEnvironment(DamengCompatibilityMode.parse(otherMode), parameters)))
+                .hasMessageContaining("differ from the stored offset");
         parameters.put("FLOAT_MODE", "1");
-        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(new DamengCompatibilityEnvironment(postgres.mode(), parameters)))
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(new DamengCompatibilityEnvironment(compatible.mode(), parameters)))
                 .hasMessageContaining("differ from the stored offset");
         assertThat(recovered.getOffset()).isEqualTo(offset.getOffset());
         final var nativeOffset = new DamengOffsetContext(config, 100);
         nativeOffset.validateCompatibilityEnvironment(environment(null));
-        assertThatThrownBy(() -> nativeOffset.validateCompatibilityEnvironment(postgres)).hasMessageContaining("differ from the stored offset");
+        assertThatThrownBy(() -> nativeOffset.validateCompatibilityEnvironment(compatible)).hasMessageContaining("differ from the stored offset");
     }
 
     @Test
     void shouldRejectUnverifiedIdentifierEnvironments() {
-        final var profile = DamengCompatibilityRegistry.builtIn().resolve(new DamengCompatibilityMode("0"));
+        final var profile = DamengCompatibilityRegistry.builtIn().resolve(DamengCompatibilityMode.NATIVE);
         final Map<String, String> parameters = new HashMap<>(environment("0").parameters());
         for (var invalid : List.of("", "2")) {
             parameters.put("CASE_SENSITIVE", invalid);
-            assertThatThrownBy(() -> profile.validate(new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), parameters)))
+            assertThatThrownBy(() -> profile.validate(new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, parameters)))
                     .hasMessageContaining("CASE_SENSITIVE=0 or 1");
         }
         parameters.put("CASE_SENSITIVE", "1");
         parameters.put("IDENTIFIER_MODE", "2");
-        assertThatThrownBy(() -> profile.validate(new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), parameters)))
+        assertThatThrownBy(() -> profile.validate(new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, parameters)))
                 .hasMessageContaining("IDENTIFIER_MODE=0 or 1");
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "0", "7" })
+    @ValueSource(strings = { "0", "1" })
+    void shouldRejectChangingNumberModeWhenRecoveringAnOracleOffset(String numberMode) {
+        final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
+        parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", numberMode, "ORA_DATE_FMT", "0"));
+        final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.ORACLE, parameters);
+        DamengCompatibilityRegistry.builtIn().resolve(initial.mode()).validate(initial);
+        final var offset = new DamengOffsetContext(config, 100);
+        offset.validateCompatibilityEnvironment(initial);
+        final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        recovered.validateCompatibilityEnvironment(initial);
+        parameters.put("NUMBER_MODE", numberMode.equals("0") ? "1" : "0");
+        final var changed = new DamengCompatibilityEnvironment(initial.mode(), parameters);
+        DamengCompatibilityRegistry.builtIn().resolve(changed.mode()).validate(changed);
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(changed)).hasMessageContaining("differ from the stored offset");
+        assertThat(recovered.getOffset()).isEqualTo(offset.getOffset());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "0", "2", "7" })
     void shouldCheckLiveParametersWithoutRebindingAChangedSnapshotOrOffset(String mode) throws Exception {
         final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
         final Map<String, String> parameters = new HashMap<>(environment("0").parameters());
-        if (mode.equals("7")) {
+        if (!mode.equals("0")) {
             parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0"));
         }
-        final var environment = new DamengCompatibilityEnvironment(new DamengCompatibilityMode(mode), parameters);
+        final var environment = new DamengCompatibilityEnvironment(DamengCompatibilityMode.parse(mode), parameters);
         doReturn(environment).when(connection).getCompatibilityEnvironment();
         assertThatThrownBy(connection::validateUnchangedCompatibility).hasMessageContaining("not been bound");
         final var offset = new DamengOffsetContext(config, 100);
@@ -151,14 +173,14 @@ class DamengCompatibilitySafetyTest {
         when(rows.getString(2)).thenAnswer(invocation -> entries.get(index.get()).getValue());
         when(rows.getString(3)).thenReturn("1");
         doAnswer(invocation -> {
-            if (mode.equals("7")) {
+            if (!mode.equals("0")) {
                 assertThat((String) invocation.getArgument(0)).contains("'FLOAT_MODE'", "'NUMBER_MODE'", "'ORA_DATE_FMT'");
             }
             index.set(-1);
             return ((ResultSetMapper<?>) invocation.getArgument(1)).apply(rows);
         }).when(connection).queryAndMap(anyString(), any());
         connection.validateUnchangedCompatibility();
-        final var changedParameter = mode.equals("7") ? "FLOAT_MODE" : "NESTED_C_STYLE_COMMENT";
+        final var changedParameter = mode.equals("2") ? "NUMBER_MODE" : mode.equals("7") ? "FLOAT_MODE" : "NESTED_C_STYLE_COMMENT";
         entries.removeIf(e -> e.getKey().equals(changedParameter));
         entries.add(Map.entry(changedParameter, "1"));
         assertThatThrownBy(connection::validateUnchangedCompatibility).hasMessageContaining("changed while the task was running");

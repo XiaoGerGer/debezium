@@ -7,13 +7,34 @@ package io.debezium.connector.dameng.compatibility;
 
 import java.math.BigInteger;
 
-/** Server mode identifier, independent of the modes implemented by this connector. */
-public record DamengCompatibilityMode(String value) {
-    public DamengCompatibilityMode {
-        if (value == null || !value.trim().matches("[0-9]+")) {
-            throw new IllegalArgumentException("Dameng COMPATIBLE_MODE must be a nonnegative integer; actual value was " + value);
+/** Server compatibility modes supported by this connector. */
+public enum DamengCompatibilityMode {
+    NATIVE("0"),
+    ORACLE("2"),
+    POSTGRES("7");
+
+    private final String value;
+
+    DamengCompatibilityMode(String value) {
+        this.value = value;
+    }
+
+    public String value() {
+        return value;
+    }
+
+    /** Parses an observed server value and rejects unsupported modes immediately. */
+    public static DamengCompatibilityMode parse(String value) {
+        if (value != null && value.trim().matches("[0-9]+")) {
+            final var canonical = new BigInteger(value.trim()).toString();
+            for (var mode : values()) {
+                if (mode.value.equals(canonical)) {
+                    return mode;
+                }
+            }
         }
-        value = new BigInteger(value.trim()).toString();
+        throw new IllegalArgumentException("Unsupported Dameng COMPATIBLE_MODE=" + value
+                + "; supported values: 0 (native), 2 (Oracle), 7 (PostgreSQL)");
     }
 
     @Override

@@ -11,6 +11,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.sql.Types;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.HexFormat;
 import java.util.stream.Stream;
 
@@ -27,6 +29,30 @@ import io.debezium.relational.Tables;
 class DamengDefaultValueConverterTest {
     private final DamengDefaultValueConverter defaults = new DamengDefaultValueConverter(
             new DamengValueConverters(new DamengConnectorConfig(DamengTestConfiguration.configuration().build())));
+
+    @ParameterizedTest
+    @ValueSource(strings = { "sqlstring", "adaptive" })
+    void shouldDecodeOracleDateConstantsUsingTimestampPrecision(String precision) {
+        final var converter = new DamengDefaultValueConverter(new DamengValueConverters(new DamengConnectorConfig(
+                DamengTestConfiguration.configuration().with("time.precision.mode", precision).build())));
+        final var column = column(Types.TIMESTAMP).edit().type("TIMESTAMP").scale(0).create();
+        final Object midnight = precision.equals("sqlstring") ? "2000-02-29 00:00:00"
+                : LocalDateTime.of(2000, 2, 29, 0, 0).toInstant(ZoneOffset.UTC).toEpochMilli();
+        final Object withTime = precision.equals("sqlstring") ? "2000-02-29 12:34:56"
+                : LocalDateTime.of(2000, 2, 29, 12, 34, 56).toInstant(ZoneOffset.UTC).toEpochMilli();
+        assertThat(converter.parseDefaultValue(column, "DATE'2000-02-29'")).contains(midnight);
+        assertThat(converter.parseDefaultValue(column, "TO_DATE('2000-02-29','YYYY-MM-DD')")).contains(midnight);
+        assertThat(converter.parseDefaultValue(column, "DATE'2000-02-29 12:34:56'")).contains(withTime);
+        assertThat(converter.parseDefaultValue(column, "TO_DATE('2000-02-29 12:34:56','YYYY-MM-DD HH24:MI:SS')")).contains(withTime);
+        assertThat(defaults.parseDefaultValue(column(Types.DATE), "DATE'2000-02-29'")).contains("2000-02-29");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "TO_DATE(SYSDATE,'YYYY-MM-DD')", "TO_DATE('29-FEB-00','DD-MON-YY')", "DATE'2000-02-29' + 1",
+            "TO_DATE('2000-02-29','YYYY-MM-DD') + 1", "TO_DATE('2000-02-29','YYYY-MM-DD','NLS_DATE_LANGUAGE=ENGLISH')", "SYSDATE" })
+    void shouldOmitDynamicAndUnverifiedTemporalDefaults(String expression) {
+        assertThat(defaults.parseDefaultValue(column(Types.TIMESTAMP), expression)).isEmpty();
+    }
 
     @Test
     void shouldDecodeQuotedCharacterDefaultsWithoutEvaluatingThemAsSql() {

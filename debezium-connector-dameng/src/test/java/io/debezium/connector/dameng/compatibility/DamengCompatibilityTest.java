@@ -30,7 +30,7 @@ import io.debezium.relational.Tables;
 class DamengCompatibilityTest {
     @Test
     void shouldCanonicalizeCaseInsensitiveHistoricalIdentifiersWithoutChangingValues() {
-        final var environment = new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"),
+        final var environment = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE,
                 Map.of("LENGTH_IN_CHAR", "0", "BACKSLASH_ESCAPE", "0", "NESTED_C_STYLE_COMMENT", "0", "CASE_SENSITIVE", "0"));
         final var parser = new DamengNativeCompatibilityProfile().createDdlParser(environment, StandardCharsets.UTF_8);
         final var tables = new Tables();
@@ -46,68 +46,85 @@ class DamengCompatibilityTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "9", "42", "2147483648", "99999999999999999999999999999999999999" })
-    void shouldRepresentFutureServerModesWithoutAnEnumeratedUpperBound(String value) {
-        final var mode = new DamengCompatibilityMode(value);
-        assertThat(mode.value()).isEqualTo(value);
-        assertThat(mode.toString()).isEqualTo(value);
-        assertThatThrownBy(() -> DamengCompatibilityRegistry.builtIn().resolve(mode))
-                .isInstanceOf(IllegalStateException.class).hasMessageContaining("COMPATIBLE_MODE=" + value, "registered modes: [0, 7]");
+    @ValueSource(strings = { "1", "3", "4", "5", "6", "8", "9", "42", " 0042 ", "2147483648", "99999999999999999999999999999999999999" })
+    void shouldRejectUnsupportedModesDuringParsing(String value) {
+        assertThatThrownBy(() -> DamengCompatibilityMode.parse(value))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("COMPATIBLE_MODE=" + value, "supported values: 0 (native), 2 (Oracle), 7 (PostgreSQL)");
     }
 
     @Test
     void shouldCanonicalizeIdentifiersBeforeLookingUpSemantics() {
-        assertThat(new DamengCompatibilityMode(" 000 ")).isEqualTo(new DamengCompatibilityMode("0"));
-        assertThat(DamengCompatibilityRegistry.builtIn().resolve(new DamengCompatibilityMode("000")).id()).isEqualTo("native-v1");
+        assertThat(DamengCompatibilityMode.parse(" 000 ")).isEqualTo(DamengCompatibilityMode.NATIVE);
+        assertThat(DamengCompatibilityRegistry.builtIn().resolve(DamengCompatibilityMode.parse("000")).id()).isEqualTo("native-v1");
+    }
+
+    @Test
+    void shouldKeepNamedModesCompatibleWithServerValuesAndPersistedSignatures() {
+        final var registry = DamengCompatibilityRegistry.builtIn();
+        assertThat(registry.registeredModes()).containsExactly(DamengCompatibilityMode.NATIVE, DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.POSTGRES);
+        assertThat(DamengCompatibilityMode.values()).containsExactly(DamengCompatibilityMode.NATIVE, DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.POSTGRES);
+        assertThat(DamengCompatibilityMode.NATIVE.value()).isEqualTo("0");
+        assertThat(DamengCompatibilityMode.ORACLE.value()).isEqualTo("2");
+        assertThat(DamengCompatibilityMode.POSTGRES.value()).isEqualTo("7");
+        for (var mode : registry.registeredModes()) {
+            assertThat(DamengCompatibilityMode.parse(mode.value())).isSameAs(mode);
+            assertThat(DamengCompatibilityMode.parse(" 00" + mode.value() + " ")).isSameAs(mode);
+            assertThat(mode.toString()).isEqualTo(mode.value());
+            assertThat(new DamengCompatibilityEnvironment(mode, Map.of()).signature()).isEqualTo("v1:1:" + mode.value());
+        }
+        assertThat(registry.resolve(DamengCompatibilityMode.NATIVE).id()).isEqualTo("native-v1");
+        assertThat(registry.resolve(DamengCompatibilityMode.ORACLE).id()).isEqualTo("oracle-v1");
+        assertThat(registry.resolve(DamengCompatibilityMode.POSTGRES).id()).isEqualTo("postgres-v1");
     }
 
     @ParameterizedTest
     @NullAndEmptySource
     @ValueSource(strings = { " ", "-1", "+1", "oracle", "0.0", "1e2", "1 OR 1=1" })
     void shouldRejectMissingAndMalformedIdentifiers(String value) {
-        assertThatThrownBy(() -> new DamengCompatibilityMode(value))
+        assertThatThrownBy(() -> DamengCompatibilityMode.parse(value))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("COMPATIBLE_MODE");
     }
 
     @Test
-    void shouldAllowAValidatedFutureImplementationToBeRegisteredWithoutChangingTheModeModel() {
-        final var future = profile("future-v1", "42", "43");
-        final List<DamengCompatibilityProfile> profiles = new ArrayList<>(List.of(new DamengNativeCompatibilityProfile(), future));
+    void shouldCopyRegistrationsAndKeepRegistriesIndependent() {
+        final var custom = profile("custom-v1", DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.POSTGRES);
+        final List<DamengCompatibilityProfile> profiles = new ArrayList<>(List.of(new DamengNativeCompatibilityProfile(), custom));
         final var registry = new DamengCompatibilityRegistry(profiles);
         profiles.clear();
-        assertThat(registry.resolve(new DamengCompatibilityMode("42"))).isSameAs(future);
-        assertThat(registry.resolve(new DamengCompatibilityMode("43"))).isSameAs(future);
-        assertThat(registry.resolve(new DamengCompatibilityMode("0")).id()).isEqualTo("native-v1");
+        assertThat(registry.resolve(DamengCompatibilityMode.ORACLE)).isSameAs(custom);
+        assertThat(registry.resolve(DamengCompatibilityMode.POSTGRES)).isSameAs(custom);
+        assertThat(registry.resolve(DamengCompatibilityMode.NATIVE).id()).isEqualTo("native-v1");
         assertThatThrownBy(() -> registry.registeredModes().clear()).isInstanceOf(UnsupportedOperationException.class);
-        assertThatThrownBy(() -> registry.resolve(new DamengCompatibilityMode("44"))).hasMessageContaining("COMPATIBLE_MODE=44");
-        // Registration in a test-local registry never enables the built-in production registry.
-        assertThatThrownBy(() -> DamengCompatibilityRegistry.builtIn().resolve(new DamengCompatibilityMode("42")))
-                .hasMessageContaining("No implemented Dameng compatibility profile");
+        assertThat(DamengCompatibilityRegistry.builtIn().resolve(DamengCompatibilityMode.ORACLE).id()).isEqualTo("oracle-v1");
     }
 
     @Test
     void shouldRejectAmbiguousRegistrationIncludingCanonicalModeAliases() {
-        assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of(profile("first", "42"), profile("second", "042"))))
-                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("COMPATIBLE_MODE=42", "first", "second");
+        assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of(profile("first", DamengCompatibilityMode.ORACLE),
+                profile("second", DamengCompatibilityMode.parse("002")))))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("COMPATIBLE_MODE=2", "first", "second");
     }
 
     @Test
     void shouldRequireIdentifiableProfilesAndRejectUnregisteredModesEvenWithAnEmptyRegistry() {
-        assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of(profile(null, "42"))))
+        assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of(profile(null, DamengCompatibilityMode.ORACLE))))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of(profile(" ", "42"))))
+        assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of(profile(" ", DamengCompatibilityMode.ORACLE))))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of(profile("empty"))))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of()).resolve(new DamengCompatibilityMode("0")))
+        assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of()).resolve(DamengCompatibilityMode.NATIVE))
                 .hasMessageContaining("registered modes: []");
+        assertThatThrownBy(() -> new DamengCompatibilityRegistry(List.of(new DamengNativeCompatibilityProfile())).resolve(DamengCompatibilityMode.ORACLE))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("COMPATIBLE_MODE=2", "registered modes: [0]");
         assertThatThrownBy(() -> DamengCompatibilityRegistry.builtIn().resolve(null)).isInstanceOf(NullPointerException.class);
     }
 
     @Test
     void shouldPreserveObservedParametersWithoutConflatingMissingAndZero() {
         final Map<String, String> values = new HashMap<>(Map.of("LENGTH_IN_CHAR", "0"));
-        final var environment = new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), values);
+        final var environment = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, values);
         values.put("LENGTH_IN_CHAR", "1");
         assertThat(environment.parameter("LENGTH_IN_CHAR")).isEqualTo("0");
         assertThat(environment.parameter("MISSING_PARAMETER")).isNull();
@@ -117,14 +134,14 @@ class DamengCompatibilityTest {
 
     @Test
     void shouldKeepNativeDateAndResolvedCharacterSemanticsInTheHistoricalSchema() {
-        final var profile = DamengCompatibilityRegistry.builtIn().resolve(new DamengCompatibilityMode("0"));
+        final var profile = DamengCompatibilityRegistry.builtIn().resolve(DamengCompatibilityMode.NATIVE);
         assertThat(profile.parameterNames()).containsExactlyInAnyOrder("LENGTH_IN_CHAR", "NLS_LENGTH_SEMANTICS", "NVARCHAR_LENGTH_IN_CHAR", "BACKSLASH_ESCAPE",
                 "NESTED_C_STYLE_COMMENT", "IDENTIFIER_MODE");
         for (var defaults : List.of(Map.of("LENGTH_IN_CHAR", "0", "BACKSLASH_ESCAPE", "0", "NESTED_C_STYLE_COMMENT", "0", "CASE_SENSITIVE", "1"),
                 Map.of("LENGTH_IN_CHAR", "0", "NLS_LENGTH_SEMANTICS", "CHAR", "NVARCHAR_LENGTH_IN_CHAR", "1", "BACKSLASH_ESCAPE", "0", "NESTED_C_STYLE_COMMENT", "0",
                         "CASE_SENSITIVE", "1"))) {
             final var tables = new Tables();
-            profile.createDdlParser(new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), defaults), StandardCharsets.UTF_8)
+            profile.createDdlParser(new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, defaults), StandardCharsets.UTF_8)
                     .parse("CREATE TABLE APP.T (ID INT PRIMARY KEY, D DATE, C CHAR(8), N NCHAR(8))", tables, "APP");
             final var table = tables.forTable(new TableId(null, "APP", "T"));
             assertThat(table.columnWithName("D").jdbcType()).isEqualTo(Types.DATE);
@@ -132,21 +149,21 @@ class DamengCompatibilityTest {
             assertThat(table.columnWithName("C").typeExpression()).isEqualTo("CHAR(8 BYTE)");
             assertThat(table.columnWithName("N").typeExpression()).isEqualTo("NCHAR(8 BYTE)");
         }
-        final var missing = new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), Map.of("CASE_SENSITIVE", "1"));
+        final var missing = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, Map.of("CASE_SENSITIVE", "1"));
         assertThatThrownBy(() -> profile.createDdlParser(missing, StandardCharsets.UTF_8)).hasMessageContaining("LENGTH_IN_CHAR=0");
     }
 
-    private static DamengCompatibilityProfile profile(String id, String... modes) {
+    private static DamengCompatibilityProfile profile(String id, DamengCompatibilityMode... modes) {
         final var profile = mock(DamengCompatibilityProfile.class);
         when(profile.id()).thenReturn(id);
-        when(profile.modes()).thenReturn(Set.copyOf(java.util.Arrays.stream(modes).map(DamengCompatibilityMode::new).toList()));
+        when(profile.modes()).thenReturn(Set.of(modes));
         return profile;
     }
 
     @ParameterizedTest
     @CsvSource({ "0,0", "0,1", "1,0", "1,1" })
     void shouldApplyNativeLexicalSettingsToAnalysisAndHistoricalDdl(String backslash, String nested) {
-        final var environment = new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"),
+        final var environment = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE,
                 Map.of("LENGTH_IN_CHAR", "0", "BACKSLASH_ESCAPE", backslash, "NESTED_C_STYLE_COMMENT", nested, "CASE_SENSITIVE", "1"));
         final var parser = new DamengNativeCompatibilityProfile().createDdlParser(environment, StandardCharsets.UTF_8);
         final var comment = "1".equals(nested) ? "/* outer /* ; DROP TABLE T; */ outer */" : "/* outer /* text ends here */";

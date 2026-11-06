@@ -12,6 +12,8 @@ import java.util.Optional;
 
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.DataException;
 
 import io.debezium.connector.dameng.antlr.DamengAntlrSqlLexer;
 import io.debezium.connector.dameng.antlr.DamengSqlToken.Kind;
@@ -59,15 +61,40 @@ public final class DamengDefaultValueConverter implements DefaultValueConverter 
         else if (DamengInterval.isInterval(column) && literal.regionMatches(true, 0, "INTERVAL", 0, "INTERVAL".length())) {
             value = new SqlExpression(literal);
         }
+        else if (isTemporal(column) && DamengValueConverters.isTemporalExpression(literal)) {
+            try {
+                return convert(column, new SqlExpression(literal));
+            }
+            catch (DataException unsupported) {
+                // Unknown formats remain database expressions, without evaluating
+                // them against today's session or inventing a schema default.
+                return Optional.empty();
+            }
+        }
         else {
             return Optional.empty();
         }
+        return convert(column, value);
+    }
+
+    private Optional<Object> convert(Column column, Object value) {
         final SchemaBuilder builder = converters.schemaBuilder(column);
         if (builder == null) {
             return Optional.empty();
         }
         final Field field = new Field(column.name(), 0, builder.optional().build());
-        return Optional.ofNullable(converters.converter(column, field).convert(value));
+        final Object converted = converters.converter(column, field).convert(value);
+        // KAFKA-12694: a Struct default cannot be attached to a SchemaBuilder.
+        // Keep the database default expression in history and capture its stored
+        // value, but omit the incompatible Connect schema default, as Oracle does.
+        return converted instanceof Struct ? Optional.empty() : Optional.ofNullable(converted);
+    }
+
+    private static boolean isTemporal(Column column) {
+        return switch (column.jdbcType()) {
+            case Types.DATE, Types.TIME, Types.TIMESTAMP, Types.TIME_WITH_TIMEZONE, Types.TIMESTAMP_WITH_TIMEZONE -> true;
+            default -> false;
+        };
     }
 
     private static boolean isBinary(Column column) {

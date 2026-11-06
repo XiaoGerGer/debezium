@@ -21,6 +21,7 @@ import static org.mockito.Mockito.when;
 
 import java.nio.charset.Charset;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.time.LocalDate;
@@ -98,6 +99,9 @@ class DamengConnectionResultValidationTest {
     @CsvSource({ "-4712-01-01,-4712", "0001-01-01,1", "1582-10-10,1582", "9999-12-31,9999" })
     void shouldReadTheStoredCalendarWithoutTheDriversHybridDateConversion(String stored, int year) throws Exception {
         final var result = mock(ResultSet.class);
+        final var metadata = mock(ResultSetMetaData.class);
+        when(result.getMetaData()).thenReturn(metadata);
+        when(metadata.getColumnType(1)).thenReturn(Types.TIMESTAMP);
         final var connection = new DamengConnection(JdbcConfiguration.create().build());
         final var date = Column.editor().name("D").jdbcType(Types.DATE).create();
         final var timestamp = Column.editor().name("T").jdbcType(Types.TIMESTAMP).create();

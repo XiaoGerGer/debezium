@@ -7,6 +7,9 @@ package io.debezium.connector.dameng;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -15,20 +18,82 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Types;
+import java.time.LocalDateTime;
 import java.util.List;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.dameng.DamengConnection.ArchiveLogFile;
 import io.debezium.jdbc.JdbcConfiguration;
+import io.debezium.jdbc.JdbcConnection.ResultSetConsumer;
+import io.debezium.jdbc.JdbcConnection.StatementPreparer;
+import io.debezium.relational.Column;
 import io.debezium.relational.TableId;
 
 class DamengConnectionTest {
+    @ParameterizedTest
+    @CsvSource({ "NUMBER,3", "DOUBLE,6", "FLOAT,6" })
+    void shouldDistinguishDecimalAndBinaryStorageBehindTheJdbcFloatCode(String physicalType, int jdbcType) throws SQLException {
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        doReturn("1").when(connection).getCaseSensitiveFlag();
+        final var metadata = mock(ResultSet.class);
+        when(metadata.getString(4)).thenReturn("F");
+        when(metadata.getString(6)).thenReturn("FLOAT");
+        when(metadata.getInt(5)).thenReturn(Types.FLOAT);
+        when(metadata.getInt(7)).thenReturn(53);
+        final var storedType = mock(ResultSet.class);
+        when(storedType.next()).thenReturn(true);
+        when(storedType.getString(1)).thenReturn(physicalType);
+        doAnswer(invocation -> {
+            invocation.<ResultSetConsumer> getArgument(2).accept(storedType);
+            return connection;
+        }).when(connection).prepareQuery(anyString(), any(StatementPreparer.class), any(ResultSetConsumer.class));
+        final var column = connection.readTableColumn(metadata, new TableId(null, "APP", "NUMBERS"), null).orElseThrow().create();
+        assertThat(column.jdbcType()).isEqualTo(jdbcType);
+        assertThat(column.length()).isEqualTo(53);
+        assertThat(column.scale()).isEmpty();
+        if (jdbcType == Types.DECIMAL) {
+            final var rows = mock(ResultSet.class);
+            final var value = new BigDecimal("12345678901234567890.123456789");
+            when(rows.getObject(1)).thenReturn(value);
+            assertThat(connection.getColumnValue(rows, 1, column, null)).isEqualTo(value);
+            verify(rows, never()).getDouble(1);
+        }
+        when(storedType.next()).thenReturn(false);
+        assertThatThrownBy(() -> connection.readTableColumn(metadata, new TableId(null, "APP", "NUMBERS"), null))
+                .hasMessageContaining("Cannot resolve physical numeric type");
+    }
+
+    @Test
+    void shouldRetainOracleDateTimeAndEraWhenTheDriverDisplaysOnlyTheDate() throws SQLException {
+        final var connection = new DamengConnection(JdbcConfiguration.create().build());
+        final var rows = mock(ResultSet.class);
+        final var metadata = mock(ResultSetMetaData.class);
+        when(rows.getMetaData()).thenReturn(metadata);
+        when(metadata.getColumnType(1)).thenReturn(Types.DATE);
+        final var column = Column.editor().name("D").jdbcType(Types.TIMESTAMP).type("TIMESTAMP").scale(0).create();
+        final var stored = LocalDateTime.of(-1, 1, 1, 12, 34, 56);
+        when(rows.getObject(1, LocalDateTime.class)).thenReturn(stored);
+        assertThat(connection.getColumnValue(rows, 1, column, null)).isEqualTo(stored);
+        verify(rows, never()).getString(1);
+        when(rows.getObject(1, LocalDateTime.class)).thenReturn(null);
+        assertThat(connection.getColumnValue(rows, 1, column, null)).isNull();
+        when(metadata.getColumnType(1)).thenReturn(Types.TIMESTAMP);
+        when(rows.getString(1)).thenReturn("-0001-01-01 12:34:56");
+        assertThat(connection.getColumnValue(rows, 1, column, null)).isEqualTo(stored);
+    }
+
     @Test
     void shouldCanonicalizeMetadataNamesAndPrimaryKeysWithoutChangingDefaults() throws SQLException {
         final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));

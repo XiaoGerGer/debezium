@@ -39,7 +39,7 @@ class DamengStandbySupportTest {
         when(reader.readPrimaryStandbyIdentity()).thenReturn(identity(1, 10, 20, "open"));
         when(primary.currentLsn()).thenReturn(100L);
         when(reader.readStandbyProgress()).thenReturn(new DamengConnection.StandbyProgress(150, 100));
-        final var environment = new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), Map.of());
+        final var environment = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, Map.of());
         when(primary.getCompatibilityEnvironment()).thenReturn(environment);
         when(reader.getCompatibilityEnvironment()).thenReturn(environment);
         when(primary.getDatabaseCharset()).thenReturn(StandardCharsets.UTF_8);
@@ -81,7 +81,7 @@ class DamengStandbySupportTest {
         when(reader.getDatabaseCharset()).thenReturn(StandardCharsets.US_ASCII);
         assertThatThrownBy(() -> support.initialize(reader)).hasMessageContaining("different compatibility settings or character sets");
         when(reader.getDatabaseCharset()).thenReturn(StandardCharsets.UTF_8);
-        when(reader.getCompatibilityEnvironment()).thenReturn(new DamengCompatibilityEnvironment(new DamengCompatibilityMode("0"), Map.of("CASE_SENSITIVE", "0")));
+        when(reader.getCompatibilityEnvironment()).thenReturn(new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, Map.of("CASE_SENSITIVE", "0")));
         assertThatThrownBy(() -> support.initialize(reader)).hasMessageContaining("different compatibility settings or character sets");
     }
 

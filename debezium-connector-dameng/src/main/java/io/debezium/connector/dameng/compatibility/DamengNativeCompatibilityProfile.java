@@ -16,6 +16,6 @@ final class DamengNativeCompatibilityProfile extends AbstractDamengCompatibility
 
     @Override
     public Set<DamengCompatibilityMode> modes() {
-        return Set.of(new DamengCompatibilityMode("0"));
+        return Set.of(DamengCompatibilityMode.NATIVE);
     }
 }
