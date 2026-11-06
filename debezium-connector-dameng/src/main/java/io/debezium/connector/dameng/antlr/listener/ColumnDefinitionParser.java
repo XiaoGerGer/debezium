@@ -46,16 +46,24 @@ public final class ColumnDefinitionParser {
     private final boolean nationalCharacterLength;
     private final DamengIdentifierRules identifierRules;
     private final DamengTypeRules typeRules;
+    private final boolean backslashEscape;
 
     public ColumnDefinitionParser(Charset databaseCharset, boolean characterSemanticsEnabled,
                                   boolean defaultCharacterLength, boolean nationalCharacterLength,
                                   DamengIdentifierRules identifierRules, DamengTypeRules typeRules) {
+        this(databaseCharset, characterSemanticsEnabled, defaultCharacterLength, nationalCharacterLength, identifierRules, typeRules, false);
+    }
+
+    public ColumnDefinitionParser(Charset databaseCharset, boolean characterSemanticsEnabled,
+                                  boolean defaultCharacterLength, boolean nationalCharacterLength,
+                                  DamengIdentifierRules identifierRules, DamengTypeRules typeRules, boolean backslashEscape) {
         this.databaseCharset = databaseCharset;
         this.characterSemanticsEnabled = characterSemanticsEnabled;
         this.defaultCharacterLength = defaultCharacterLength;
         this.nationalCharacterLength = nationalCharacterLength;
         this.identifierRules = identifierRules;
         this.typeRules = typeRules;
+        this.backslashEscape = backslashEscape;
     }
 
     public void addDefinitions(TableEditor table, TableDefinitionContext definition) {
@@ -123,7 +131,7 @@ public final class ColumnDefinitionParser {
             }
             else if (attribute.COMMENT() != null) {
                 final var tokens = DamengParseTree.tokens(attribute);
-                column.comment(tokens.get(tokens.size() - 1).stringValue());
+                column.comment(tokens.get(tokens.size() - 1).stringValue(backslashEscape));
             }
             else if (attribute.AS() != null) {
                 throw generatedColumn(attribute);
@@ -268,6 +276,13 @@ public final class ColumnDefinitionParser {
         else if (type.VARYING() != null) {
             throw error(type, "Unsupported DM column type " + expression(type));
         }
+        // DM MySQL-mode aliases are stored as TEXT/BLOB, not separate physical types.
+        if (name.equals("MEDIUMTEXT") || name.equals("LONGTEXT")) {
+            name = "TEXT";
+        }
+        else if (name.equals("MEDIUMBLOB") || name.equals("LONGBLOB")) {
+            name = "BLOB";
+        }
         int length = -1;
         Integer scale = null;
         boolean characterLength = defaultCharacterLength || name.equals("NCHAR") && nationalCharacterLength;
@@ -402,8 +417,8 @@ public final class ColumnDefinitionParser {
         return DamengParseTree.source(context);
     }
 
-    public static String defaultExpression(ParserRuleContext context) {
-        return DamengParseTree.defaultExpression(context);
+    public String defaultExpression(ParserRuleContext context) {
+        return DamengParseTree.defaultExpression(context, backslashEscape);
     }
 
     public static int integer(ParserRuleContext context) {

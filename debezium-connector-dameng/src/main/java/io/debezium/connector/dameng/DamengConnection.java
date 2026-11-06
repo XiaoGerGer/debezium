@@ -842,6 +842,11 @@ public class DamengConnection extends JdbcConnection {
             else if (editor.jdbcType() == 95) {
                 editor.jdbcType(Types.TIMESTAMP_WITH_TIMEZONE);
             }
+            else if (editor.jdbcType() == Types.LONGVARCHAR && "TEXT".equalsIgnoreCase(editor.typeName())) {
+                // JDBC reports MySQL-mode TEXT aliases as LONGVARCHAR, while
+                // history uses CLOB. Keep omitted LOB row images consistent.
+                editor.jdbcType(Types.CLOB);
+            }
             else if (DamengInterval.isInterval(editor.typeName())) {
                 // DatabaseMetaData uses DM-specific interval codes, while ResultSetMetaData uses OTHER.
                 editor.jdbcType(Types.OTHER);

@@ -42,3 +42,11 @@ The fixture accepts `-Ddameng.test.ini.FLOAT_MODE=0|1`, `-Ddameng.test.ini.ORA_D
 Add `DamengOracleNumberModeIT` with `-Ddameng.test.ini.NUMBER_MODE=1` to verify decimal FLOAT values and defaults, database precision rounding, offline DDL/CRUD and recovery in precise, string and double decimal modes.
 The dedicated engine test checks timestamp DATE values and defaults, numeric aliases, archived CREATE/ALTER and CRUD, NULL transitions and restart recovery in sqlstring/adaptive modes.
 Run the four parameter combinations separately and preserve their reports. One-off diagnostic scripts belong outside the repository.
+
+MySQL compatibility regression uses `-Pdameng-tests -Dit.test=DamengMySqlCompatibilityIT -Ddameng.compatible.mode=4`.
+The test owns disposable databases and covers all 16 FLOAT_MODE/NUMBER_MODE/ORA_DATE_FMT/BACKSLASH_ESCAPE combinations.
+CASE_SENSITIVE, nested comments and MY_STRICT_TABLES each take both values across the matrix.
+Optionally fix strict mode with `-Ddameng.test.ini.MY_STRICT_TABLES=0` or `1`.
+It checks backticks, escaped names, auto-increment keys, DATETIME, high-precision decimals, TEXT/BLOB aliases, defaults,
+archived CREATE/ALTER and CRUD, decimal FLOAT, escaped defaults, literal backslashes in bound parameters,
+NULL transitions, deleted rows and two restarts against independently read JDBC values.

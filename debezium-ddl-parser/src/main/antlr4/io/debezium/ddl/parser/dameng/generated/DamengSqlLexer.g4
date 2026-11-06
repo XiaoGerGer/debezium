@@ -463,6 +463,7 @@ TILDE: '~';
 Q_QUOTE_START: 'Q' '\'' { startAlternativeQuote(); } -> more, pushMode(Q_DELIMITER_MODE);
 STRING_START: ('N' | 'E')? '\'' -> more, pushMode(STRING_MODE);
 IDENTIFIER_START: '"' -> more, pushMode(IDENTIFIER_MODE);
+BACKTICK_IDENTIFIER_START: '`' -> more, pushMode(BACKTICK_IDENTIFIER_MODE);
 HEX_BINARY_LITERAL: '0X' [0-9A-F]+;
 // Consume malformed suffixes as one error, rather than a literal plus an alias.
 INVALID_HEX_BINARY_LITERAL: '0X' (Letter | Digit | [_#$])* { fail("Invalid SQL hexadecimal binary literal"); };
@@ -498,6 +499,12 @@ IDENTIFIER_ESCAPED_QUOTE: '""' -> more;
 IDENTIFIER_END: '"' -> type(IDENTIFIER), popMode;
 IDENTIFIER_CHARACTER: . -> more;
 IDENTIFIER_EOF: EOF { fail("Unclosed SQL quoted value"); };
+
+mode BACKTICK_IDENTIFIER_MODE;
+BACKTICK_IDENTIFIER_ESCAPED_QUOTE: '``' -> more;
+BACKTICK_IDENTIFIER_END: '`' -> type(IDENTIFIER), popMode;
+BACKTICK_IDENTIFIER_CHARACTER: . -> more;
+BACKTICK_IDENTIFIER_EOF: EOF { fail("Unclosed SQL quoted identifier"); };
 
 mode Q_DELIMITER_MODE;
 Q_DELIMITER: . { readAlternativeQuoteDelimiter(); } -> more, mode(Q_STRING_MODE);

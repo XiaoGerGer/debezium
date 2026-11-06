@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -95,10 +96,10 @@ class DamengCompatibilitySafetyTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "2", "7" })
+    @ValueSource(strings = { "2", "4", "7" })
     void shouldPersistTypeSettingsAndRejectSwitchingSupportedModes(String mode) {
         final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
-        parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0"));
+        parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0", "MY_STRICT_TABLES", "1"));
         final var compatible = new DamengCompatibilityEnvironment(DamengCompatibilityMode.parse(mode), parameters);
         final var offset = new DamengOffsetContext(config, 100);
         offset.validateCompatibilityEnvironment(compatible);
@@ -133,11 +134,11 @@ class DamengCompatibilitySafetyTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "0", "1" })
-    void shouldRejectChangingNumberModeWhenRecoveringAnOracleOffset(String numberMode) {
+    @CsvSource({ "2,0", "2,1", "4,0", "4,1" })
+    void shouldRejectChangingNumberModeWhenRecoveringAnOffset(String mode, String numberMode) {
         final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
-        parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", numberMode, "ORA_DATE_FMT", "0"));
-        final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.ORACLE, parameters);
+        parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", numberMode, "ORA_DATE_FMT", "0", "MY_STRICT_TABLES", "1"));
+        final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.parse(mode), parameters);
         DamengCompatibilityRegistry.builtIn().resolve(initial.mode()).validate(initial);
         final var offset = new DamengOffsetContext(config, 100);
         offset.validateCompatibilityEnvironment(initial);
@@ -151,12 +152,12 @@ class DamengCompatibilitySafetyTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "0", "2", "7" })
+    @ValueSource(strings = { "0", "2", "4", "7" })
     void shouldCheckLiveParametersWithoutRebindingAChangedSnapshotOrOffset(String mode) throws Exception {
         final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
         final Map<String, String> parameters = new HashMap<>(environment("0").parameters());
         if (!mode.equals("0")) {
-            parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0"));
+            parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0", "MY_STRICT_TABLES", "1"));
         }
         final var environment = new DamengCompatibilityEnvironment(DamengCompatibilityMode.parse(mode), parameters);
         doReturn(environment).when(connection).getCompatibilityEnvironment();
@@ -180,7 +181,7 @@ class DamengCompatibilitySafetyTest {
             return ((ResultSetMapper<?>) invocation.getArgument(1)).apply(rows);
         }).when(connection).queryAndMap(anyString(), any());
         connection.validateUnchangedCompatibility();
-        final var changedParameter = mode.equals("2") ? "NUMBER_MODE" : mode.equals("7") ? "FLOAT_MODE" : "NESTED_C_STYLE_COMMENT";
+        final var changedParameter = mode.equals("2") ? "NUMBER_MODE" : (mode.equals("4") || mode.equals("7")) ? "FLOAT_MODE" : "NESTED_C_STYLE_COMMENT";
         entries.removeIf(e -> e.getKey().equals(changedParameter));
         entries.add(Map.entry(changedParameter, "1"));
         assertThatThrownBy(connection::validateUnchangedCompatibility).hasMessageContaining("changed while the task was running");

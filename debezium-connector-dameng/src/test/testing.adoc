@@ -298,9 +298,9 @@ Ancient and future non-zone temporal boundaries have separate test instances so 
 Before creating test tables, the fixture changes only its own disposable container, restarts it and verifies the system, session and file values.
 An external `dameng.hostname` is read and checked against the requested mode; it is never reconfigured or restarted.
 The fixture records server build, JDBC version, driver, charset, selected parameters and a numbered case catalog.
-Production supports modes `0`, `2` and `7` through explicit compatibility profiles. The component tests invoke the real connection, archived LogMiner, DML/DDL parsers and converters directly;
+Production supports modes `0`, `2`, `4` and `7` through explicit compatibility profiles. The component tests invoke the real connection, archived LogMiner, DML/DDL parsers and converters directly;
 they do not mock the mode guard. Their success is component evidence, not full Connector support.
-Unregistered modes still fail during complete-engine startup. Mode `7` additionally requires `FLOAT_MODE=0`, `NUMBER_MODE=0`, `ORA_DATE_FMT=0` and `BACKSLASH_ESCAPE=0`.
+Unsupported modes fail when parsing the server value, before selecting a compatibility profile. Mode `7` additionally requires `FLOAT_MODE=0`, `NUMBER_MODE=0`, `ORA_DATE_FMT=0` and `BACKSLASH_ESCAPE=0`.
 Mode `2` requires `BACKSLASH_ESCAPE=0`, with `NUMBER_MODE`, `FLOAT_MODE` and `ORA_DATE_FMT` each in `{0,1}`.
 `DamengOracleCompatibilityIT`, selected with `dameng.compatible.mode=2`, checks DATE as TIMESTAMP(0) in sqlstring and adaptive modes,
 including non-midnight and BCE values, defaults, unconstrained NUMBER, numeric aliases, RAW and NVARCHAR2,
@@ -317,6 +317,19 @@ Use `DamengCaseSensitivityIT` with mode `2` to exercise initialized CASE_SENSITI
 These embedded-engine tests validate SourceRecords, not a standalone Kafka Connect Worker/Broker deployment.
 `DamengPostgresCompatibilityIT`, selected with `dameng.compatible.mode=7`, covers both nested-comment settings, E-prefixed defaults,
 TIME/TIMESTAMP WITHOUT TIME ZONE, mixed-case quoted identifiers, offline DDL/CRUD and recovery from the persisted offset and history.
+
+`DamengMySqlCompatibilityIT`, selected with `dameng.compatible.mode=4`, checks backtick identifiers and escaped backticks,
+auto-increment keys, DATETIME precision, high-precision decimals, TEXT/BLOB aliases and constant defaults.
+It covers all 16 FLOAT_MODE/NUMBER_MODE/ORA_DATE_FMT/BACKSLASH_ESCAPE combinations, with CASE_SENSITIVE=0/1,
+both nested-comment settings and strict modes distributed across the matrix, plus archived CREATE/ALTER,
+NULL transitions, deleted rows and recovery across two restarts. Expected values are read independently through JDBC before deletion.
+Optionally fix `MY_STRICT_TABLES` with `-Ddameng.test.ini.MY_STRICT_TABLES=0` or `1`.
+Mode `4` accepts each of these five parameters in `{0,1}` and binds them to the compatibility signature.
+NUMBER_MODE=1 uses decimal FLOAT without changing DATE to TIMESTAMP.
+Escaped defaults, Q/N/E literals, ALTER DEFAULT, precision changes and bound literal backslashes check that
+historical DDL is decoded exactly once, while JDBC defaults and LogMiner DML preserve their stored values.
+Unchanged LOBs omitted by DM from UPDATE/DELETE retain the existing unavailable-value behavior.
+One-off SQL capability probes remain outside the repository.
 
 Run the component layer for an explicitly selected mode from the repository root with JDK 21 or newer:
 

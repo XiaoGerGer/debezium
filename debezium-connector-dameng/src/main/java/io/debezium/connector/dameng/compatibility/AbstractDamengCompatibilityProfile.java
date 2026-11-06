@@ -59,7 +59,11 @@ abstract class AbstractDamengCompatibilityProfile implements DamengCompatibility
                 // be uppercased). Use the same canonical names as JDBC metadata ingestion.
                 new DamengIdentifierRules("0".equals(environment.parameter("CASE_SENSITIVE"))
                         || "1".equals(environment.parameter("IDENTIFIER_MODE"))),
-                typeRules(environment));
+                typeRules(environment), backslashEscape(environment));
+    }
+
+    protected boolean backslashEscape(DamengCompatibilityEnvironment environment) {
+        return false;
     }
 
     protected DamengTypeRules typeRules(DamengCompatibilityEnvironment environment) {

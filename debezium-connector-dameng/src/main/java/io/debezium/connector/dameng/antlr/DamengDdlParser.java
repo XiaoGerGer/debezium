@@ -49,10 +49,15 @@ public final class DamengDdlParser {
 
     public DamengDdlParser(Charset databaseCharset, boolean characterSemanticsEnabled, boolean defaultCharacterLength, boolean nationalCharacterLength,
                            boolean nestedComments, DamengIdentifierRules identifierRules, DamengTypeRules typeRules) {
+        this(databaseCharset, characterSemanticsEnabled, defaultCharacterLength, nationalCharacterLength, nestedComments, identifierRules, typeRules, false);
+    }
+
+    public DamengDdlParser(Charset databaseCharset, boolean characterSemanticsEnabled, boolean defaultCharacterLength, boolean nationalCharacterLength,
+                           boolean nestedComments, DamengIdentifierRules identifierRules, DamengTypeRules typeRules, boolean backslashEscape) {
         this.identifierRules = identifierRules;
         this.analyzer = new DamengDdlStatementAnalyzer(nestedComments, identifierRules);
         this.columns = new ColumnDefinitionParser(databaseCharset, characterSemanticsEnabled, defaultCharacterLength,
-                nationalCharacterLength, identifierRules, typeRules);
+                nationalCharacterLength, identifierRules, typeRules, backslashEscape);
     }
 
     public enum Type {

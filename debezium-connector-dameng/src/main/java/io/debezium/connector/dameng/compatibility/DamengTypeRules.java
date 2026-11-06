@@ -8,6 +8,7 @@ package io.debezium.connector.dameng.compatibility;
 /** Physical type semantics used when rebuilding historical DDL. */
 public enum DamengTypeRules {
     NATIVE(false, false),
+    NATIVE_NUMBERS(false, true),
     ORACLE(true, false),
     ORACLE_NUMBERS(true, true);
 

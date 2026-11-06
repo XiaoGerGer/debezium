@@ -19,6 +19,14 @@ import org.junit.jupiter.params.provider.ValueSource;
 import io.debezium.connector.dameng.antlr.DamengSqlToken.Kind;
 
 class DamengAntlrSqlLexerTest {
+    @Test
+    void shouldKeepBacktickIdentifiersTogetherIncludingEscapedQuotesAndStatementDelimiters() {
+        assertTokens("CREATE TABLE `a``b;--/*` (`Id` INT)", false,
+                word("CREATE"), word("TABLE"), identifier("`a``b;--/*`"), symbol("("), identifier("`Id`"), word("INT"), symbol(")"));
+        assertThatThrownBy(() -> new DamengAntlrSqlLexer().tokenize("CREATE TABLE `unclosed"))
+                .hasMessageContaining("Unclosed SQL quoted identifier", "character 13");
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = { false, true })
     void shouldTokenizeDdlWithExplicitKindsAndOriginalSpelling(boolean nestedComments) {

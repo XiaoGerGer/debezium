@@ -46,11 +46,11 @@ class DamengCompatibilityTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "1", "3", "4", "5", "6", "8", "9", "42", " 0042 ", "2147483648", "99999999999999999999999999999999999999" })
+    @ValueSource(strings = { "1", "3", "5", "6", "8", "9", "42", " 0042 ", "2147483648", "99999999999999999999999999999999999999" })
     void shouldRejectUnsupportedModesDuringParsing(String value) {
         assertThatThrownBy(() -> DamengCompatibilityMode.parse(value))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("COMPATIBLE_MODE=" + value, "supported values: 0 (native), 2 (Oracle), 7 (PostgreSQL)");
+                .hasMessageContaining("COMPATIBLE_MODE=" + value, "supported values: 0 (native), 2 (Oracle), 4 (MySQL), 7 (PostgreSQL)");
     }
 
     @Test
@@ -62,10 +62,13 @@ class DamengCompatibilityTest {
     @Test
     void shouldKeepNamedModesCompatibleWithServerValuesAndPersistedSignatures() {
         final var registry = DamengCompatibilityRegistry.builtIn();
-        assertThat(registry.registeredModes()).containsExactly(DamengCompatibilityMode.NATIVE, DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.POSTGRES);
-        assertThat(DamengCompatibilityMode.values()).containsExactly(DamengCompatibilityMode.NATIVE, DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.POSTGRES);
+        assertThat(registry.registeredModes()).containsExactly(DamengCompatibilityMode.NATIVE, DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.MYSQL,
+                DamengCompatibilityMode.POSTGRES);
+        assertThat(DamengCompatibilityMode.values()).containsExactly(DamengCompatibilityMode.NATIVE, DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.MYSQL,
+                DamengCompatibilityMode.POSTGRES);
         assertThat(DamengCompatibilityMode.NATIVE.value()).isEqualTo("0");
         assertThat(DamengCompatibilityMode.ORACLE.value()).isEqualTo("2");
+        assertThat(DamengCompatibilityMode.MYSQL.value()).isEqualTo("4");
         assertThat(DamengCompatibilityMode.POSTGRES.value()).isEqualTo("7");
         for (var mode : registry.registeredModes()) {
             assertThat(DamengCompatibilityMode.parse(mode.value())).isSameAs(mode);
@@ -75,6 +78,7 @@ class DamengCompatibilityTest {
         }
         assertThat(registry.resolve(DamengCompatibilityMode.NATIVE).id()).isEqualTo("native-v1");
         assertThat(registry.resolve(DamengCompatibilityMode.ORACLE).id()).isEqualTo("oracle-v1");
+        assertThat(registry.resolve(DamengCompatibilityMode.MYSQL).id()).isEqualTo("mysql-v1");
         assertThat(registry.resolve(DamengCompatibilityMode.POSTGRES).id()).isEqualTo("postgres-v1");
     }
 
@@ -88,7 +92,7 @@ class DamengCompatibilityTest {
 
     @Test
     void shouldCopyRegistrationsAndKeepRegistriesIndependent() {
-        final var custom = profile("custom-v1", DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.POSTGRES);
+        final var custom = profile("custom-v1", DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.MYSQL, DamengCompatibilityMode.POSTGRES);
         final List<DamengCompatibilityProfile> profiles = new ArrayList<>(List.of(new DamengNativeCompatibilityProfile(), custom));
         final var registry = new DamengCompatibilityRegistry(profiles);
         profiles.clear();

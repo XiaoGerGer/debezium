@@ -138,7 +138,7 @@ class DamengLogMiningConfigurationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "1", "3", "4", "5", "6", "42" })
+    @ValueSource(strings = { "1", "3", "5", "6", "42" })
     void shouldRejectUnimplementedTypeSemantics(String compatibilityMode) throws Exception {
         when(connection.getIniParameter("COMPATIBLE_MODE")).thenReturn(compatibilityMode);
 
@@ -147,9 +147,10 @@ class DamengLogMiningConfigurationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "2", "7" })
+    @ValueSource(strings = { "2", "4", "7" })
     void shouldAcceptCompatibleModesWithVerifiedTypeSettings(String mode) throws Exception {
         when(connection.getIniParameter("COMPATIBLE_MODE")).thenReturn(mode);
+        when(connection.getIniParameter("MY_STRICT_TABLES")).thenReturn("1");
         for (var name : java.util.List.of("FLOAT_MODE", "NUMBER_MODE", "ORA_DATE_FMT")) {
             when(connection.getIniParameter(name)).thenReturn("0");
         }

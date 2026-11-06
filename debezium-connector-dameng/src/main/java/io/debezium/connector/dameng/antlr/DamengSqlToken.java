@@ -25,14 +25,54 @@ public record DamengSqlToken(Kind kind, String text, int start, int end, String 
     }
 
     public String stringValue() {
+        return stringValue(false);
+    }
+
+    public String stringValue(boolean backslashEscape) {
+        return decodedString(backslashEscape, false);
+    }
+
+    /** Canonical literal matching DM's compiled default, for history and schema conversion. */
+    public String defaultValueExpression() {
+        return "'" + decodedString(true, true).replace("'", "''") + "'";
+    }
+
+    private String decodedString(boolean backslashEscape, boolean defaultValue) {
         if (kind != Kind.STRING) {
             throw error("Expected SQL string literal");
         }
         if (text.charAt(0) == 'q' || text.charAt(0) == 'Q') {
-            return text.substring(3, text.length() - 2);
+            final var value = text.substring(3, text.length() - 2);
+            // DM doubles retained backslashes when compiling a Q-quoted default.
+            return backslashEscape && defaultValue ? value.replace("\\", "\\\\") : value;
         }
         final int prefix = text.charAt(0) == '\'' ? 1 : 2;
-        return text.substring(prefix, text.length() - 1).replace("''", "'");
+        final var value = text.substring(prefix, text.length() - 1).replace("''", "'");
+        if (!backslashEscape) {
+            return value;
+        }
+        final var decoded = new StringBuilder();
+        for (int index = 0; index < value.length(); index++) {
+            final char character = value.charAt(index);
+            if (character != '\\' || index + 1 == value.length()) {
+                decoded.append(character);
+                continue;
+            }
+            final char escaped = value.charAt(++index);
+            // Unlike an INSERT literal, DM retains both slashes in a compiled default.
+            if (escaped == '\\' && defaultValue) {
+                decoded.append('\\');
+            }
+            decoded.append(switch (escaped) {
+                case 'b' -> '\b';
+                case 'f' -> '\f';
+                case 'n' -> '\n';
+                case 'r' -> '\r';
+                case 't' -> '\t';
+                default -> escaped;
+            });
+        }
+        return decoded.toString();
     }
 
     public static IllegalArgumentException error(String input, int offset, String message) {

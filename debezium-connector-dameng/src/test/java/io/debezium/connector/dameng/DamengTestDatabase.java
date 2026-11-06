@@ -97,7 +97,7 @@ final class DamengTestDatabase {
             }
             jdbcUrl = "jdbc:dm://" + hostname + ":" + port;
             verifyCompatibilityMode(mode);
-            for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE", "RECYCLEBIN")) {
+            for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE", "MY_STRICT_TABLES", "RECYCLEBIN")) {
                 final var value = System.getProperty("dameng.test.ini." + name);
                 if (value != null) {
                     verifyLexicalParameter(name, Integer.parseInt(value));
@@ -189,7 +189,7 @@ final class DamengTestDatabase {
         catch (SQLException rejected) {
             throw new SQLException("Fixture cannot set COMPATIBLE_MODE=" + mode + " on this database image", rejected);
         }
-        for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE", "RECYCLEBIN")) {
+        for (var name : List.of("FLOAT_MODE", "ORA_DATE_FMT", "NUMBER_MODE", "MY_STRICT_TABLES", "RECYCLEBIN")) {
             final var value = System.getProperty("dameng.test.ini." + name);
             if (value != null) {
                 if (!hasIniParameter(name)) {

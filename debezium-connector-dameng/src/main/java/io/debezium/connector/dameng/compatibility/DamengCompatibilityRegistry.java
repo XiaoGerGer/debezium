@@ -16,7 +16,8 @@ import java.util.Set;
 /** Explicit registration controls which semantics can be used for production capture. */
 public final class DamengCompatibilityRegistry {
     private static final DamengCompatibilityRegistry BUILT_IN = new DamengCompatibilityRegistry(
-            List.of(new DamengNativeCompatibilityProfile(), new DamengOracleCompatibilityProfile(), new DamengPostgresCompatibilityProfile()));
+            List.of(new DamengNativeCompatibilityProfile(), new DamengOracleCompatibilityProfile(), new DamengMySqlCompatibilityProfile(),
+                    new DamengPostgresCompatibilityProfile()));
     private final Map<DamengCompatibilityMode, DamengCompatibilityProfile> profiles;
 
     public DamengCompatibilityRegistry(Collection<? extends DamengCompatibilityProfile> implementations) {

@@ -36,7 +36,7 @@ class DamengOracleCompatibilityTest {
         assertThat(profile.id()).isEqualTo("oracle-v1");
         assertThat(profile.parameterNames()).contains("FLOAT_MODE", "NUMBER_MODE", "ORA_DATE_FMT", "BACKSLASH_ESCAPE");
         assertThat(DamengCompatibilityRegistry.builtIn().registeredModes())
-                .containsExactly(DamengCompatibilityMode.NATIVE, DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.POSTGRES);
+                .containsExactly(DamengCompatibilityMode.NATIVE, DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.MYSQL, DamengCompatibilityMode.POSTGRES);
     }
 
     @ParameterizedTest

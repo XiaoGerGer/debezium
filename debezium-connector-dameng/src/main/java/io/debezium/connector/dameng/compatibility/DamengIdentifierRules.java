@@ -18,7 +18,8 @@ public record DamengIdentifierRules(boolean uppercaseQuoted) {
 
     public String identifier(DamengSqlToken token) {
         if (token.kind() == Kind.IDENTIFIER) {
-            final var name = token.text().substring(1, token.text().length() - 1).replace("\"\"", "\"");
+            final var quote = token.text().substring(0, 1);
+            final var name = token.text().substring(1, token.text().length() - 1).replace(quote + quote, quote);
             return canonicalName(name);
         }
         if (token.kind() != Kind.WORD) {

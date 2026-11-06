@@ -84,6 +84,10 @@ public final class DamengParseTree {
     }
 
     public static String defaultExpression(ParserRuleContext context) {
+        return defaultExpression(context, false);
+    }
+
+    public static String defaultExpression(ParserRuleContext context, boolean backslashEscape) {
         final var values = tokens(context);
         if (values.isEmpty()) {
             return "";
@@ -94,7 +98,7 @@ public final class DamengParseTree {
         for (var token : values) {
             final var gap = sql.substring(previousEnd, token.start());
             result.append(gap.isBlank() ? gap : " ");
-            result.append(token.text());
+            result.append(backslashEscape && token.kind() == DamengSqlToken.Kind.STRING ? token.defaultValueExpression() : token.text());
             previousEnd = token.end();
         }
         return result.toString();

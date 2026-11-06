@@ -11,6 +11,7 @@ import java.math.BigInteger;
 public enum DamengCompatibilityMode {
     NATIVE("0"),
     ORACLE("2"),
+    MYSQL("4"),
     POSTGRES("7");
 
     private final String value;
@@ -34,7 +35,7 @@ public enum DamengCompatibilityMode {
             }
         }
         throw new IllegalArgumentException("Unsupported Dameng COMPATIBLE_MODE=" + value
-                + "; supported values: 0 (native), 2 (Oracle), 7 (PostgreSQL)");
+                + "; supported values: 0 (native), 2 (Oracle), 4 (MySQL), 7 (PostgreSQL)");
     }
 
     @Override

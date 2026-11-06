@@ -42,6 +42,19 @@ import io.debezium.relational.Column;
 import io.debezium.relational.TableId;
 
 class DamengConnectionTest {
+    @Test
+    void shouldNormalizeJdbcTextToTheHistoricalLobType() throws SQLException {
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        doReturn("1").when(connection).getCaseSensitiveFlag();
+        final var metadata = mock(ResultSet.class);
+        when(metadata.getString(4)).thenReturn("VALUE");
+        when(metadata.getString(6)).thenReturn("TEXT");
+        when(metadata.getInt(5)).thenReturn(Types.LONGVARCHAR);
+        final var column = connection.readTableColumn(metadata, new TableId(null, "APP", "T"), null).orElseThrow().create();
+        assertThat(column.jdbcType()).isEqualTo(Types.CLOB);
+        assertThat(column.typeName()).isEqualTo("TEXT");
+    }
+
     @ParameterizedTest
     @CsvSource({ "NUMBER,3", "DOUBLE,6", "FLOAT,6" })
     void shouldDistinguishDecimalAndBinaryStorageBehindTheJdbcFloatCode(String physicalType, int jdbcType) throws SQLException {

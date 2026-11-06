@@ -17,7 +17,6 @@ import org.antlr.v4.runtime.ParserRuleContext;
 import io.debezium.connector.dameng.DamengTableType;
 import io.debezium.connector.dameng.antlr.DamengDdlParser.SchemaChange;
 import io.debezium.connector.dameng.antlr.DamengDdlParser.Type;
-import io.debezium.connector.dameng.antlr.DamengParseTree;
 import io.debezium.ddl.parser.dameng.generated.DamengSqlParser;
 import io.debezium.relational.Attribute;
 import io.debezium.relational.TableEditor;
@@ -127,7 +126,7 @@ final class AlterTableParserListener extends BaseParserListener {
         final var column = requireColumn(table, name).edit();
         if (operation.DEFAULT() != null) {
             if (operation.SET() != null) {
-                column.defaultValueExpression(DamengParseTree.defaultExpression(operation.expression()));
+                column.defaultValueExpression(columns.defaultExpression(operation.expression()));
                 if (operation.ON() != null) {
                     column.optional(false);
                 }
