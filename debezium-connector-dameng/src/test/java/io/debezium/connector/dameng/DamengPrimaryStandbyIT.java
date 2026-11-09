@@ -61,8 +61,8 @@ class DamengPrimaryStandbyIT extends AbstractAsyncEngineConnectorTest {
                 writer.commit();
             }
             config = Configuration.create().with("topic.prefix", "dameng")
-                    .with("database.failover.hosts", environment.endpoints())
-                    .with("database.standby.hosts", standby ? environment.endpoints() : "")
+                    .with("database.hosts", environment.endpoints())
+                    .with("database.capture.role", standby ? "standby" : "primary")
                     .with("database.user", DamengPrimaryStandbyEnvironment.USER).with("database.password", DamengPrimaryStandbyEnvironment.PASSWORD)
                     .with("database.dbname", "DAMENG").with("table.include.list", "SYSDBA\\." + table)
                     .with("database.socket.timeout.ms", 15_000).with("database.query.timeout.ms", 10_000)
@@ -124,10 +124,19 @@ class DamengPrimaryStandbyIT extends AbstractAsyncEngineConnectorTest {
     void shouldRecoverHistoricalDdlAcrossManualSwitchoverSwitchbackAndPrimaryFailure() throws Exception {
         try (var environment = new DamengPrimaryStandbyEnvironment()) {
             environment.start();
+            // A single candidate can still be a PRIMARY and must retain lineage checks.
+            final var single = new DamengConnectorConfig(DamengTestConfiguration.configuration()
+                    .with("database.hosts", environment.endpoints().split(",")[0])
+                    .with("database.user", DamengPrimaryStandbyEnvironment.USER)
+                    .with("database.password", DamengPrimaryStandbyEnvironment.PASSWORD).build());
+            try (var primary = new DamengConnection(single.getJdbcConfig())) {
+                primary.validateServerRole();
+                assertThat(primary.requiresDatabaseLineage()).isTrue();
+            }
             execute(environment, "CREATE TABLE SYSDBA." + table + " (ID INT PRIMARY KEY, LABEL VARCHAR(100))",
                     "INSERT INTO SYSDBA." + table + " VALUES(1,'snapshot')");
             config = Configuration.create().with("topic.prefix", "dameng")
-                    .with("database.failover.hosts", environment.endpoints())
+                    .with("database.hosts", environment.endpoints())
                     .with("database.user", DamengPrimaryStandbyEnvironment.USER).with("database.password", DamengPrimaryStandbyEnvironment.PASSWORD)
                     .with("database.dbname", "DAMENG").with("table.include.list", "SYSDBA\\." + table)
                     .with("database.socket.timeout.ms", 15_000).with("database.query.timeout.ms", 10_000)

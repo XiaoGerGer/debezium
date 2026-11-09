@@ -478,7 +478,7 @@ class DamengMaterializedViewSchemaRecoveryProbeIT {
     }
 
     private static DamengConnection miner() {
-        return new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname()).with("port", DamengTestDatabase.port())
+        return new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts())
                 .with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build());
     }
 

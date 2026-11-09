@@ -52,73 +52,23 @@ offset 中的 `compatibility_signature` 记录兼容和词法环境，`capture_s
 [id="dameng-compatible-mode-matrix"]
 === 兼容模式
 
-支持服务器实际的 `COMPATIBLE_MODE=0`（达梦原生模式）、`COMPATIBLE_MODE=2`（Oracle 兼容模式）、`COMPATIBLE_MODE=4`（MySQL 兼容模式）和 `COMPATIBLE_MODE=7`（PostgreSQL 兼容模式），分别选择 `native-v1`、`oracle-v1`、`mysql-v1` 和 `postgres-v1`。
-其他模式、缺失值和无效值均在读取服务器模式时立即报错，错误信息包含实际值及支持的 `0`、`2`、`4`、`7`，不回退到原生规则。
-`dameng.compatible.mode` 是测试属性；JDBC 的 `compatibleMode` 驱动选项也不能覆盖服务器检查。
-数据库端的日志和词法参数要求见 <<dameng-database-setup,数据库准备>>。
+Connector 自动读取服务器的 `COMPATIBLE_MODE`，仅支持下表中的值；缺失或其他值会报错。
+所有模式均通过达梦 JDBC 和 `DBMS_LOGMNR` 采集，使用达梦实际物理类型和标识符规则。
 
-模式 0 支持 `NUMBER_MODE=0/1` 和 `BACKSLASH_ESCAPE=0/1`。
-`NUMBER_MODE=1` 时，FLOAT(p)、REAL、DOUBLE PRECISION 使用十进制映射；DATE 仍为纯日期，DOUBLE、BINARY_FLOAT、BINARY_DOUBLE 仍为二进制浮点。
-旧 DM 8.1.2.128 在值 1 时仍将 REAL 存为二进制浮点。原生 profile 通过只读 CAST 表达式的 JDBC 元数据识别 REAL 类型，并把派生值 `NATIVE_REAL_SEMANTICS=binary/decimal` 记录到兼容签名和运行边界检查。
-当前 DM 8.1.3.162 构建在 `BACKSLASH_ESCAPE=1` 时会解码普通/N/E 字符串，默认值和多列 ADD 的反斜杠处理与模式 2、4、7 相同。
-旧 DM 8.1.2.128 构建在相同设置下仍保留反斜杠，多列 ADD 也不会加倍默认值中的反斜杠。
-原生 profile 在参数为 1 时通过只读查询识别当前会话的实际行为，作为派生值 `NATIVE_BACKSLASH_SEMANTICS=raw/escaped` 记录到兼容签名并在运行边界复核；该派生值不是 dm.ini 参数或 Connector 配置。
-历史 DDL 应用转义一次；JDBC 默认值和 LogMiner DML 已包含实际值，不再解码。
-当前已测样例中，切换 `FLOAT_MODE` 未改变物理映射或存储值；原生 profile 不对该参数额外设置范围限制，也不将其纳入兼容签名。
-`ORA_DATE_FMT` 仅在模式 2 下有效，原生、MySQL 和 PostgreSQL 模式均不读取、校验或记录该参数，也不因其变化中止恢复或采集。
-原生 profile 新增了 `NUMBER_MODE` 校验和签名记录，缺失或非 0/1 值会被拒绝。
-此前未记录 `NUMBER_MODE` 的原生 offset 不能直接复用，需要建立新的采集基线。
-两种构建的原生反斜杠行为已分别验证；更换数据库构建或驱动时仍需重新核查。
+[cols="1,2,6",options="header"]
+|===
+|COMPATIBLE_MODE |模式 |主要差异与支持语法
+|`0` |达梦原生 |`DATE` 为纯日期，其余按达梦原生类型和语法处理。
+|`2` |Oracle 兼容 |`DATE` 按 `TIMESTAMP(0)` 采集，保留时分秒；支持 `VARCHAR2`、`NVARCHAR2`、`RAW`、`PLS_INTEGER`、`BINARY_FLOAT`、`BINARY_DOUBLE` 等已映射类型。
+|`4` |MySQL 兼容 |支持反引号标识符及双反引号转义、`AUTO_INCREMENT`、`DATETIME(p)` 和 `MEDIUMTEXT`、`LONGTEXT`、`MEDIUMBLOB`、`LONGBLOB` 别名。
+|`7` |PostgreSQL 兼容 |支持 `TIME/TIMESTAMP ... WITHOUT TIME ZONE` 和 `E'...'` 字面量；未引用标识符仍转大写。
+|===
 
-模式 2 使用达梦 JDBC、归档日志和 `DBMS_LOGMNR`，不需要 Oracle Connector 或 Oracle 数据库。
-`DATE` 按达梦实际物理类型 `TIMESTAMP(0)` 采集，保留日期和时分秒；默认 sqlstring 输出如 `2000-02-29 12:34:56`，adaptive 输出毫秒时间戳。
-该规则用于 JDBC 快照、历史 CREATE/ALTER、默认值和流式行像。`ORA_DATE_FMT=1` 的 JDBC 日期显示格式不会截断采集的时间。
-支持 `VARCHAR2`、`NVARCHAR2`、`RAW`、`PLS_INTEGER`、`BINARY_FLOAT`、`BINARY_DOUBLE` 等已映射的达梦类型。
-模式 2 支持 `BACKSLASH_ESCAPE`、`NUMBER_MODE`、`FLOAT_MODE` 和 `ORA_DATE_FMT` 分别为 `0` 或 `1`，缺失或其他值拒绝。
-当前测试构建中，切换 `FLOAT_MODE` 未改变已测 FLOAT/REAL/DOUBLE 样例的物理类型或 JDBC 数值；映射仍依据实际物理类型和 `NUMBER_MODE`。
-这些参数会记录到兼容签名并在运行边界复核；参数需在所保留的归档区间内保持不变，修改后需要建立新的采集基线。
-`BACKSLASH_ESCAPE=1` 时，历史 DDL 默认值和注释按达梦转义规则解码；JDBC 默认值和 LogMiner DML 已反映实际存储值，不再解码，预编译参数中的字面反斜杠也会保留。
-当前构建编译 DEFAULT 时保留成对反斜杠，Q 字面量默认值中的反斜杠加倍；一次 ADD 多列会使已有和新列字符串默认值中的反斜杠再加倍一次，单列 ADD 不应用该规则。
-`NUMBER_MODE=0` 沿用达梦原有数值映射。
-`NUMBER_MODE=1` 时，`FLOAT(p)`、`REAL` 和 `DOUBLE PRECISION` 存储为可变 scale 的十进制数，默认输出 `VariableScaleDecimal`；string/double 模式分别输出 STRING/FLOAT64。
-当前 Kafka Connect 的 Struct 默认值限制使 VariableScaleDecimal 字段不附带 schema 默认值；数据库实际写入的默认数值仍正常采集，默认表达式仍保存在 schema history 中。
-JDBC 仍将这些列报告为 FLOAT，Connector 根据列的实际物理类型识别它们，快照不会先转成 Java float/double。
-历史 DDL 保留 FLOAT 的二进制精度；未指定精度的 FLOAT 和 DOUBLE PRECISION 为 126，REAL 为 63。
-`DOUBLE`、`BINARY_FLOAT` 和 `BINARY_DOUBLE` 仍按实际浮点类型映射。
-当前测试的 DM 8.1.3.162 拒绝负 scale 的 `NUMBER(5,-2)` 和 scale 大于 precision 的 `NUMBER(4,6)`。
-模式 2 的定向回归使用默认 DM 8.1.3.162 镜像、`DmJdbcDriver18 8.1.3.140` 和 GB18030 字符集；其他数据库构建和驱动需另行验证。
+语法和类型须以达梦实际接受的声明为准。已测 DM 8.1.3.162 不接受 `UNSIGNED`、`JSON`、`ENUM`、`ENGINE=InnoDB` 等 MySQL 声明，也不接受 `SERIAL`、`INT4`、`BYTEA`、`JSONB`、`UUID` 等 PostgreSQL 声明。
+MySQL 模式的 ALTER 使用 `MODIFY`、`RENAME COLUMN`、`ADD`，不支持 `MODIFY COLUMN`、`CHANGE COLUMN` 或 `ADD ... AFTER`。
 
-模式 4 使用达梦 JDBC、归档日志和 `DBMS_LOGMNR`，不使用 MySQL binlog 协议。
-支持历史 DDL 中的反引号标识符及双反引号转义、`AUTO_INCREMENT`、`DATETIME(p)`，以及实际存储为 TEXT/BLOB 的 `MEDIUMTEXT`、`LONGTEXT`、`MEDIUMBLOB`、`LONGBLOB`。
-引用名按达梦的 `CASE_SENSITIVE`、`IDENTIFIER_MODE` 处理；未引用名仍采用达梦的大写规则。
-模式 4 支持 `FLOAT_MODE`、`NUMBER_MODE`、`BACKSLASH_ESCAPE` 和 `MY_STRICT_TABLES` 分别为 `0` 或 `1`；这些参数均记录到兼容签名，缺失或其他值拒绝。
-`NUMBER_MODE=1` 时，`FLOAT(p)`、`REAL`、`DOUBLE PRECISION` 使用可变 scale 的十进制映射，`DOUBLE` 和 `BINARY_FLOAT/BINARY_DOUBLE` 仍按物理浮点类型处理；`DATE` 仍是纯日期。
-当前测试构建中，切换 `FLOAT_MODE` 未改变这些样例的物理类型、JDBC 值或归档行像。
-`BACKSLASH_ESCAPE=1` 时，历史 DDL 默认值和列注释按达梦的转义规则解码；JDBC 默认值和 LogMiner DML 已反映数据库存储值，不再应用转义。
-实测 `\n`、`\r`、`\t`、`\b`、`\f` 对应控制字符，未知转义只保留后一个字符，例如 `\0` 为字符 `0`，并非 NUL。
-当前构建编译 DEFAULT 时会保留成对反斜杠，Q 引号默认值中的反斜杠会加倍；Connector 按此行为重建默认值，不能套用 MySQL 字符串规则。
-当 `BACKSLASH_ESCAPE=1` 且一次 ADD 多列时，数据库还会将所有字符串默认值中的反斜杠额外加倍一次，包括新列默认值；历史解析同步该变化，单列 ADD 不应用此规则。
-Connector 采集数据库实际存储的数值和日期，不推断 MySQL 的无符号整数、显示宽度或 TIMESTAMP 时区语义。
-当前测试的 DM 8.1.3.162 不接受 `BOOL`、`BOOLEAN`、`TINYINT(1)`、`INT(11)`、`UNSIGNED`、`MEDIUMINT`、`YEAR`、`BIT(8)`、`JSON`、`ENUM`、`SET`、`TINYTEXT`、`TINYBLOB`，也不接受 `ENGINE=InnoDB`、`MODIFY COLUMN`、`CHANGE COLUMN` 或 `ADD ... AFTER`。
-这些 MySQL 声明不在本次支持范围内；ALTER 使用达梦接受的 `MODIFY`、`RENAME COLUMN`、`ADD` 形式。
-模式 4 的专用回归使用默认 DM 8.1.3.162 镜像、`DmJdbcDriver18 8.1.3.140` 和 GB18030 字符集。
-
-模式 7 使用达梦 JDBC、归档日志和 `DBMS_LOGMNR`，沿用达梦物理类型映射，不使用 PostgreSQL 的复制协议。
-未引用标识符转大写；引用标识符按 `CASE_SENSITIVE` 和 `IDENTIFIER_MODE` 处理，不按 PostgreSQL 规则转小写。
-支持历史 DDL 中的 `TIME/TIMESTAMP ... WITHOUT TIME ZONE` 和 `E'...'` 字面量。
-模式 7 支持 `FLOAT_MODE`、`NUMBER_MODE`、`BACKSLASH_ESCAPE` 分别为 `0` 或 `1`；这些参数记录到兼容签名并在运行边界复核，缺失或其他值拒绝。
-参数需在所保留的归档区间内保持不变；修改参数后须建立新的采集基线，不能复用原 offset 和 schema history。
-`NUMBER_MODE=1` 时，`FLOAT(p)`、`REAL`、`DOUBLE PRECISION` 使用可变 scale 的十进制映射；`DOUBLE`、`BINARY_FLOAT/BINARY_DOUBLE` 仍为二进制浮点，`DATE` 仍是纯日期。
-十进制 FLOAT 的精度、默认值和 JDBC 识别规则与前述模式 2、4 相同。
-当前测试构建中，切换 `FLOAT_MODE` 未改变已测样例的物理类型、JDBC 值或归档行像。
-`BACKSLASH_ESCAPE=0` 时，包括 `E'a\n'` 在内的字符串保留反斜杠；值为 `1` 时，历史 DDL 默认值和注释按达梦转义规则解码。
-实测普通字符串及 N/E 字面量中的 `\n` 成为换行，未知转义丢弃反斜杠；编译 DEFAULT 时保留成对反斜杠，Q 字面量默认值中的反斜杠加倍。
-当前构建在一次 ADD 多列时会额外编译所有字符串默认值，反斜杠加倍一次；Connector 对已有及新列默认值应用相同规则，单列 ADD 不应用。
-JDBC 默认值和 LogMiner DML 已反映实际存储值，不再解码，预编译参数中传入的字面反斜杠也会保留。
-模式 7 不代表数据库接受所有 PostgreSQL 类型：当前测试的 DM 8.1.3.162 不接受 `SERIAL`、`INT4`、`BYTEA`、`JSONB`、`UUID` 等声明。
-模式 7 的定向回归使用当前默认的 DM 8.1.3.162 镜像、`DmJdbcDriver18 8.1.3.140` 和 GB18030 字符集，覆盖 `CASE_SENSITIVE=0/1`。
-浮点精度、行外 LOB 和 LOCAL TIME ZONE 的限制同样适用于模式 2、4 和 7，见 <<dameng-data-types,类型映射>>。
-切换兼容模式必须建立新的采集基线，不能复用另一模式的 offset 和 schema history。
+各模式的参数校验见 <<dameng-database-setup,数据库准备>>，字段表示与精度限制见 <<dameng-data-types,数据类型映射>>，命名规则见 <<dameng-case-sensitive,标识符大小写>>。
+切换兼容模式须建立新的采集基线，不能复用原 offset 和 schema history。
 
 本实现使用 JDBC LogMiner，不提供 JNI 生产适配器、XStream、OpenLogReplicator、Oracle RAC/PDB 或 Flashback。
 并行初始快照、阻塞快照、自定义 snapshotter、主动丢弃事务和手工注入历史 DDL 未提供。
@@ -145,15 +95,17 @@ JDBC 默认值和 LogMiner DML 已反映实际存储值，不再解码，预编�
 [cols="3,2,5",options="header"]
 |===
 |拓扑 |支持状态 |要求
-|单机直连 |支持 |`NORMAL/OPEN`，配置 hostname/port。
-|固定地址连接主库 |支持当前成员采集 |`PRIMARY/OPEN`；单地址 offset 不提供跨成员恢复保证。
-|成员列表连接主库 |支持人工切换 |配置 `database.failover.hosts`，成员 `N_EP=1`；DBA 负责切换和隔离旧主。见 <<dameng-primary-standby-recovery,主备恢复>>。
-|物理备库采集 |支持指定构建 |配置 `database.standby.hosts`；备库提供 LogMiner、SLSN、RPKG_LSN，主库负责信号写入和快照锁。见 <<dameng-standby-capture,备库采集>>。
+|单机直连 |支持 |`NORMAL/OPEN`，在 `database.hosts` 中填写一个 `host:port`，使用默认 `database.capture.role=primary`。
+|固定地址连接主库 |支持当前可达成员采集 |`PRIMARY/OPEN`，在 `database.hosts` 中填写当前主库地址；连接其他成员需要提供相应地址。
+|成员列表连接主库 |支持人工切换 |配置 `database.hosts`，使用默认 `database.capture.role=primary`，成员 `N_EP=1`；DBA 负责切换和隔离旧主。见 <<dameng-primary-standby-recovery,主备恢复>>。
+|物理备库采集 |支持指定构建 |配置成员列表 `database.hosts` 和 `database.capture.role=standby`；备库提供 LogMiner、SLSN、RPKG_LSN，主库负责信号写入和快照锁。见 <<dameng-standby-capture,备库采集>>。
 |VIP、代理、自动故障切换 |未验收 |现有回归使用成员地址列表和人工切换。
 |DMDSC、多可写主库、分布式多源 |不支持 |未实现多节点日志合并与恢复。
 |===
 
 只采集 `OPEN` 实例。主备成员须属于同一物理数据库家族，保持唯一可写主库、连续归档和一致的词法参数。
+拓扑和恢复身份依据连接后实际读取的角色判定：`NORMAL` 使用单机 `DB_MAGIC` 校验，`PRIMARY`、`STANDBY` 使用主备身份锚点校验，即使地址列表只有一个成员也不例外。
+默认 `primary` 采集只接受 `NORMAL/OPEN` 或 `PRIMARY/OPEN`；备库不能作为这两种角色的替代节点。
 旧 8.1.2.128 在备库注册 LogMiner 归档时返回 `-710`；8.1.3.162 的备库采集已有回归。强制有损 takeover 和脑裂恢复不在支持范围。
 
 [[dameng-case-sensitive]]
@@ -433,8 +385,7 @@ curl -fsS http://localhost:8083/connector-plugins
     "connector.class": "io.debezium.connector.dameng.DamengConnector",
     "tasks.max": "1",
     "topic.prefix": "dameng",
-    "database.hostname": "dm.example.com",
-    "database.port": "5236",
+    "database.hosts": "dm.example.com:5236",
     "database.user": "CDC_USER",
     "database.password": "${file:/secrets/dameng.properties:password}",
     "database.dbname": "DAMENG",
@@ -743,6 +694,11 @@ EXCHANGE 两端都不在当前采集或历史维护范围时直接过滤；任�
 模式 0、2、4、7 支持 `BACKSLASH_ESCAPE=0/1`。标识符规则见 <<dameng-case-sensitive,大小写>>。
 MySQL 可执行注释、`#` 注释和 PostgreSQL dollar string 不作为原生语法处理。
 
+`BACKSLASH_ESCAPE=1` 时，历史 DDL 中的字符串字面量及列注释按达梦实际行为解码；JDBC 默认值和 LogMiner DML 不重复解码，预编译参数中的字面反斜杠保留。
+已测 DM 8.1.3.162 将 `\n`、`\r`、`\t`、`\b`、`\f` 解释为控制字符，未知转义只保留后一个字符；值为 0 时，包括 `E'...'` 在内的字符串保留反斜杠。
+该构建在 `BACKSLASH_ESCAPE=1` 时，编译 DEFAULT 会保留成对反斜杠、加倍 Q 字面量中的反斜杠；一次 ADD 多列还会将已有及新列字符串默认值中的反斜杠再加倍一次，单列 ADD 不应用。
+旧 DM 8.1.2.128 的原生模式在值为 1 时仍保留反斜杠，多列 ADD 也不加倍；Connector 自动识别原生模式的构建差异。
+
 常量默认值按历史列类型转换，包括 DATE/TIME/TIMESTAMP 字面量及已实现 ISO 格式的 TO_DATE/TO_TIMESTAMP/TO_TIMESTAMP_TZ。
 CURRENT_TIMESTAMP、SYSDATE 和未实现格式的表达式不在 Connector 中求值，也不生成推测的 schema 默认值。
 `0x` 二进制常量支持奇数位左补零，定长 BINARY 在右侧补零；输出遵循 `binary.handling.mode`。
@@ -782,6 +738,7 @@ JSON 中 bytes 常呈 Base64；Decimal 的 JSON 表示还取决于 Converter 设
 === Decimal、时间和默认值
 
 `decimal.handling.mode=precise` 保留固定 scale 或 VariableScaleDecimal；string 输出十进制文本；double 可能损失有效位。
+受 Kafka Connect 的 Struct 默认值限制，VariableScaleDecimal 字段不附带 schema 默认值；数据库实际写入的默认数值仍正常采集，默认表达式保存在 schema history 中。
 
 普通 DATE、TIME、TIMESTAMP 默认 `time.precision.mode=sqlstring`，输出无逻辑类型名称、无时区的 STRING。
 需要旧 ISO 格式时显式配置 `isostring`。升级或修改此参数会改变字段 schema 和表示，下游须先适配。
@@ -999,18 +956,19 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`connector.class` |无，必填 |固定 `io.debezium.connector.dameng.DamengConnector`，不要写简称 `dameng`。
 |`tasks.max` |Worker 默认 `1` |达梦只允许一个 Task，大于 1 会报错。
 |`topic.prefix` |无，必填 |来源分区与 Topic 命名空间；使用字母、数字、点、横线和下划线。恢复时保持不变。
-|`database.hostname` |无 |单地址模式主机/IP；配置 failover.hosts 时可省略。
-|`database.port` |`5236` |JDBC 监听端口。
+|`database.hosts` |无，必填 |逗号分隔的成员 `host:port` 列表，端口必须显式填写，IPv6 写 `[address]:port`。单机填一个地址；主备环境填可供选择的成员地址，列表顺序不代表主备角色。
+|`database.capture.role` |`primary` |只接受 `primary`、`standby`。primary 从 OPEN NORMAL 单机或 OPEN PRIMARY 主库采集；standby 严格从 OPEN STANDBY 备库采集，并从同一地址列表选择主库写信号和加快照锁。见 <<dameng-standby-capture,备库采集>>。
 |`database.user` |无，必填 |CDC 账号，所需权限见数据库配置章节。
 |`database.password` |无 |CDC 账号密码；生产配置应使用 Worker 支持的外部配置提供器。
 |`database.dbname` |`DAMENG` |事件 source.db 和结构事件中的数据库名称，不选择 schema/PDB，不改变连接目标。
-|`database.failover.hosts` |空 |同一主备数据库的 `host:port` 列表，IPv6 写 `[address]:port`；覆盖 hostname/port，仅选择 OPEN PRIMARY。
-|`database.standby.hosts` |空 |备库采集地址列表；现有数据库地址连接主库写信号和加快照锁。两组使用相同账号，须为同一物理数据库家族。见 <<dameng-standby-capture,备库采集>>。
 |`database.standby.replay.timeout.ms` |`60000` |等待备库追平快照或水位边界的预算，必须为正；超时不确认未完成快照。
 |`database.connection.adapter` |`logminer` |唯一可用值为 logminer。
 |`database.socket.timeout.ms` |`600000` |正整数，映射 DM JDBC socketTimeout；不能另配 `database.socketTimeout`。
 |`database.query.timeout.ms` |`600000` |非负，正数向上取整为秒后应用 statement timeout；0 关闭语句超时，但不关闭网络和快照总时限。
 |===
+
+`database.hostname`、`database.port`、`database.failover.hosts`、`database.standby.hosts` 已移除，配置中出现任意一个都会报错。
+迁移时将地址合并到 `database.hosts`；原备库采集配置还须显式设置 `database.capture.role=standby`。
 
 === 表列过滤、Key 与字段处理
 
@@ -1226,6 +1184,7 @@ Worker 认证、业务 producer 认证和 history 客户端认证分别核对，
 
 升级前保存 REST 配置、Worker 支持的 `GET /connectors/{name}/offsets` 结果和旧镜像。
 缺失 `compatibility_signature` 或 `capture_scope` 的旧 offset 不能手工补造；通常用新 Connector 名称、`topic.prefix`、history Topic 和显式 `snapshot.mode=initial` 建立基线。
+原生模式的旧 offset 若未在兼容签名中记录 `NUMBER_MODE`，也须建立新的采集基线。
 回滚镜像前也须确认旧插件能读取新 offset/history 格式。
 
 === 显式放弃积压并重建基线
@@ -1262,8 +1221,9 @@ JMX 的 `RecoveryNonce`、`RecoveryBaselineLsn` 可确认当前世代。
 [id="dameng-primary-standby-recovery"]
 === 无 VIP 主备恢复
 
-配置 `database.failover.hosts=dm-a.example.com:5236,dm-b.example.com:5236`，成员须为同一物理数据库家族、`N_EP=1`，保持唯一 OPEN PRIMARY。
-驱动固定 `loginMode=1`、`loginStatus=4`、`rwSeparate=0`、`autoReconnect=0`、`switchTimes=1`、`switchInterval=200`，禁止冲突覆盖。
+配置 `database.hosts=dm-a.example.com:5236,dm-b.example.com:5236`，使用默认 `database.capture.role=primary`，成员须为同一物理数据库家族、`N_EP=1`，保持唯一 OPEN PRIMARY。
+地址顺序不表示主备角色，连接按数据库报告的角色选择并校验；不能通过地址数量推断单机或主备拓扑。
+驱动的角色路由由 Connector 管理，固定 `loginStatus=4`、`rwSeparate=0`、`autoReconnect=0`、`switchTimes=1`、`switchInterval=200`，禁止冲突覆盖。
 重连由 Connector 按 `errors.max.retries` 管理，未确认事件可能重放。
 
 切换步骤：
@@ -1274,24 +1234,24 @@ JMX 的 `RecoveryNonce`、`RecoveryBaselineLsn` 可确认当前世代。
 
 Connector 校验 PERMANENT_MAGIC、SYS.SYSOPENHISTORY 锚点、来源主库链和已应用 LSN。
 open history 最多 128 条；锚点丢失、时间戳排序歧义、应用 LSN 倒退或归档分叉均停止。高当前 LSN 不能代替这些检查。
-旧单地址 offset 没有主备锚点，不能仅添加 failover.hosts 升级，应新建身份/基线，或接受有损恢复。
+没有主备身份锚点的旧单机 offset，不能仅向地址列表添加主备成员来升级，应建立新的采集身份和初始快照基线。
 
 [id="dameng-standby-capture"]
 === 备库采集
 
-使用支持备库 LogMiner 的构建，在主库地址配置之外增加：
+使用支持备库 LogMiner 的构建，将主备候选成员填写在同一个地址列表，并显式选择备库采集：
 
 [source,json]
 ----
 {
-  "database.failover.hosts": "dm-a.example.com:5236,dm-b.example.com:5236",
-  "database.standby.hosts": "dm-a.example.com:5236,dm-b.example.com:5236",
+  "database.hosts": "dm-a.example.com:5236,dm-b.example.com:5236",
+  "database.capture.role": "standby",
   "database.standby.replay.timeout.ms": "60000",
   "signal.data.collection": "CDC.DBZ_SIGNAL"
 }
 ----
 
-两组列表可相同，驱动分别选择主库和备库，两条连接使用相同账号。
+驱动从 `database.hosts` 中分别选择当前主库和备库，两条连接使用相同账号，成员必须属于同一物理数据库家族。
 
 [cols="2,5",options="header"]
 |===
@@ -1491,7 +1451,7 @@ docker run --rm --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules \
 |compatibility_signature 不匹配/缺失 |旧插件 offset、模式/词法/大小写参数、主备参数一致性 |不要填造签名。只有确认临时设置期间没生成受影响历史，才可还原设置恢复，否则新基线。
 |内存/事务数/单 SQL 上限或磁盘失败 |具体错误字段、SQL 连续片段、并发事务、落盘可用容量/权限 |调整对应资源或负载后重启；队列、事务缓存、单 SQL 是不同预算。不能跳过超限事务。
 |主备切换后停止 |唯一 OPEN PRIMARY、身份锚点、应用 LSN、归档连续性 |由 DBA 修复主备状态并保留 history/offset；高当前 LSN 不足以证明旧确认数据已复制。
-|备库 -710 |实际构建、STANDBY 角色及失败的 SQL |旧 8.1.2.128 构建的 JDBC LogMiner 注册归档受角色限制；8.1.3.162 备库采集需配置 database.standby.hosts，信号 DDL/DML 路由到主库。业务 SQL 或水位误写备库也会报此错误，不能通过放开任意备库写入解决。
+|备库 -710 |实际构建、STANDBY 角色及失败的 SQL |旧 8.1.2.128 构建的 JDBC LogMiner 注册归档受角色限制；8.1.3.162 备库采集需配置 database.capture.role=standby，信号 DDL/DML 路由到主库。业务 SQL 或水位误写备库也会报此错误，不能通过放开任意备库写入解决。
 |Kafka 2.0 history 创建失败 |history Topic 是否预建、单分区和保留策略 |按部署章节预创建，检查认证与权限；延长 timeout 不修复协议不兼容。
 |Grafana 无数据 |Task 是否运行、Agent 是否加载、Exporter 是否有对应规则、新版 JAR、标签筛选 |先 curl metrics，再查 Prometheus target 和 Grafana；缺 series 不当成数值零。
 |===

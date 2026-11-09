@@ -25,6 +25,17 @@ class DamengOffsetContextTest {
     private final DamengConnectorConfig config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
 
     @Test
+    void shouldRejectResumingAPrimaryStandbyOffsetOnAStandaloneDatabase() {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
+        final var offset = new DamengOffsetContext(config, 100);
+        offset.validatePrimaryStandbyIdentity(new DamengDatabaseIdentity(1, 10, 150,
+                java.util.List.of(new DamengDatabaseIdentity.OpenRecord("open", java.time.Instant.EPOCH, 10, 0))));
+        final var restored = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        assertThatThrownBy(() -> restored.validateDatabaseMagic(10)).isInstanceOf(ConnectException.class)
+                .hasMessageContaining("lineage anchor", "standalone NORMAL");
+    }
+
+    @Test
     void shouldRoundTripRecoveryGenerationAndRejectInvalidRecoveryPositions() {
         final var offset = new DamengOffsetContext(config, 100);
         offset.setRecoveryBaseline("incident-1", 100);

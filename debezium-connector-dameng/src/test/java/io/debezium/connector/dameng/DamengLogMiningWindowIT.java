@@ -40,8 +40,8 @@ class DamengLogMiningWindowIT {
     @ValueSource(strings = { "commit", "rollback", "statement-failure", "savepoint-only", "bulk-update", "bulk-delete" })
     void shouldInspectRollbackMarkersWithoutAssumingExplicitSavepoints(String outcome) throws Exception {
         final var table = DamengTestDatabase.schema() + ".DBZ_BOUNDARY_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-        try (var miner = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build());
+        try (var miner = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
+                .with("password", DamengTestDatabase.password()).build());
                 var writer = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password())) {
             miner.execute("CREATE TABLE " + table + " (ID INT PRIMARY KEY, NAME VARCHAR(30), CHECK(ID>0))");
             try {
@@ -106,8 +106,8 @@ class DamengLogMiningWindowIT {
     @ValueSource(strings = { "commit", "savepoint", "rollback" })
     void shouldExposeTransactionOutcomeWhenMiningStartsInsideATransaction(String outcome) throws Exception {
         final var table = DamengTestDatabase.schema() + ".DBZ_WINDOW_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-        try (var miner = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build());
+        try (var miner = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
+                .with("password", DamengTestDatabase.password()).build());
                 var writer = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password())) {
             miner.execute("CREATE TABLE " + table + " (ID INT PRIMARY KEY, NAME VARCHAR(30))");
             try {
@@ -171,8 +171,8 @@ class DamengLogMiningWindowIT {
     @ValueSource(booleans = { false, true })
     void shouldDistinguishEmptySavepointRollbackFromFullRollback(boolean full) throws Exception {
         final var table = DamengTestDatabase.schema() + ".DBZ_EMPTY_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-        try (var miner = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build());
+        try (var miner = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
+                .with("password", DamengTestDatabase.password()).build());
                 var writer = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password())) {
             miner.execute("CREATE TABLE " + table + " (ID INT PRIMARY KEY)");
             try {

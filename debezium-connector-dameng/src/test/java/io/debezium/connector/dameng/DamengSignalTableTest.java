@@ -41,7 +41,7 @@ class DamengSignalTableTest {
 
     @BeforeEach
     void before() throws Exception {
-        connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doReturn("1").when(connection).getCaseSensitiveFlag();
         columns = mock(ResultSetMetaData.class);
         final var result = mock(ResultSet.class);

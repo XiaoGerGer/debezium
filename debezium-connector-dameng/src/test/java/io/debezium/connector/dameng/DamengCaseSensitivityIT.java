@@ -54,7 +54,7 @@ class DamengCaseSensitivityIT extends AbstractAsyncEngineConnectorTest {
             sql.execute("CREATE TABLE \"Dbz_App\".\"Dbz_NoPk\" (\"Id\" INT, \"VaLuE\" VARCHAR(30))");
             sql.execute("INSERT INTO " + qualified + " VALUES (1, 'AbC', 9)");
             final var config = Configuration.create().with("topic.prefix", "case")
-                    .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                    .with("database.hosts", DamengTestDatabase.hosts())
                     .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                     .with("database.dbname", "DAMENG")
                     .with("schema.include.list", "(?-i)" + schemaName)
@@ -193,7 +193,7 @@ class DamengCaseSensitivityIT extends AbstractAsyncEngineConnectorTest {
         DamengTestDatabase.start(0, 0, sensitive);
         final var evidence = new StringBuilder("CASE_SENSITIVE=").append(sensitive).append('\n');
         try (var connection = new DamengConnection(Configuration.create()
-                .with("hostname", DamengTestDatabase.hostname()).with("port", DamengTestDatabase.port())
+                .with("hosts", DamengTestDatabase.hosts())
                 .with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build())) {
             final long start = connection.currentLsn();
             connection.execute("CREATE TABLE Dbz_Mixed (Id INT PRIMARY KEY, VaLuE VARCHAR(30))",

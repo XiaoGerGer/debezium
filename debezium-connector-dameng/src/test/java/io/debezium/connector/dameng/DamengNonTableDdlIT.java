@@ -134,7 +134,7 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
         execute("INSERT INTO " + table + " VALUES(0,'snapshot')");
         config = Configuration.create()
                 .with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
                 .with("table.include.list", Pattern.quote(table))
@@ -147,7 +147,7 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
         waitForStreamingRunning("dameng", "dameng");
 
         try (var miner = new DamengConnection(Configuration.create()
-                .with("hostname", DamengTestDatabase.hostname()).with("port", DamengTestDatabase.port())
+                .with("hosts", DamengTestDatabase.hosts())
                 .with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build())) {
             final long objectId = miner.getTableObjectId(new TableId(null, schema, prefix + "_DATA"));
             final long startLsn = miner.currentLsn();
@@ -332,7 +332,7 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
         evidence.put("scope", "six recycle-bin purge forms; live CDC, offline replay and same-name table recreation");
 
         try (var miner = new DamengConnection(Configuration.create()
-                .with("hostname", DamengTestDatabase.hostname()).with("port", DamengTestDatabase.port())
+                .with("hosts", DamengTestDatabase.hosts())
                 .with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build())) {
             // Snapshot the new incarnation while the old table and its index remain in the bin.
             final long oldObjectId = prepareRecycledTable(tableName, indexName, miner);
@@ -345,7 +345,7 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
             evidence.put("liveObjectId", objectId);
             config = Configuration.create()
                     .with("topic.prefix", "dameng")
-                    .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                    .with("database.hosts", DamengTestDatabase.hosts())
                     .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                     .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
                     .with("table.include.list", Pattern.quote(table))
@@ -434,7 +434,7 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
         evidence.put("scope", "captured dependent tables removed by live/offline DROP SCHEMA CASCADE; unchanged persisted history and restart with opt-in disabled");
         config = Configuration.create()
                 .with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
                 .with("table.include.list", Pattern.quote(table) + "," + Pattern.quote(victims.get(0).toString()) + "," + Pattern.quote(victims.get(1).toString()))
@@ -457,7 +457,7 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
         }
         final var history = java.nio.file.Files.readAllLines(directory.resolve("history.dat"));
         try (var miner = new DamengConnection(Configuration.create()
-                .with("hostname", DamengTestDatabase.hostname()).with("port", DamengTestDatabase.port())
+                .with("hosts", DamengTestDatabase.hosts())
                 .with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build())) {
             startEngine();
             waitForStreamingRunning("dameng", "dameng");

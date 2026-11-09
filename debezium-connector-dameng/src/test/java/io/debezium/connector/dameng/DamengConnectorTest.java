@@ -26,10 +26,10 @@ class DamengConnectorTest {
         final var connector = new DamengConnector();
         final Map<String, String> configuration = new HashMap<>(DamengTestConfiguration.configuration().build().asMap());
         connector.start(configuration);
-        configuration.put("database.hostname", "changed");
+        configuration.put("database.hosts", "changed");
 
         assertThat(connector.taskConfigs(1)).hasSize(1);
-        assertThat(connector.taskConfigs(1).get(0).get("database.hostname")).isEqualTo("localhost");
+        assertThat(connector.taskConfigs(1).get(0).get("database.hosts")).isEqualTo("localhost:5236");
         assertThat(connector.taskClass()).isEqualTo(DamengConnectorTask.class);
         assertThatThrownBy(() -> connector.taskConfigs(2)).isInstanceOf(IllegalArgumentException.class);
         connector.stop();
@@ -75,13 +75,13 @@ class DamengConnectorTest {
     }
 
     @Test
-    void shouldReportDatabaseValidationFailureOnHostnameAndCloseTheConnection() throws Exception {
+    void shouldReportDatabaseValidationFailureOnHostsAndCloseTheConnection() throws Exception {
         final var config = DamengTestConfiguration.configuration().build();
         try (var connections = mockConstruction(DamengConnection.class,
                 (connection, context) -> when(connection.connection()).thenThrow(new SQLException("primary unavailable", "08001")))) {
             final var result = new DamengConnector().validate(config.asMap());
 
-            assertThat(result.configValues()).filteredOn(value -> value.name().equals(DamengConnectorConfig.HOSTNAME.name()))
+            assertThat(result.configValues()).filteredOn(value -> value.name().equals(DamengConnectorConfig.HOSTS.name()))
                     .singleElement().satisfies(value -> assertThat(value.errorMessages()).containsExactly("Unable to connect to Dameng: primary unavailable"));
             assertThat(connections.constructed()).hasSize(1);
             verify(connections.constructed().get(0)).close();
@@ -90,11 +90,11 @@ class DamengConnectorTest {
 
     @Test
     void shouldRejectInvalidFieldsBeforeOpeningADatabaseConnection() {
-        final var config = DamengTestConfiguration.configuration().with("database.port", "not-a-port").build();
+        final var config = DamengTestConfiguration.configuration().with("database.hosts", "localhost:not-a-port").build();
         try (var connections = mockConstruction(DamengConnection.class)) {
             final var result = new DamengConnector().validate(config.asMap());
 
-            assertThat(result.configValues()).filteredOn(value -> value.name().equals(DamengConnectorConfig.PORT.name()))
+            assertThat(result.configValues()).filteredOn(value -> value.name().equals(DamengConnectorConfig.HOSTS.name()))
                     .singleElement().satisfies(value -> assertThat(value.errorMessages()).isNotEmpty());
             assertThat(connections.constructed()).isEmpty();
         }

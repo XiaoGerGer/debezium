@@ -332,8 +332,8 @@ class DamengStandbyIT extends AbstractAsyncEngineConnectorTest {
     }
 
     private Configuration.Builder configuration(DamengPrimaryStandbyEnvironment environment, String table) {
-        return Configuration.create().with("topic.prefix", "dameng").with("database.failover.hosts", environment.endpoints())
-                .with("database.standby.hosts", environment.endpoints())
+        return Configuration.create().with("topic.prefix", "dameng").with("database.hosts", environment.endpoints())
+                .with("database.capture.role", "standby")
                 .with("database.user", DamengPrimaryStandbyEnvironment.USER).with("database.password", DamengPrimaryStandbyEnvironment.PASSWORD)
                 .with("table.include.list", "SYSDBA\\." + table).with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())

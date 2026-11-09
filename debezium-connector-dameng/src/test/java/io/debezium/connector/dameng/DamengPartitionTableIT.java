@@ -94,7 +94,7 @@ class DamengPartitionTableIT extends AbstractAsyncEngineConnectorTest {
         }
         execute("CREATE TABLE " + qualified("MARKER") + "(ID INT PRIMARY KEY,K INT,V VARCHAR(30))");
         config = Configuration.create().with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
                 .with("schema.include.list", SCHEMA).with("snapshot.mode", "initial")
@@ -216,7 +216,7 @@ class DamengPartitionTableIT extends AbstractAsyncEngineConnectorTest {
             included.add(Pattern.quote(peer));
         }
         config = Configuration.create().with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
                 .with("table.include.list", String.join(",", included)).with("snapshot.mode", "initial")

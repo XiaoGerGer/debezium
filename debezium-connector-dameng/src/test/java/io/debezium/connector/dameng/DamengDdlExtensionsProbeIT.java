@@ -29,8 +29,7 @@ class DamengDdlExtensionsProbeIT {
         assumeTrue(System.getProperty("dameng.hostname") == null, "Probe owns its database");
         DamengTestDatabase.start();
         final var evidence = new StringBuilder();
-        try (var connection = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user())
+        try (var connection = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
                 .with("password", DamengTestDatabase.password()).build());
                 var jdbc = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password())) {
             jdbc.setAutoCommit(true);
@@ -137,8 +136,7 @@ class DamengDdlExtensionsProbeIT {
         assumeTrue(System.getProperty("dameng.hostname") == null, "Probe owns its database");
         DamengTestDatabase.start();
         final var evidence = new StringBuilder();
-        try (var connection = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user())
+        try (var connection = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
                 .with("password", DamengTestDatabase.password()).build());
                 var jdbc = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password())) {
             jdbc.setAutoCommit(true);

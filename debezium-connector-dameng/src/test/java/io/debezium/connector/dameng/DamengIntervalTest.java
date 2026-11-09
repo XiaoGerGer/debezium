@@ -161,7 +161,7 @@ class DamengIntervalTest {
     @Test
     void shouldReadIntervalsThroughStandardJdbcStringInterfaceIncludingNull() throws Exception {
         final var result = mock(ResultSet.class);
-        final var connection = new DamengConnection(JdbcConfiguration.create().build());
+        final var connection = new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build());
         final var column = column("INTERVAL DAY TO SECOND");
         when(result.getString(2)).thenReturn("INTERVAL -'2 3:4:5.000001' DAY TO SECOND", null);
         assertThat(connection.getColumnValue(result, 2, column, null)).isEqualTo("INTERVAL -'2 3:4:5.000001' DAY TO SECOND");
@@ -180,7 +180,7 @@ class DamengIntervalTest {
         when(metadata.getInt(7)).thenReturn(25);
         when(metadata.getInt(11)).thenReturn(java.sql.DatabaseMetaData.columnNullable);
         when(metadata.getInt(17)).thenReturn(2);
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doReturn("1").when(connection).getCaseSensitiveFlag();
         final var column = connection.readTableColumn(metadata, new TableId(null, "APP", "T"), null).orElseThrow().create();
         assertThat(column.jdbcType()).isEqualTo(Types.OTHER);

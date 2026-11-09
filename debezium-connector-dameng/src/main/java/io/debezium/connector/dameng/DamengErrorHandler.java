@@ -22,11 +22,8 @@ import io.debezium.relational.history.SchemaHistoryException;
 
 /** Classifies connection failures without retrying invalid schemas or missing archives. */
 public final class DamengErrorHandler extends ErrorHandler {
-    private final boolean failoverEnabled;
-
     public DamengErrorHandler(DamengConnectorConfig config, ChangeEventQueue<?> queue, ErrorHandler previous) {
         super(DamengConnector.class, config, queue, previous);
-        failoverEnabled = config.requiresDatabaseLineage();
     }
 
     boolean canRetry(Throwable failure) {
@@ -78,9 +75,9 @@ public final class DamengErrorHandler extends ErrorHandler {
                 // an in-flight transaction interrupted by manual MOUNT as
                 // -6508 / 25000, or a query racing with MOUNT as -510 / 22000.
                 // These require rebuilding the role-routed sessions.
-                if (failoverEnabled && (sql.getErrorCode() == 6091
+                if (sql.getErrorCode() == 6091
                         || (sql.getErrorCode() == -6508 && "25000".equals(sql.getSQLState()))
-                        || (sql.getErrorCode() == -510 && "22000".equals(sql.getSQLState())))) {
+                        || (sql.getErrorCode() == -510 && "22000".equals(sql.getSQLState()))) {
                     connectionFailure = true;
                 }
                 if (sql.getSQLState() != null && sql.getSQLState().startsWith("08")) {

@@ -124,8 +124,7 @@ class DamengOracleCompatibilityIT extends AbstractAsyncEngineConnectorTest {
         final var initialDefaults = stringDefaults(TABLE);
         config = Configuration.create()
                 .with("topic.prefix", "ora")
-                .with("database.hostname", DamengTestDatabase.hostname())
-                .with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user())
                 .with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", "DAMENG")

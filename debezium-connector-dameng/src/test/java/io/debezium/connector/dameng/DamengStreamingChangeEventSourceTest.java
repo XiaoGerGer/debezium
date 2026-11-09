@@ -96,7 +96,7 @@ class DamengStreamingChangeEventSourceTest {
         when(context.isRunning()).thenAnswer(invocation -> running.get());
         config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dm")
                 .with("log.mining.window.strategy", "fixed")
-                .with("database.hostname", "localhost").with("database.user", "APP").with("database.password", "test")
+                .with("database.hosts", "localhost:5236").with("database.user", "APP").with("database.password", "test")
                 .with("table.include.list", "APP.T").build());
         connection = mock(DamengConnection.class);
         when(connection.createDdlParser()).thenReturn(new DamengDdlParser());
@@ -195,8 +195,9 @@ class DamengStreamingChangeEventSourceTest {
         @ParameterizedTest
         @ValueSource(strings = { "fixed", "archive_bytes" })
         void shouldBoundStandbyMiningByCompletedReplayInsteadOfReceivedArchives(String strategy) throws Exception {
-            config = new DamengConnectorConfig(config.getConfig().edit().with("database.standby.hosts", "replica:5236")
+            config = new DamengConnectorConfig(config.getConfig().edit().with("database.capture.role", "standby")
                     .with("log.mining.window.strategy", strategy).build());
+            when(connection.requiresDatabaseLineage()).thenReturn(true);
             createSource();
             when(connection.readStandbyProgress()).thenReturn(new DamengConnection.StandbyProgress(140, 125));
             records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
@@ -217,8 +218,9 @@ class DamengStreamingChangeEventSourceTest {
         @ParameterizedTest
         @ValueSource(strings = { "fixed", "archive_bytes" })
         void shouldRejectAStandbyReplayRegressionBeforePublishingAnyRecords(String strategy) throws Exception {
-            config = new DamengConnectorConfig(config.getConfig().edit().with("database.standby.hosts", "replica:5236")
+            config = new DamengConnectorConfig(config.getConfig().edit().with("database.capture.role", "standby")
                     .with("log.mining.window.strategy", strategy).build());
+            when(connection.requiresDatabaseLineage()).thenReturn(true);
             createSource();
             when(connection.readStandbyProgress()).thenReturn(new DamengConnection.StandbyProgress(150, 150), new DamengConnection.StandbyProgress(100, 100));
             records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
@@ -231,7 +233,8 @@ class DamengStreamingChangeEventSourceTest {
 
         @Test
         void shouldStopBeforeRebindingACachedWindowToANewPrimaryGeneration() throws Exception {
-            config = new DamengConnectorConfig(config.getConfig().edit().with("database.standby.hosts", "replica:5236").build());
+            config = new DamengConnectorConfig(config.getConfig().edit().with("database.capture.role", "standby").build());
+            when(connection.requiresDatabaseLineage()).thenReturn(true);
             createSource();
             doThrow(new SQLException("primary changed", "08006")).when(connection).validateUnchangedPrimary();
             final var offset = new DamengOffsetContext(config, 90);

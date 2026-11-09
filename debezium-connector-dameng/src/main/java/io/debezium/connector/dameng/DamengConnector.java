@@ -69,7 +69,7 @@ public final class DamengConnector extends RelationalBaseSourceConnector impleme
             connection.connection();
         }
         catch (Exception e) {
-            values.get(DamengConnectorConfig.HOSTNAME.name()).addErrorMessage("Unable to connect to Dameng: " + e.getMessage());
+            values.get(DamengConnectorConfig.HOSTS.name()).addErrorMessage("Unable to connect to Dameng: " + e.getMessage());
         }
     }
 

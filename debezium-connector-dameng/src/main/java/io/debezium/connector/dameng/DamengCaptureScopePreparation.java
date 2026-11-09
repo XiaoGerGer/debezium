@@ -85,7 +85,7 @@ final class DamengCaptureScopePreparation {
                 primaryConnection.setAutoCommit(false);
                 primaryConnection.rollback();
             }
-            final var before = config.requiresDatabaseLineage() ? reader.readPrimaryStandbyIdentity() : null;
+            final var before = reader.requiresDatabaseLineage() ? reader.readPrimaryStandbyIdentity() : null;
             final long magic = before == null ? reader.databaseMagic() : before.databaseMagic();
             final var nonRow = reader.readNonRowTableIds();
             for (TableId table : tables) {
@@ -132,7 +132,7 @@ final class DamengCaptureScopePreparation {
                 standby.validate(reader);
                 primary.validateUnchangedCompatibility();
             }
-            final var after = config.requiresDatabaseLineage() ? reader.readPrimaryStandbyIdentity() : null;
+            final var after = reader.requiresDatabaseLineage() ? reader.readPrimaryStandbyIdentity() : null;
             if (before != null) {
                 if (after.permanentMagic() != before.permanentMagic() || after.databaseMagic() != before.databaseMagic()
                         || after.readingDatabaseMagic() != before.readingDatabaseMagic() || !after.openGuid().equals(before.openGuid())) {

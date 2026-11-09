@@ -427,8 +427,7 @@ class DamengKafkaConnectIT {
         config.put("connector.class", CONNECTOR_CLASS);
         config.put("tasks.max", "1");
         config.put("topic.prefix", prefix);
-        config.put("database.hostname", "dameng");
-        config.put("database.port", "5236");
+        config.put("database.hosts", "dameng:5236");
         config.put("database.user", DamengKafkaConnectEnvironment.DATABASE_USER);
         config.put("database.password", DamengKafkaConnectEnvironment.DATABASE_PASSWORD);
         config.put("database.dbname", "DAMENG");

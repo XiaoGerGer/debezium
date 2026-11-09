@@ -117,7 +117,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
             connection.validateLogMiningConfiguration();
             connection.validateCompatibilityEnvironment(offset);
             ddlParser = connection.createDdlParser();
-            if (config.requiresDatabaseLineage()) {
+            if (connection.requiresDatabaseLineage()) {
                 connection.validatePrimaryStandbyIdentity(offset);
             }
             else {
@@ -132,7 +132,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
             metrics.onWindowStarted(offset.getLsn(), scannedThrough, 0);
             while (context.isRunning()) {
                 connection.validateUnchangedCompatibility();
-                if (config.requiresDatabaseLineage()) {
+                if (connection.requiresDatabaseLineage()) {
                     // Cached transactions may include an unacknowledged old-primary
                     // tail. A changed source generation requires a fresh buffer.
                     connection.validateUnchangedPrimary();

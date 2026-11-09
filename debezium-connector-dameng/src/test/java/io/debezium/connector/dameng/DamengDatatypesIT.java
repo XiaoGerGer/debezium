@@ -84,8 +84,7 @@ class DamengDatatypesIT extends AbstractAsyncEngineConnectorTest {
         table = "DBZ_TYPES_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12).toUpperCase();
         config = Configuration.create()
                 .with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname())
-                .with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user())
                 .with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))

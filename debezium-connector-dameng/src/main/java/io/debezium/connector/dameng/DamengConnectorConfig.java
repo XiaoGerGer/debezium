@@ -41,18 +41,20 @@ import io.debezium.spi.schema.DataCollectionId;
 
 public final class DamengConnectorConfig extends HistorizedRelationalDatabaseConnectorConfig {
     private static final Logger LOGGER = LoggerFactory.getLogger(DamengConnectorConfig.class);
-    public static final int DEFAULT_PORT = 5236;
-    public static final Field PORT = RelationalDatabaseConnectorConfig.PORT.withDefault(DEFAULT_PORT);
-    public static final Field HOSTNAME = RelationalDatabaseConnectorConfig.HOSTNAME.optional().withNoValidation()
-            .withValidation(DamengConnectorConfig::validateDamengHostname)
-            .withDescription("Resolvable hostname or IP address of the database server. Required unless database.failover.hosts is set.");
-    public static final Field FAILOVER_HOSTS = Field.create("database.failover.hosts")
-            .withDisplayName("Primary failover hosts").withType(Type.STRING).withDefault("")
+    public static final Field HOSTS = Field.create("database.hosts")
+            .withDisplayName("Database hosts").withType(Type.STRING).required()
             .withWidth(Width.LONG).withImportance(Importance.HIGH)
-            .withValidation(DamengConnectorConfig::validateFailoverHosts)
-            .withDescription("Optional comma-separated host:port endpoints belonging to one primary/standby database. "
-                    + "Use [IPv6]:port for IPv6 addresses. Overrides database.hostname and database.port. "
-                    + "The connector connects only to an OPEN PRIMARY and owns reconnects so offsets and schema history are restored together.");
+            .withValidation(DamengConnectorConfig::validateHosts)
+            .withDescription("Required comma-separated host:port endpoints belonging to one database. "
+                    + "Use one endpoint for a standalone database and [IPv6]:port for IPv6 addresses. "
+                    + "The connector selects nodes by their actual roles and owns reconnects so offsets and schema history are restored together.");
+    public static final Field CAPTURE_ROLE = Field.create("database.capture.role")
+            .withDisplayName("Capture role").withEnum(CaptureRole.class, CaptureRole.PRIMARY)
+            .withWidth(Width.SHORT).withImportance(Importance.HIGH)
+            .withValidation(DamengConnectorConfig::validateCaptureRole)
+            .withDescription("Capture from primary (the default, including standalone NORMAL databases) or standby. "
+                    + "Standby capture uses the same database.hosts list to select a primary for signal writes and snapshot locks, "
+                    + "and never falls back to primary capture. All endpoints must use the same credentials and belong to one physical database family.");
     public static final Field DATABASE_NAME = RelationalDatabaseConnectorConfig.DATABASE_NAME
             .withDefault("DAMENG");
     public static final Field TIME_PRECISION_MODE = RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE
@@ -60,13 +62,6 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             .withDescription("Dameng defaults to SQL-style strings without T or Z for DATE, TIME and ordinary TIMESTAMP values. "
                     + "Explicit isostring, adaptive, adaptive_time_microseconds, connect, microseconds and nanoseconds modes remain available. "
                     + "Changing this setting changes Kafka Connect field schemas and requires downstream consumers to adapt.");
-    public static final Field STANDBY_HOSTS = Field.create("database.standby.hosts")
-            .withDisplayName("Standby capture hosts").withType(Type.STRING).withDefault("")
-            .withWidth(Width.LONG).withImportance(Importance.HIGH)
-            .withValidation(DamengConnectorConfig::validateFailoverHosts)
-            .withDescription("Optional comma-separated host:port endpoints for OPEN STANDBY capture. When set, mining and snapshot reads use a standby; "
-                    + "database.failover.hosts or database.hostname/port select the primary for signal writes and snapshot locks. "
-                    + "All endpoints must belong to the same physical database family and use the same credentials. No fallback to primary capture.");
     public static final Field STANDBY_REPLAY_TIMEOUT_MS = Field.create("database.standby.replay.timeout.ms")
             .withDisplayName("Standby replay wait timeout").withType(Type.LONG).withDefault(60_000L)
             .withWidth(Width.MEDIUM).withImportance(Importance.MEDIUM).withValidation(Field::isPositiveLong)
@@ -201,7 +196,7 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             .excluding(RelationalDatabaseConnectorConfig.QUERY_TIMEOUT_MS)
             .excluding(RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE)
             .name("Dameng")
-            .type(HOSTNAME, PORT, FAILOVER_HOSTS, STANDBY_HOSTS, STANDBY_REPLAY_TIMEOUT_MS, DATABASE_NAME, SOCKET_TIMEOUT_MS, QUERY_TIMEOUT_MS,
+            .type(HOSTS, CAPTURE_ROLE, STANDBY_REPLAY_TIMEOUT_MS, DATABASE_NAME, SOCKET_TIMEOUT_MS, QUERY_TIMEOUT_MS,
                     RelationalDatabaseConnectorConfig.USER,
                     RelationalDatabaseConnectorConfig.PASSWORD)
             .connector(SNAPSHOT_MODE, SNAPSHOT_LOCKING_MODE, SNAPSHOT_MAX_DURATION_MS, RECOVERY_RESTART_NONCE,
@@ -215,17 +210,17 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             .create();
     public static final Field.Set ALL_FIELDS = Field.setOf(CONFIG_DEFINITION.all());
 
-    private static final Map<String, String> FAILOVER_DRIVER_PROPERTIES = Map.of(
+    private static final Map<String, String> CONTROLLED_DRIVER_PROPERTIES = Map.of(
             "loginMode", "1", "loginStatus", "4", "rwSeparate", "0", "autoReconnect", "0", "switchTimes", "1", "switchInterval", "200");
-    private static final Map<String, String> SINGLE_DRIVER_PROPERTIES = Map.of("rwSeparate", "0", "autoReconnect", "0");
     private static final Set<String> UNSAFE_DRIVER_PROPERTIES = Set.of("url", "host", "connection.factory.class", "dmsvcconf", "debezium", "unixsocketfile");
+    private static final List<String> REMOVED_CONNECTION_PROPERTIES = List.of("database.hostname", "database.port", "database.failover.hosts", "database.standby.hosts");
 
     private final SnapshotMode snapshotMode;
     private final SnapshotLockingMode snapshotLockingMode;
     private final ConnectorAdapter connectorAdapter;
     private final int logMiningBatchSize;
-    private final String failoverHosts;
-    private final String standbyHosts;
+    private final String hosts;
+    private final CaptureRole captureRole;
     private boolean caseInsensitiveIdentifiers;
     private List<TableId> signalTableIds;
 
@@ -263,6 +258,9 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
     public DamengConnectorConfig(Configuration config) {
         super(DamengConnector.class, withDefaultTimePrecision(config), new SystemTablesFilter(), table -> table.schema() + "." + table.table(), false,
                 ColumnFilterMode.SCHEMA, false);
+        validateRemovedConnectionProperties(config);
+        hosts = normalizeHosts(config.getString(HOSTS));
+        captureRole = CaptureRole.parse(config.getString(CAPTURE_ROLE));
         snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE), SnapshotMode.NO_DATA);
         if (validateRecoveryNonce(config, RECOVERY_RESTART_NONCE, (field, value, problem) -> {
         }) != 0) {
@@ -329,14 +327,8 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
         if (config.getString("database.socketTimeout") != null) {
             throw new IllegalArgumentException("Use database.socket.timeout.ms instead of database.socketTimeout for Dameng");
         }
-        failoverHosts = normalizeFailoverHosts(config.getString(FAILOVER_HOSTS));
-        standbyHosts = normalizeFailoverHosts(config.getString(STANDBY_HOSTS));
         if (getStandbyReplayTimeoutMs() <= 0) {
             throw new IllegalArgumentException("Dameng database.standby.replay.timeout.ms must be positive");
-        }
-        final var hostname = config.getString(HOSTNAME);
-        if (hostname != null && !hostname.isBlank()) {
-            validateHostValue(hostname);
         }
         validateDriverProperties(config);
     }
@@ -453,20 +445,16 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
         return getConfig().getString(DATABASE_NAME);
     }
 
-    public String getFailoverHosts() {
-        return failoverHosts;
+    public String getHosts() {
+        return hosts;
     }
 
-    public boolean isFailoverEnabled() {
-        return !failoverHosts.isEmpty();
+    public CaptureRole getCaptureRole() {
+        return captureRole;
     }
 
     public boolean isStandbyMiningEnabled() {
-        return !standbyHosts.isEmpty();
-    }
-
-    public boolean requiresDatabaseLineage() {
-        return isFailoverEnabled() || isStandbyMiningEnabled();
+        return captureRole == CaptureRole.STANDBY;
     }
 
     public long getStandbyReplayTimeoutMs() {
@@ -477,7 +465,7 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
     public JdbcConfiguration getJdbcConfig() {
         final var builder = JdbcConfiguration.copy(getPrimaryJdbcConfig());
         if (isStandbyMiningEnabled()) {
-            builder.with("failover.hosts", standbyHosts).with("standby.hosts", standbyHosts).with("loginMode", "2");
+            builder.with("capture.role", CaptureRole.STANDBY.getValue()).with("loginMode", "2");
         }
         return builder.build();
     }
@@ -486,16 +474,17 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
         final var builder = JdbcConfiguration.copy(super.getJdbcConfig())
                 .without("socket.timeout.ms")
                 .without("standby.hosts").without("standby.replay.timeout.ms")
-                .withPort(getConfig().getInteger(PORT))
+                .without("hostname").without("port").without("failover.hosts")
                 .with("socketTimeout", getSocketTimeoutMs())
-                .with("failover.hosts", failoverHosts)
+                .with("hosts", hosts)
+                .with("capture.role", CaptureRole.PRIMARY.getValue())
                 .withDatabase(getDatabaseName());
-        (requiresDatabaseLineage() ? FAILOVER_DRIVER_PROPERTIES : SINGLE_DRIVER_PROPERTIES).forEach(builder::with);
+        CONTROLLED_DRIVER_PROPERTIES.forEach(builder::with);
         return builder.build();
     }
 
     private Map<String, String> controlledDriverProperties() {
-        return requiresDatabaseLineage() ? FAILOVER_DRIVER_PROPERTIES : SINGLE_DRIVER_PROPERTIES;
+        return CONTROLLED_DRIVER_PROPERTIES;
     }
 
     private void validateDriverProperties(Configuration rawConfig) {
@@ -505,7 +494,7 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             final var normalized = key.replace("_", "").toLowerCase(Locale.ROOT);
             if (UNSAFE_DRIVER_PROPERTIES.contains(normalized)) {
                 throw new IllegalArgumentException("Dameng database." + key + " / driver." + key
-                        + " is not supported; configure database.hostname or database.failover.hosts");
+                        + " is not supported; configure database.hosts");
             }
             if (normalized.equals("autoreconnect") || normalized.equals("reconnect") || normalized.equals("doswitch")) {
                 if (!key.equals("autoReconnect") || !property.getValue().equals("0")) {
@@ -520,36 +509,23 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
                 }
             }
         }
-        for (String name : List.of("hostname", "port", "failover.hosts", "socketTimeout", "socket.timeout.ms")) {
-            if (rawConfig.getString("driver." + name) != null) {
-                throw new IllegalArgumentException("Use database." + (name.equals("socketTimeout") ? "socket.timeout.ms" : name)
-                        + " instead of driver." + name + " for Dameng");
+        for (var name : rawConfig.asMap().keySet()) {
+            if (name.startsWith("driver.")) {
+                final var normalized = name.substring("driver.".length()).replace("_", "").toLowerCase(Locale.ROOT);
+                if (Set.of("hosts", "capture.role", "hostname", "port", "failover.hosts", "standby.hosts").contains(normalized)) {
+                    throw new IllegalArgumentException("Dameng " + name + " is not supported; configure database.hosts and database.capture.role");
+                }
+                if (normalized.equals("sockettimeout") || normalized.equals("socket.timeout.ms")) {
+                    throw new IllegalArgumentException("Use database.socket.timeout.ms instead of " + name + " for Dameng");
+                }
             }
         }
     }
 
-    private static int validateDamengHostname(Configuration config, Field field, Field.ValidationOutput problems) {
-        final var value = config.getString(field);
-        if (value == null || value.isBlank()) {
-            if (config.getString(FAILOVER_HOSTS, "").isBlank()) {
-                problems.accept(field, value, "A hostname is required unless database.failover.hosts is configured");
-                return 1;
-            }
-            return 0;
-        }
+    private static int validateHosts(Configuration config, Field field, Field.ValidationOutput problems) {
         try {
-            validateHostValue(value);
-            return 0;
-        }
-        catch (IllegalArgumentException e) {
-            problems.accept(field, value, e.getMessage());
-            return 1;
-        }
-    }
-
-    private static int validateFailoverHosts(Configuration config, Field field, Field.ValidationOutput problems) {
-        try {
-            normalizeFailoverHosts(config.getString(field));
+            validateRemovedConnectionProperties(config);
+            normalizeHosts(config.getString(field));
             return 0;
         }
         catch (IllegalArgumentException e) {
@@ -558,31 +534,50 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
         }
     }
 
-    private static String normalizeFailoverHosts(String value) {
+    private static int validateCaptureRole(Configuration config, Field field, Field.ValidationOutput problems) {
+        try {
+            CaptureRole.parse(config.getString(field));
+            return 0;
+        }
+        catch (IllegalArgumentException e) {
+            problems.accept(field, config.getString(field), e.getMessage());
+            return 1;
+        }
+    }
+
+    private static void validateRemovedConnectionProperties(Configuration config) {
+        for (var name : REMOVED_CONNECTION_PROPERTIES) {
+            if (config.keys().contains(name)) {
+                throw new IllegalArgumentException("Dameng " + name + " has been removed; use database.hosts and database.capture.role instead");
+            }
+        }
+    }
+
+    private static String normalizeHosts(String value) {
         if (value == null || value.isBlank()) {
-            return "";
+            throw new IllegalArgumentException("Dameng database.hosts is required; use host:port or [IPv6]:port");
         }
         final List<String> endpoints = new ArrayList<>();
         for (String entry : value.split(",", -1)) {
             final var endpoint = entry.trim();
             final int separator = endpoint.lastIndexOf(':');
             if (separator <= 0 || separator == endpoint.length() - 1) {
-                throw new IllegalArgumentException("database.failover.hosts entries must use host:port or [IPv6]:port");
+                throw new IllegalArgumentException("database.hosts entries must use host:port or [IPv6]:port");
             }
             final var host = endpoint.substring(0, separator);
             validateHostValue(host);
             if (host.contains(":") && !(host.startsWith("[") && host.endsWith("]"))) {
-                throw new IllegalArgumentException("database.failover.hosts IPv6 addresses must be enclosed in brackets");
+                throw new IllegalArgumentException("database.hosts IPv6 addresses must be enclosed in brackets");
             }
             final int port;
             try {
                 port = Integer.parseInt(endpoint.substring(separator + 1));
             }
             catch (NumberFormatException e) {
-                throw new IllegalArgumentException("database.failover.hosts requires a numeric port", e);
+                throw new IllegalArgumentException("database.hosts requires a numeric port", e);
             }
             if (port < 1 || port > 65535) {
-                throw new IllegalArgumentException("database.failover.hosts ports must be between 1 and 65535");
+                throw new IllegalArgumentException("database.hosts ports must be between 1 and 65535");
             }
             endpoints.add(host + ':' + port);
         }
@@ -592,10 +587,10 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
     private static void validateHostValue(String value) {
         if (value.isBlank() || value.chars().anyMatch(character -> Character.isWhitespace(character)
                 || "/\\?#@&=,();${}".indexOf(character) >= 0)) {
-            throw new IllegalArgumentException("Dameng hostnames must contain only an address or service hostname, without JDBC URL parameters");
+            throw new IllegalArgumentException("Dameng database.hosts hostnames must contain only an address or service hostname, without JDBC URL parameters");
         }
         if ((value.contains("[") || value.contains("]")) && !(value.startsWith("[") && value.endsWith("]") && value.indexOf(']') == value.length() - 1)) {
-            throw new IllegalArgumentException("Dameng IPv6 brackets must enclose the whole hostname");
+            throw new IllegalArgumentException("Dameng database.hosts IPv6 brackets must enclose the whole hostname");
         }
     }
 
@@ -647,6 +642,31 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
     @Override
     public boolean supportsOperationFiltering() {
         return false;
+    }
+
+    public enum CaptureRole implements EnumeratedValue {
+        PRIMARY("primary"),
+        STANDBY("standby");
+
+        private final String value;
+
+        CaptureRole(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        static CaptureRole parse(String value) {
+            for (var role : values()) {
+                if (role.value.equalsIgnoreCase(value)) {
+                    return role;
+                }
+            }
+            throw new IllegalArgumentException("Unknown Dameng database.capture.role: " + value + ". Use primary or standby.");
+        }
     }
 
     public enum MiningWindowStrategy implements EnumeratedValue {

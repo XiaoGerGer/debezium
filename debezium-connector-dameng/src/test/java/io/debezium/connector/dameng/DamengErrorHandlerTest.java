@@ -23,7 +23,6 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import io.debezium.config.Configuration;
 import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.connector.dameng.logminer.LogMinerRow;
 import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer;
@@ -33,34 +32,21 @@ class DamengErrorHandlerTest {
     @TempDir
     Path directory;
     private final DamengErrorHandler handler = new DamengErrorHandler(
-            new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").build()), mock(ChangeEventQueue.class), null);
+            new DamengConnectorConfig(DamengTestConfiguration.configuration().build()), mock(ChangeEventQueue.class), null);
 
     @ParameterizedTest
-    @ValueSource(strings = { "database.failover.hosts", "database.standby.hosts" })
-    void shouldRetryObservedMountInterruptionOnlyForRoleControlledConnections(String hosts) {
-        final var mount = new SQLException("TRX interrupted by mount", "25000", -6508);
-        final var config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").with(hosts, "a:5236,b:5236").build());
+    @ValueSource(strings = { "primary", "standby" })
+    void shouldRetryObservedRoleAndMountInterruptions(String role) {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
+                .with("database.capture.role", role).build());
         final var roleHandler = new DamengErrorHandler(config, mock(ChangeEventQueue.class), null);
-        assertThat(roleHandler.isRetriable(mount)).isTrue();
-        final var mounted = new SQLException("System in mount status", "22000", -510);
-        assertThat(roleHandler.isRetriable(mounted)).isTrue();
-        assertThat(handler.isRetriable(mounted)).isFalse();
-        assertThat(roleHandler.isRetriable(new SQLException("different data error", "22000", -511))).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("TRX interrupted by mount", "25000", -6508))).isTrue();
+        assertThat(roleHandler.isRetriable(new SQLException("System in mount status", "22000", -510))).isTrue();
         assertThat(roleHandler.isRetriable(new SQLException("Server Mode invalid.", "", 6091))).isTrue();
-        assertThat(handler.isRetriable(mount)).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("different data error", "22000", -511))).isFalse();
         assertThat(roleHandler.isRetriable(new SQLException("unrelated transaction error", "25000", -6509))).isFalse();
         assertThat(roleHandler.isRetriable(new SQLException("different SQLState", "42000", -6508))).isFalse();
-    }
-
-    @Test
-    void shouldRetryNoEligiblePrimaryOnlyForConfiguredFailoverEndpoints() {
-        final var noPrimary = new SQLException("Server Mode invalid.", "", 6091);
-        assertThat(handler.isRetriable(noPrimary)).isFalse();
-        final var config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng")
-                .with("database.failover.hosts", "a:5236,b:5236").build());
-        final var failoverHandler = new DamengErrorHandler(config, mock(ChangeEventQueue.class), null);
-        assertThat(failoverHandler.isRetriable(noPrimary)).isTrue();
-        assertThat(failoverHandler.isRetriable(new SQLException("invalid password", "28000", 6002))).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("invalid password", "28000", 6002))).isFalse();
     }
 
     @Test
@@ -123,7 +109,7 @@ class DamengErrorHandlerTest {
 
     @Test
     void shouldShareTheRetryBudgetAcrossFailedStartsAndStreamingRestarts() {
-        final var config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").with("errors.max.retries", 2).build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("errors.max.retries", 2).build());
         final var first = new DamengErrorHandler(config, mock(ChangeEventQueue.class), null);
         assertThat(first.canRetry(new SQLException("connection refused", "08001"))).isTrue();
         assertThat(first.canRetry(new SQLException("invalid password", "28000"))).isFalse();

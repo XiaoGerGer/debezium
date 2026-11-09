@@ -75,8 +75,7 @@ class DamengDdlSyntaxProbeIT {
         final var evidence = new StringBuilder();
         evidence.append("compatibleMode=").append(DamengTestDatabase.requestedCompatibilityMode()).append('\n');
         evidence.append("sql=").append(sql).append('\n');
-        try (var connection = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user())
+        try (var connection = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
                 .with("password", DamengTestDatabase.password()).build())) {
             evidence.append("version=").append(connection.connection().getMetaData().getDatabaseProductVersion()).append('\n');
             final long start = connection.currentLsn();
@@ -148,8 +147,7 @@ class DamengDdlSyntaxProbeIT {
                 + sample.defaultExpression() + ")";
         final var evidence = Document.create().setString("case", sample.name())
                 .setNumber("compatibleMode", DamengTestDatabase.requestedCompatibilityMode()).setString("sql", sql);
-        try (var connection = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user())
+        try (var connection = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
                 .with("password", DamengTestDatabase.password()).build())) {
             final long start = connection.currentLsn();
             boolean created = false;

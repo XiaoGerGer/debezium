@@ -89,7 +89,7 @@ class DamengMaterializedViewFilterIT extends AbstractAsyncEngineConnectorTest {
         assertView(COMPLETE, List.of("1:one", "2:two"));
         assertView(FAST, List.of("1:one", "2:two"));
         config = Configuration.create().with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
                 .with("schema.include.list", SCHEMA)

@@ -19,7 +19,7 @@ class DamengQueryTimeoutTest {
     @ParameterizedTest
     @CsvSource({ "0,0", "1,1", "999,1", "1000,1", "1001,2", "2147483647,2147484" })
     void shouldRoundPositiveTimeoutUpToJdbcSeconds(int milliseconds, int seconds) throws Exception {
-        try (var connection = new DamengConnection(JdbcConfiguration.create().withQueryTimeoutMs(milliseconds).build())) {
+        try (var connection = new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").withQueryTimeoutMs(milliseconds).build())) {
             final var statement = mock(Statement.class);
             connection.initializeStatement(statement);
             verify(statement).setQueryTimeout(seconds);

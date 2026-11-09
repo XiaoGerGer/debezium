@@ -101,8 +101,7 @@ class DamengOracleNumberModeIT extends AbstractAsyncEngineConnectorTest {
         final var initial = readValues(TABLE, 1);
         config = Configuration.create()
                 .with("topic.prefix", "ora_num")
-                .with("database.hostname", DamengTestDatabase.hostname())
-                .with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user())
                 .with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", "DAMENG")

@@ -50,7 +50,7 @@ class DamengTableLogicLogIT extends AbstractAsyncEngineConnectorTest {
         final String qualified = DamengTestDatabase.schema() + "." + table;
         final var config = Configuration.create()
                 .with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", "DAMENG").with("table.include.list", qualified.replace(".", "\\."))
                 .with("schema.history.internal", FileSchemaHistory.class.getName())

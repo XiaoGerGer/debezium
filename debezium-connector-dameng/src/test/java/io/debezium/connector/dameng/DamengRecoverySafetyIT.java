@@ -99,7 +99,7 @@ class DamengRecoverySafetyIT extends AbstractAsyncEngineConnectorTest {
         config = Configuration.create()
                 .with("log.mining.window.strategy", System.getProperty("dameng.test.window.strategy", "archive_bytes"))
                 .with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", username).with("database.password", PASSWORD)
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
                 .with("table.include.list", DamengTestDatabase.schema() + "\\." + table)
@@ -243,7 +243,7 @@ class DamengRecoverySafetyIT extends AbstractAsyncEngineConnectorTest {
     @Test
     void shouldRecoverFromRepeatedConnectionFailuresDuringStartupAndStreaming() throws Exception {
         try (var proxy = new DamengTcpProxy(DamengTestDatabase.hostname(), DamengTestDatabase.port())) {
-            final var proxyConfig = config.edit().with("database.hostname", "127.0.0.1").with("database.port", proxy.port())
+            final var proxyConfig = config.edit().with("database.hosts", "127.0.0.1:" + proxy.port())
                     .with("database.socket.timeout.ms", 3000).with("database.query.timeout.ms", 3000)
                     .with("errors.max.retries", 50).with("retriable.restart.connector.wait.ms", 200).build();
             try {

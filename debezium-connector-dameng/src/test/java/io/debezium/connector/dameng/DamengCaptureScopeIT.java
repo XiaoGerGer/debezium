@@ -71,7 +71,7 @@ class DamengCaptureScopeIT extends AbstractAsyncEngineConnectorTest {
         insert(added, 1);
         writer.commit();
         config = Configuration.create().with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))
                 .with("table.include.list", included(false))

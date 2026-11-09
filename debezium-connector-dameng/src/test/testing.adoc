@@ -31,7 +31,7 @@ The table records test implementation coverage, not successful execution. Maven 
 
 |OracleJdbcConfigurationTest, OracleConnectionTest, ConnectionIT
 |DamengConnectorIT establishes JDBC and connector connections. DamengConnectionTest and DamengConnectionIT cover object identity, JDBC normalization and archived redo fixtures. DamengLogMiningConfigurationTest covers archive/logical logging requirements, optional compression parameters on older DM versions, mode 7 selection and rejection of unimplemented modes
-|DamengConnectionTest and DamengConnectorConfigTest additionally cover service-group failover URLs, primary/open role enforcement and rejection of unsafe driver routing. DamengRecoverySafetyIT covers non-DBA session termination and startup/streaming connection loss. Oracle TNS and RAC configuration do not apply; additional DM/JDBC versions remain unverified
+|DamengConnectionTest and DamengConnectorConfigTest additionally cover service-group URLs from database.hosts, primary/standby capture-role selection, open role enforcement and rejection of unsafe driver routing and removed connection parameters. DamengRecoverySafetyIT covers non-DBA session termination and startup/streaming connection loss. Oracle TNS and RAC configuration do not apply; additional DM/JDBC versions remain unverified
 
 |OraclePartitionTest
 |DamengPartitionTest inherits the common partition contract
@@ -646,9 +646,9 @@ Direct fixture probes additionally established a normal B restart and inspected 
 === Standby capture with primary signal writes
 
 `DamengStandbyIT` uses the same real backup/restore fixture with the default
-`dameng:8.1.3.162-20240621-rev232765` image. Both endpoint lists contain the two
-members: `database.failover.hosts` selects OPEN PRIMARY for writes and locks,
-and `database.standby.hosts` selects OPEN STANDBY for LogMiner and snapshot reads.
+`dameng:8.1.3.162-20240621-rev232765` image. `database.hosts` contains both members
+and `database.capture.role=standby` selects OPEN STANDBY for LogMiner and snapshot
+reads. The same endpoint list selects OPEN PRIMARY for writes and locks.
 It verifies initial snapshot rows, CRUD, automatically created primary signal
 tables, both watermark strategies with one-row chunks, persisted snapshot
 completion, role routing, JMX replay gauges, task restart, manual switchover and
@@ -697,7 +697,7 @@ or standalone Kafka Connect process tests, and does not resolve their previously
 documented failures. Docker images and the old plugin archive were not rebuilt
 by this acceptance invocation.
 
-The acceptance scope is one DM8 build and driver, one single-instance primary/standby pair (`N_EP=1`), administrator-managed role changes and DM-managed archives. The connector does not promote or fence servers. Missing open anchors after the 128-record history rotates, timestamp/apply-order ambiguity, incomplete lineage, insufficient applied LSNs, ambiguous overlapping archives and foreign database identity fail closed. Enabling `database.failover.hosts` on a single-server offset without HA anchors requires a fresh connector identity, schema history and initial snapshot. Forced lossy takeover, split brain, manually mixed archive branches, DMDSC and other DM versions are outside this demonstrated scope.
+The acceptance scope is one DM8 build and driver, one single-instance primary/standby pair (`N_EP=1`), administrator-managed role changes and DM-managed archives. The connector does not promote or fence servers. Missing open anchors after the 128-record history rotates, timestamp/apply-order ambiguity, incomplete lineage, insufficient applied LSNs, ambiguous overlapping archives and foreign database identity fail closed. Moving a single-server offset without HA anchors to primary/standby capture requires a fresh connector identity, schema history and initial snapshot. Forced lossy takeover, split brain, manually mixed archive branches, DMDSC and other DM versions are outside this demonstrated scope.
 
 `DamengCaptureScopeTest` covers signature stability and rejected changes, while `DamengSnapshotFilterIT` checks changed filters after a previously excluded table has been dropped and unchanged filters with offline creation or drop/recreation. An earlier coverage regression passed 4 `DamengRuntimeSafetyIT`, 3 `DamengSnapshotFilterIT` and 2 `DamengConstraintIT` cases; the constraint cases cover snapshot-derived named history through DDL/restart and null event keys for a UNIQUE-only table. Its 78 database integration tests included both then-existing primary/standby cases and all five 100,000-row scenarios. The earlier packaged Kafka Connect process run passed both of its cases; it is separate evidence from the 2026-10-21 standby acceptance above. Full external LOB streaming is outside the requested production acceptance scope and remains unsupported.
 

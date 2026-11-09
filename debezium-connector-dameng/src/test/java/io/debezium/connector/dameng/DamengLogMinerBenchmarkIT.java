@@ -414,7 +414,7 @@ class DamengLogMinerBenchmarkIT {
     }
 
     private static Configuration configuration() {
-        return Configuration.create().with("hostname", DamengTestDatabase.hostname()).with("port", DamengTestDatabase.port())
+        return Configuration.create().with("hosts", DamengTestDatabase.hosts())
                 .with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build();
     }
 }

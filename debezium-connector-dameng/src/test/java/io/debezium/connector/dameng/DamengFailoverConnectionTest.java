@@ -15,6 +15,7 @@ import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -61,7 +62,7 @@ class DamengFailoverConnectionTest {
 
     @Test
     void shouldWaitForReplicaReplayBeforeResumingAnAcknowledgedOffset() throws Exception {
-        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("database.standby.hosts", "replica:5236").build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("database.capture.role", "standby").build());
         try (var connection = spy(new DamengConnection(config.getJdbcConfig()))) {
             final var history = List.of(new DamengDatabaseIdentity.OpenRecord("open", Instant.EPOCH, 10, 0));
             final var ready = new DamengDatabaseIdentity(1, 10, 200, history, 20);
@@ -82,7 +83,7 @@ class DamengFailoverConnectionTest {
     @Test
     void shouldRouteCaptureOnlyToStandbyWithoutPassingInternalFlagsToDriver() throws Exception {
         final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
-                .with("database.standby.hosts", "a:5236,b:5237").build());
+                .with("database.hosts", "a:5236,b:5237").with("database.capture.role", "standby").build());
         final var jdbc = mock(Connection.class);
         final var statement = mock(Statement.class);
         when(jdbc.createStatement()).thenReturn(statement);
@@ -93,7 +94,7 @@ class DamengFailoverConnectionTest {
             final var properties = ArgumentCaptor.forClass(Properties.class);
             verify(drivers.constructed().get(0)).connect(eq("jdbc:dm://debezium?debezium=(a:5236,b:5237)"), properties.capture());
             assertThat(properties.getValue()).containsEntry("loginMode", "2").containsEntry("loginStatus", "4")
-                    .containsEntry("autoReconnect", "0").containsEntry("rwSeparate", "0").doesNotContainKeys("standby.hosts", "failover.hosts");
+                    .containsEntry("autoReconnect", "0").containsEntry("rwSeparate", "0").doesNotContainKeys("hosts", "capture.role", "hostname", "port");
         }
     }
 
@@ -115,7 +116,7 @@ class DamengFailoverConnectionTest {
     @Test
     void shouldPassTheControlledServiceGroupAndRoutingPropertiesToTheDriver() throws Exception {
         final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
-                .with("database.failover.hosts", "primary:5236,standby:5237").build());
+                .with("database.hosts", "primary:5236,standby:5237").build());
         final var jdbc = mock(Connection.class);
         final var statement = mock(Statement.class);
         when(jdbc.createStatement()).thenReturn(statement);
@@ -125,7 +126,7 @@ class DamengFailoverConnectionTest {
             verify(statement).execute("SET TIME ZONE '+00:00'");
             final var properties = ArgumentCaptor.forClass(Properties.class);
             verify(drivers.constructed().get(0)).connect(eq("jdbc:dm://debezium?debezium=(primary:5236,standby:5237)"), properties.capture());
-            assertThat(properties.getValue()).doesNotContainKeys("hostname", "host", "port", "failover.hosts")
+            assertThat(properties.getValue()).doesNotContainKeys("hostname", "host", "port", "hosts", "capture.role")
                     .containsEntry("loginMode", "1").containsEntry("loginStatus", "4")
                     .containsEntry("autoReconnect", "0").containsEntry("rwSeparate", "0")
                     .containsEntry("switchTimes", "1").containsEntry("switchInterval", "200");
@@ -133,8 +134,8 @@ class DamengFailoverConnectionTest {
     }
 
     @Test
-    void shouldPreserveSingleEndpointUrlsWithoutTransparentReconnection() throws Exception {
-        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("database.port", 5327).build());
+    void shouldRouteASingleEndpointWithoutTransparentReconnection() throws Exception {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("database.hosts", "localhost:5327").build());
         final var jdbc = mock(Connection.class);
         final var statement = mock(Statement.class);
         when(jdbc.createStatement()).thenReturn(statement);
@@ -143,14 +144,14 @@ class DamengFailoverConnectionTest {
             assertThat(connection.connection()).isSameAs(jdbc);
             verify(statement).execute("SET TIME ZONE '+00:00'");
             final var properties = ArgumentCaptor.forClass(Properties.class);
-            verify(drivers.constructed().get(0)).connect(eq("jdbc:dm://localhost:5327"), properties.capture());
+            verify(drivers.constructed().get(0)).connect(eq("jdbc:dm://debezium?debezium=(localhost:5327)"), properties.capture());
             assertThat(properties.getValue()).containsEntry("autoReconnect", "0").containsEntry("rwSeparate", "0")
-                    .doesNotContainKeys("failover.hosts", "loginMode");
+                    .containsEntry("loginMode", "1").doesNotContainKeys("hosts", "capture.role");
         }
     }
 
     @ParameterizedTest
-    @CsvSource({ "false,NORMAL,OPEN", "false,PRIMARY,OPEN", "true,PRIMARY,OPEN" })
+    @CsvSource({ "false,NORMAL,OPEN", "false,PRIMARY,OPEN", "true,PRIMARY,OPEN", "true,NORMAL,OPEN" })
     void shouldAcceptOnlyWritableSupportedRoles(boolean failover, String role, String status) throws Exception {
         try (var connection = connectionWithRole(failover, role, status)) {
             connection.validateServerRole();
@@ -158,7 +159,7 @@ class DamengFailoverConnectionTest {
     }
 
     @ParameterizedTest
-    @CsvSource({ "false,STANDBY,OPEN", "true,STANDBY,OPEN", "true,NORMAL,OPEN", "true,PRIMARY,MOUNT", "false,NORMAL,SUSPEND",
+    @CsvSource({ "false,STANDBY,OPEN", "true,STANDBY,OPEN", "true,PRIMARY,MOUNT", "false,NORMAL,SUSPEND",
             "true,PRIMARY,''", "false,'',OPEN" })
     void shouldTriggerTaskReconnectWhenTheSessionIsDemotedOrNotOpen(boolean failover, String role, String status) throws Exception {
         try (var connection = connectionWithRole(failover, role, status)) {
@@ -172,7 +173,7 @@ class DamengFailoverConnectionTest {
         try (var connection = connectionWithNewPrimaryHistory()) {
             doNothing().doThrow(new SQLException("Former primary was demoted", "08006")).when(connection).validateServerRole();
             final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
-                    .with("database.failover.hosts", "primary:5236,standby:5236").build());
+                    .with("database.hosts", "primary:5236,standby:5236").build());
             final var offset = new DamengOffsetContext(config, 150);
             assertThatThrownBy(() -> connection.validatePrimaryStandbyIdentity(offset))
                     .isInstanceOf(SQLException.class)
@@ -185,16 +186,90 @@ class DamengFailoverConnectionTest {
         try (var connection = connectionWithNewPrimaryHistory()) {
             doNothing().when(connection).validateServerRole();
             final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
-                    .with("database.failover.hosts", "primary:5236,standby:5236").build());
+                    .with("database.hosts", "primary:5236,standby:5236").build());
             final var offset = new DamengOffsetContext(config, 150);
             assertThatThrownBy(() -> connection.validatePrimaryStandbyIdentity(offset))
                     .isInstanceOf(ConnectException.class).hasMessageContaining("latest primary-open record");
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({ "false,NORMAL,false", "true,NORMAL,false", "false,PRIMARY,true", "true,PRIMARY,true" })
+    void shouldDetermineLineageFromTheObservedRoleInsteadOfTheEndpointCount(boolean multiple, String role, boolean lineage) throws Exception {
+        try (var connection = connectionWithRole(multiple, role, "OPEN")) {
+            assertThat(connection.requiresDatabaseLineage()).isEqualTo(lineage);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "NORMAL,PRIMARY", "PRIMARY,NORMAL" })
+    void shouldReconnectWhenTheObservedTopologyChanges(String initial, String latest) throws Exception {
+        try (var connection = connectionWithRole(false, initial, "OPEN")) {
+            connection.validateServerRole();
+            final var result = mock(ResultSet.class);
+            when(result.next()).thenReturn(true);
+            when(result.getString(1)).thenReturn(latest);
+            when(result.getString(2)).thenReturn("OPEN");
+            doAnswer(invocation -> invocation.<JdbcConnection.ResultSetMapper<Object>> getArgument(1).apply(result))
+                    .when(connection).queryAndMap(eq("SELECT MODE$, STATUS$ FROM V$INSTANCE"), any());
+            assertThatThrownBy(connection::validateServerRole).isInstanceOf(SQLException.class).hasMessageContaining("unchanged topology")
+                    .satisfies(error -> assertThat(((SQLException) error).getSQLState()).isEqualTo("08006"));
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "NORMAL,OPEN,true", "STANDBY,OPEN,false", "PRIMARY,OPEN,false", "NORMAL,MOUNT,false" })
+    void shouldAcceptOnlyAnOpenStandaloneWhenTheDriverRejectsPrimaryRouting(String role, String status, boolean accepted) throws Exception {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
+        final var jdbc = mock(Connection.class);
+        final var statement = mock(Statement.class);
+        final var result = mock(ResultSet.class);
+        when(jdbc.createStatement()).thenReturn(statement);
+        when(statement.executeQuery("SELECT MODE$, STATUS$ FROM V$INSTANCE")).thenReturn(result);
+        when(result.next()).thenReturn(true);
+        when(result.getString(1)).thenReturn(role);
+        when(result.getString(2)).thenReturn(status);
+        try (var drivers = mockConstruction(DmDriver.class, (driver, context) -> when(driver.connect(anyString(), any())).thenAnswer(invocation -> {
+            if ("1".equals(((Properties) invocation.getArgument(1)).getProperty("loginMode"))) {
+                throw new SQLException("Server Mode invalid", "", 6091);
+            }
+            return jdbc;
+        }));
+                var connection = new DamengConnection(config.getJdbcConfig())) {
+            if (accepted) {
+                assertThat(connection.connection()).isSameAs(jdbc);
+                verify(statement).execute("SET TIME ZONE '+00:00'");
+                verify(jdbc, never()).close();
+            }
+            else {
+                assertThatThrownBy(connection::connection).isInstanceOf(SQLException.class).hasMessageContaining("NORMAL/OPEN");
+                verify(jdbc).close();
+                verify(statement, never()).execute(anyString());
+            }
+            assertThat(drivers.constructed()).hasSize(2);
+            final var properties = ArgumentCaptor.forClass(Properties.class);
+            for (var driver : drivers.constructed()) {
+                verify(driver).connect(eq("jdbc:dm://debezium?debezium=(localhost:5236)"), properties.capture());
+            }
+            assertThat(properties.getAllValues()).extracting(value -> value.getProperty("loginMode")).containsExactly("1", "0");
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "primary,-70028", "primary,-6007", "standby,6091" })
+    void shouldNotRetryAuthenticationCommunicationOrStandbyFailuresAsStandalone(String role, int code) throws Exception {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("database.capture.role", role).build());
+        final var failure = new SQLException("connection rejected", "", code);
+        try (var drivers = mockConstruction(DmDriver.class, (driver, context) -> when(driver.connect(anyString(), any())).thenThrow(failure));
+                var connection = new DamengConnection(config.getJdbcConfig())) {
+            assertThatThrownBy(connection::connection).isSameAs(failure);
+            verify(drivers.constructed().get(0)).connect(anyString(), any());
+        }
+    }
+
     private DamengConnection connectionWithNewPrimaryHistory() throws Exception {
         final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
-                .with("database.failover.hosts", "primary:5236,standby:5236").build());
+                .with("database.hosts", "primary:5236,standby:5236").build());
         final var connection = spy(new DamengConnection(config.getJdbcConfig()));
         doReturn(10L).when(connection).databaseMagic();
         doReturn(300L).when(connection).currentLsn();
@@ -221,7 +296,7 @@ class DamengFailoverConnectionTest {
 
     private DamengConnection connectionWithRole(boolean failover, String role, String status) throws Exception {
         final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
-                .with("database.failover.hosts", failover ? "primary:5236,standby:5236" : "").build());
+                .with("database.hosts", failover ? "primary:5236,standby:5236" : "localhost:5236").build());
         final var connection = spy(new DamengConnection(config.getJdbcConfig()));
         final var result = mock(ResultSet.class);
         when(result.next()).thenReturn(true);

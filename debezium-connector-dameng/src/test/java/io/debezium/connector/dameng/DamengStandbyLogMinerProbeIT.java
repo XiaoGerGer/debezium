@@ -236,7 +236,7 @@ class DamengStandbyLogMinerProbeIT {
 
     private void probeCurrentConnectorAndReadOnlyOperations(String url) throws Exception {
         final var endpoint = URI.create(url.substring("jdbc:".length()));
-        final var config = Configuration.create().with("hostname", endpoint.getHost()).with("port", endpoint.getPort())
+        final var config = Configuration.create().with("hosts", endpoint.getRawAuthority()).with("capture.role", "standby")
                 .with("user", DamengPrimaryStandbyEnvironment.USER)
                 .with("password", DamengPrimaryStandbyEnvironment.PASSWORD).build();
         try (var connection = new DamengConnection(config)) {

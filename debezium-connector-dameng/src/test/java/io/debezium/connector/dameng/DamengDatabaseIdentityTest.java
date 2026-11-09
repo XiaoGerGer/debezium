@@ -21,7 +21,7 @@ import io.debezium.connector.dameng.DamengDatabaseIdentity.OpenRecord;
 class DamengDatabaseIdentityTest {
     @Test
     void shouldPersistSourceLineageAndValidateLocalArchivesSeparatelyFromTheReplicaIdentity() {
-        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("database.standby.hosts", "replica:5236").build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("database.capture.role", "standby").build());
         final var identity = new DamengDatabaseIdentity(1, 10, 200, List.of(open("a", 1, 10, 100)), 20);
         final var offset = new DamengOffsetContext(config, 150);
         offset.validatePrimaryStandbyIdentity(identity);

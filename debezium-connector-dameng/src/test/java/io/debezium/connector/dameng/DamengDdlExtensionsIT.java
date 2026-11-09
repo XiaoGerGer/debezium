@@ -69,7 +69,7 @@ class DamengDdlExtensionsIT extends AbstractAsyncEngineConnectorTest {
         prefix = "DBZ_P1_" + UUID.randomUUID().toString().replace("-", "").substring(0, 10).toUpperCase();
         config = Configuration.create()
                 .with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname()).with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user()).with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", "DAMENG").with("table.include.list", "SYSDBA\\." + prefix + ".*")
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
@@ -322,8 +322,8 @@ class DamengDdlExtensionsIT extends AbstractAsyncEngineConnectorTest {
             default -> "CREATE TABLE " + table + "(ID INT,V INT AS(ID+1) VIRTUAL)";
         });
         created.add(table);
-        try (var connection = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build())) {
+        try (var connection = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
+                .with("password", DamengTestDatabase.password()).build())) {
             assertThatThrownBy(() -> connection.readSchema(new Tables(), null, "SYSDBA", id -> id.table().equals(prefix + "_UNSAFE"), null, false))
                     .hasStackTraceContaining(kind.equals("VIRTUAL") ? "virtual/generated column" : "unsupported storage kind");
         }
@@ -332,8 +332,8 @@ class DamengDdlExtensionsIT extends AbstractAsyncEngineConnectorTest {
     @Test
     void shouldRejectSnapshotColumnsThatDifferOnlyByCase() throws Exception {
         create("_CASE", "(\"id\" INT,\"ID\" INT)");
-        try (var connection = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user()).with("password", DamengTestDatabase.password()).build())) {
+        try (var connection = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
+                .with("password", DamengTestDatabase.password()).build())) {
             assertThatThrownBy(() -> connection.readSchema(new Tables(), null, "SYSDBA", id -> id.table().equals(prefix + "_CASE"), null, false))
                     .hasMessageContaining("columns that differ only by case");
         }

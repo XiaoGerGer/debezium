@@ -29,7 +29,7 @@ final class DamengStandbySupport {
     }
 
     void initialize(DamengConnection reader) throws SQLException {
-        primaryIdentity = primary.readPrimaryStandbyIdentity();
+        primaryIdentity = readPrimaryIdentity();
         primary.validateLogMiningConfiguration();
         validate(reader);
         awaitReplay(reader, primary.currentLsn());
@@ -56,11 +56,19 @@ final class DamengStandbySupport {
     }
 
     private void validatePrimary() throws SQLException {
-        final var current = primary.readPrimaryStandbyIdentity();
+        final var current = readPrimaryIdentity();
         if (current.permanentMagic() != primaryIdentity.permanentMagic() || current.databaseMagic() != primaryIdentity.databaseMagic()
                 || !current.openGuid().equals(primaryIdentity.openGuid())) {
             throw new SQLException("Dameng primary changed during standby snapshot coordination; reconnect and restart the incomplete operation", "08006");
         }
+    }
+
+    private DamengDatabaseIdentity readPrimaryIdentity() throws SQLException {
+        final var identity = primary.readPrimaryStandbyIdentity();
+        if (!primary.requiresDatabaseLineage()) {
+            throw new SQLException("Dameng standby capture requires an OPEN PRIMARY for writes and snapshot locks; NORMAL servers are not eligible", "08006");
+        }
+        return identity;
     }
 
     long snapshotBoundary(DamengConnection reader) throws SQLException {

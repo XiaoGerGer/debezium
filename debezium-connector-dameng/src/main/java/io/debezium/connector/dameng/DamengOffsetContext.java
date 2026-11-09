@@ -179,6 +179,9 @@ public final class DamengOffsetContext extends CommonOffsetContext<SourceInfo> {
 
     /** Binds legacy offsets once and rejects positions belonging to another database incarnation. */
     public void validateDatabaseMagic(long currentDatabaseMagic) {
+        if (permanentMagic != null || primaryOpenGuid != null) {
+            throw new ConnectException("Stored Dameng offset contains a primary/standby lineage anchor; refusing to resume it on a standalone NORMAL database");
+        }
         if (databaseMagic != null && databaseMagic != currentDatabaseMagic) {
             throw new ConnectException("Stored Dameng offset belongs to database magic " + databaseMagic
                     + " but the connected database has magic " + currentDatabaseMagic
@@ -191,7 +194,7 @@ public final class DamengOffsetContext extends CommonOffsetContext<SourceInfo> {
         if (databaseMagic != null) {
             if (permanentMagic == null || primaryOpenGuid == null) {
                 throw new ConnectException("Stored Dameng offset has no primary/standby lineage anchor. "
-                        + "Use a new connector identity and fresh snapshot/history before enabling database.failover.hosts");
+                        + "Use a new connector identity and fresh snapshot/history before capturing a primary/standby database");
             }
             identity.validateResume(permanentMagic, databaseMagic, primaryOpenGuid,
                     Math.max(getLsn(), Math.max(getChangeLsn(), getCommitLsn())));

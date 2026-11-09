@@ -175,7 +175,8 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldHoldPrimaryLocksBeforeChoosingAReplayedStandbySnapshotBoundary() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().with("database.standby.hosts", "replica:5236").build());
+        final var source = source(DamengTestConfiguration.configuration().with("database.capture.role", "standby").build());
+        when(connection.requiresDatabaseLineage()).thenReturn(true);
         final var primary = mock(DamengConnection.class);
         final var standby = mock(DamengStandbySupport.class);
         when(standby.primary()).thenReturn(primary);

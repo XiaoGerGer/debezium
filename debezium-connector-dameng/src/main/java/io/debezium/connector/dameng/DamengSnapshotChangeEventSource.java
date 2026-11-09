@@ -389,7 +389,7 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
 
     private void validateDatabaseIdentity(DamengOffsetContext offset) throws SQLException {
         connection.validateCompatibilityEnvironment(offset);
-        if (config.requiresDatabaseLineage()) {
+        if (connection.requiresDatabaseLineage()) {
             connection.validatePrimaryStandbyIdentity(offset);
         }
         else {

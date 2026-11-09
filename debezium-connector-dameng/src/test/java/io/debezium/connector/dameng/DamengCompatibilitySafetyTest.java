@@ -198,7 +198,7 @@ class DamengCompatibilitySafetyTest {
         }
         final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, parameters);
         final var offset = new DamengOffsetContext(config, 100);
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doReturn(initial).when(connection).getCompatibilityEnvironment();
         connection.validateCompatibilityEnvironment(offset);
         final var entries = new java.util.ArrayList<>(parameters.entrySet());
@@ -235,7 +235,7 @@ class DamengCompatibilitySafetyTest {
         parameters.putAll(Map.of("BACKSLASH_ESCAPE", "1", "NATIVE_BACKSLASH_SEMANTICS", "raw"));
         final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, parameters);
         final var offset = new DamengOffsetContext(config, 100);
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doReturn(initial).when(connection).getCompatibilityEnvironment();
         connection.validateCompatibilityEnvironment(offset);
         final var entries = new java.util.ArrayList<>(parameters.entrySet());
@@ -301,7 +301,7 @@ class DamengCompatibilitySafetyTest {
     @ParameterizedTest
     @ValueSource(strings = { "0", "2", "4", "7" })
     void shouldCheckLiveParametersWithoutRebindingAChangedSnapshotOrOffset(String mode) throws Exception {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         final Map<String, String> parameters = new HashMap<>(environment("0").parameters());
         if (!mode.equals("0")) {
             parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0", "MY_STRICT_TABLES", "1"));

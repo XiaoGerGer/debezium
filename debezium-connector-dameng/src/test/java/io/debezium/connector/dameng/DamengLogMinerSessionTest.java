@@ -26,7 +26,7 @@ import io.debezium.jdbc.JdbcConfiguration;
 class DamengLogMinerSessionTest {
     @Test
     void shouldEndThePreviousMiningSessionBeforeAddingTheNextWindow() throws Exception {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         final var sql = new ArrayList<String>();
         doReturn(List.of(new ArchiveLogFile("first.arc", 1, 100, 11, 0))).when(connection).archiveLogsForRange(anyLong(), anyLong());
         doAnswer(invocation -> {
@@ -49,7 +49,7 @@ class DamengLogMinerSessionTest {
 
     @Test
     void shouldKeepSessionInactiveWhenTheFirstWindowCannotStart() throws Exception {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         final var sql = new ArrayList<String>();
         doReturn(List.of(new ArchiveLogFile("first.arc", 1, 100, 11, 0))).when(connection).archiveLogsForRange(anyLong(), anyLong());
         doAnswer(invocation -> {

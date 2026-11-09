@@ -352,6 +352,10 @@ final class DamengTestDatabase {
         return port;
     }
 
+    static String hosts() {
+        return (hostname.contains(":") ? "[" + hostname + "]" : hostname) + ":" + port;
+    }
+
     static String jdbcUrl() {
         return jdbcUrl;
     }

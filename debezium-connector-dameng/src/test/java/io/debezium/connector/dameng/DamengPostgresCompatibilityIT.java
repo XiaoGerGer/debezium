@@ -113,8 +113,7 @@ class DamengPostgresCompatibilityIT extends AbstractAsyncEngineConnectorTest {
         assertThat(initial.get("V")).isEqualTo(backslash == 1 ? DEFAULT.replace("\\n", "\n") : DEFAULT);
         config = Configuration.create()
                 .with("topic.prefix", "pg")
-                .with("database.hostname", DamengTestDatabase.hostname())
-                .with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user())
                 .with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", "DAMENG")

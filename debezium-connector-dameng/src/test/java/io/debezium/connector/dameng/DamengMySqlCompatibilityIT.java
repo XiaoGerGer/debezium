@@ -126,8 +126,7 @@ class DamengMySqlCompatibilityIT extends AbstractAsyncEngineConnectorTest {
         assertThat(initial.get(name("v"))).isEqualTo(backslashEscape ? DEFAULT.replace("\\n", "\n") : DEFAULT);
         config = Configuration.create()
                 .with("topic.prefix", "mysql")
-                .with("database.hostname", DamengTestDatabase.hostname())
-                .with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user())
                 .with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", "DAMENG")

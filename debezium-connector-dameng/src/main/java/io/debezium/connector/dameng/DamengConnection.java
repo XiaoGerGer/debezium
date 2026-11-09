@@ -6,6 +6,7 @@
 package io.debezium.connector.dameng;
 
 import java.nio.charset.Charset;
+import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -54,13 +55,10 @@ import io.debezium.relational.Tables.TableFilter;
 /** JDBC connection and DM-specific LogMiner operations. */
 public class DamengConnection extends JdbcConnection {
     private static final Logger LOGGER = LoggerFactory.getLogger(DamengConnection.class);
-    public static final String URL = "url";
-    // DM treats the path component as a schema name. The database name is not part of
-    // the JDBC URL and is retained by the connector only as source metadata.
-    private static final String URL_PATTERN = "jdbc:dm://${hostname}:${port}";
     private boolean logMiningStarted;
     private Charset databaseCharset;
     private Boolean caseInsensitive;
+    private Boolean databaseLineageRequired;
     private DamengDatabaseIdentity primaryStandbyIdentity;
     private DamengCompatibilityEnvironment compatibilityEnvironment;
 
@@ -94,13 +92,12 @@ public class DamengConnection extends JdbcConnection {
     private static ConnectionFactory connectionFactory(JdbcConfiguration config) {
         final var factory = JdbcConnection.patternBasedFactory(connectionUrlPattern(config), "dm.jdbc.driver.DmDriver", DamengConnection.class.getClassLoader());
         return jdbcConfig -> {
-            final var driverConfig = JdbcConfiguration.copy(jdbcConfig).without("failover.hosts").without("standby.hosts");
-            if (isFailoverEnabled(config)) {
-                // The endpoint list in the URL owns routing. The raw hostname and
-                // port properties must not change the driver's service resolution.
-                driverConfig.without("hostname").without("port");
-            }
-            final var connection = factory.connect(driverConfig.build());
+            // Only the service URL owns address selection. Connector options must
+            // not become driver properties or override its service resolution.
+            final var driverConfig = JdbcConfiguration.copy(jdbcConfig)
+                    .without("hosts").without("capture.role").without("standby.replay.timeout.ms")
+                    .without("hostname").without("port");
+            final var connection = connect(factory, driverConfig.build(), !"standby".equals(config.getString("capture.role", "primary")));
             try (var statement = connection.createStatement()) {
                 statement.execute("SET TIME ZONE '+00:00'");
                 return connection;
@@ -117,19 +114,51 @@ public class DamengConnection extends JdbcConnection {
         };
     }
 
-    static String connectionUrlPattern(JdbcConfiguration config) {
-        if (isFailoverEnabled(config)) {
-            return "jdbc:dm://debezium?debezium=(" + config.getString("failover.hosts") + ")";
+    private static Connection connect(ConnectionFactory factory, JdbcConfiguration config, boolean primary) throws SQLException {
+        try {
+            return factory.connect(config);
         }
-        return URL_PATTERN;
+        catch (SQLException e) {
+            // loginMode=1 excludes standalone NORMAL servers. Only a role-selection
+            // failure permits a mode-0 attempt, and that connection must be NORMAL/OPEN.
+            // Authentication and communication failures retain their original cause.
+            if (!primary || e.getErrorCode() != 6091) {
+                throw e;
+            }
+            final var normal = factory.connect(JdbcConfiguration.copy(config).with("loginMode", "0").build());
+            try (var statement = normal.createStatement();
+                    var result = statement.executeQuery("SELECT MODE$, STATUS$ FROM V$INSTANCE")) {
+                if (!result.next() || !"NORMAL".equalsIgnoreCase(result.getString(1)) || !"OPEN".equalsIgnoreCase(result.getString(2))) {
+                    throw new SQLException("Dameng standalone connection requires NORMAL/OPEN; no eligible primary or standalone server is available", "08006");
+                }
+                return normal;
+            }
+            catch (SQLException failure) {
+                failure.addSuppressed(e);
+                try {
+                    normal.close();
+                }
+                catch (SQLException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                throw failure;
+            }
+        }
     }
 
-    private static boolean isFailoverEnabled(JdbcConfiguration config) {
-        return !config.getString("failover.hosts", "").isBlank();
+    static String connectionUrlPattern(JdbcConfiguration config) {
+        return "jdbc:dm://debezium?debezium=(" + config.getString("hosts") + ")";
     }
 
     public boolean isStandbyMining() {
-        return !config().getString("standby.hosts", "").isBlank();
+        return "standby".equals(config().getString("capture.role", "primary"));
+    }
+
+    boolean requiresDatabaseLineage() throws SQLException {
+        if (databaseLineageRequired == null) {
+            validateServerRole();
+        }
+        return databaseLineageRequired;
     }
 
     /** Checks the live session because an existing primary connection can be demoted in place. */
@@ -141,12 +170,15 @@ public class DamengConnection extends JdbcConnection {
             final var mode = result.getString(1);
             final var status = result.getString(2);
             final boolean primary = "PRIMARY".equalsIgnoreCase(mode);
-            final boolean singleServer = !isFailoverEnabled(config()) && "NORMAL".equalsIgnoreCase(mode);
-            final boolean expectedRole = isStandbyMining() ? "STANDBY".equalsIgnoreCase(mode) : primary || singleServer;
-            if (!expectedRole || !"OPEN".equalsIgnoreCase(status)) {
-                throw new SQLException("Dameng CDC requires an OPEN " + (isStandbyMining() ? "STANDBY" : isFailoverEnabled(config()) ? "PRIMARY" : "NORMAL or PRIMARY")
-                        + " server; actual MODE$=" + mode + ", STATUS$=" + status + ". Reconnect to the configured capture role.", "08006");
+            final boolean standalone = "NORMAL".equalsIgnoreCase(mode);
+            final boolean expectedRole = isStandbyMining() ? "STANDBY".equalsIgnoreCase(mode) : primary || standalone;
+            final boolean lineage = !standalone;
+            if (!expectedRole || !"OPEN".equalsIgnoreCase(status)
+                    || (databaseLineageRequired != null && databaseLineageRequired != lineage)) {
+                throw new SQLException("Dameng CDC requires an OPEN " + (isStandbyMining() ? "STANDBY" : "NORMAL or PRIMARY")
+                        + " server with unchanged topology; actual MODE$=" + mode + ", STATUS$=" + status + ". Reconnect to the configured capture role.", "08006");
             }
+            databaseLineageRequired = lineage;
             return null;
         });
     }

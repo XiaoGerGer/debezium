@@ -106,8 +106,7 @@ class DamengLexicalSettingsIT extends AbstractAsyncEngineConnectorTest {
         final var snapshotValues = databaseRow(1);
         config = Configuration.create()
                 .with("topic.prefix", "dameng")
-                .with("database.hostname", DamengTestDatabase.hostname())
-                .with("database.port", DamengTestDatabase.port())
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", DamengTestDatabase.user())
                 .with("database.password", DamengTestDatabase.password())
                 .with("database.dbname", "DAMENG")

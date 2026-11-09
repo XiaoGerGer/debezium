@@ -84,8 +84,7 @@ class DamengMaterializedViewRedoProbeIT {
         report.set("positiveControl", JSON.createArrayNode());
         try (var observer = connect();
                 var writer = connect();
-                var miner = new DamengConnection(Configuration.create().with("hostname", DamengTestDatabase.hostname())
-                        .with("port", DamengTestDatabase.port()).with("user", DamengTestDatabase.user())
+                var miner = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
                         .with("password", DamengTestDatabase.password()).build())) {
             observer.setAutoCommit(true);
             writer.setAutoCommit(false);

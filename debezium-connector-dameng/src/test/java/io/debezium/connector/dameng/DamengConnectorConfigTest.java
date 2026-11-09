@@ -8,6 +8,7 @@ package io.debezium.connector.dameng;
 import static io.debezium.connector.dameng.DamengTestConfiguration.configuration;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mockConstruction;
 
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.junit.jupiter.api.Test;
@@ -15,6 +16,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import io.debezium.config.Configuration;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.TableId;
@@ -87,32 +89,63 @@ class DamengConnectorConfigTest {
     }
 
     @Test
-    void shouldKeepStandbyReadsAndPrimaryWritesOnSeparateControlledRoutes() {
-        final var raw = configuration().with("database.failover.hosts", "a:5236,b:5236")
-                .with("database.standby.hosts", " b:5236,a:5236 ").build();
+    void shouldKeepStandbyReadsAndPrimaryWritesOnTheSameMemberList() {
+        final var raw = configuration().with("database.hosts", " a:5236, b:5237 ")
+                .with("database.capture.role", "standby").build();
         final var config = new DamengConnectorConfig(raw);
         assertThat(config.isStandbyMiningEnabled()).isTrue();
-        assertThat(config.requiresDatabaseLineage()).isTrue();
-        assertThat(config.getJdbcConfig().getString("failover.hosts")).isEqualTo("b:5236,a:5236");
+        assertThat(config.getCaptureRole()).isEqualTo(DamengConnectorConfig.CaptureRole.STANDBY);
+        assertThat(config.getHosts()).isEqualTo("a:5236,b:5237");
+        assertThat(config.getJdbcConfig().getString("hosts")).isEqualTo("a:5236,b:5237");
+        assertThat(config.getJdbcConfig().getString("capture.role")).isEqualTo("standby");
         assertThat(config.getJdbcConfig().getInteger("loginMode")).isEqualTo(2);
         assertThat(config.getJdbcConfig().getInteger("loginStatus")).isEqualTo(4);
-        assertThat(config.getPrimaryJdbcConfig().getString("failover.hosts")).isEqualTo("a:5236,b:5236");
+        assertThat(config.getPrimaryJdbcConfig().getString("hosts")).isEqualTo("a:5236,b:5237");
+        assertThat(config.getPrimaryJdbcConfig().getString("capture.role")).isEqualTo("primary");
         assertThat(config.getPrimaryJdbcConfig().getInteger("loginMode")).isEqualTo(1);
-        assertThat(config.getPrimaryJdbcConfig().hasKey("standby.hosts")).isFalse();
         assertThat(config.getStandbyReplayTimeoutMs()).isEqualTo(60_000);
-        final var direct = new DamengConnectorConfig(configuration().with("database.standby.hosts", "replica:5236").build());
-        assertThat(direct.requiresDatabaseLineage()).isTrue();
-        assertThat(direct.isFailoverEnabled()).isFalse();
-        assertThat(direct.getPrimaryJdbcConfig().getString("hostname")).isEqualTo("localhost");
-        assertThat(direct.getPrimaryJdbcConfig().getInteger("loginMode")).isEqualTo(1);
+        assertThat(config.getJdbcConfig().asMap()).doesNotContainKeys("hostname", "port", "failover.hosts", "standby.hosts");
+        assertThat(config.getPrimaryJdbcConfig().asMap()).doesNotContainKeys("hostname", "port", "failover.hosts", "standby.hosts");
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "bad", "bad:0", "bad:5236?loginMode=1", "bad:5236," })
-    void shouldRejectInvalidStandbyEndpoints(String endpoints) {
-        final var raw = configuration().with("database.standby.hosts", endpoints).build();
-        assertThatThrownBy(() -> new DamengConnectorConfig(raw)).isInstanceOf(IllegalArgumentException.class);
-        assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("database.standby.hosts").errorMessages()).isNotEmpty();
+    @ValueSource(strings = { "primary", "standby" })
+    void shouldUseExplicitCaptureRolesForSingleAndMultipleEndpoints(String role) {
+        for (var hosts : new String[]{ "node:5236", "a:5236,b:5237" }) {
+            final var raw = configuration().with("database.hosts", hosts).with("database.capture.role", role).build();
+            final var config = new DamengConnectorConfig(raw);
+            assertThat(config.getHosts()).isEqualTo(hosts);
+            assertThat(config.getCaptureRole().getValue()).isEqualTo(role);
+            assertThat(config.isStandbyMiningEnabled()).isEqualTo(role.equals("standby"));
+            assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("database.capture.role").errorMessages()).isEmpty();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "", " ", "unknown", "normal", "auto", "primary,standby" })
+    void shouldRejectUnknownOrEmptyCaptureRolesBeforeOpeningJdbc(String role) {
+        final var raw = configuration().with("database.capture.role", role).build();
+        assertThatThrownBy(() -> new DamengConnectorConfig(raw)).hasMessageContaining("database.capture.role");
+        assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("database.capture.role").errorMessages()).isNotEmpty();
+        assertRejectedBeforeJdbc(raw, "database.capture.role", "database.capture.role");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "database.hostname", "database.port", "database.failover.hosts", "database.standby.hosts" })
+    void shouldRejectRemovedEndpointSettingsWithAndWithoutTheNewMemberList(String property) {
+        assertThat(DamengConnectorConfig.configDef().configKeys()).doesNotContainKey(property);
+        for (var value : new String[]{ "", "legacy:5236" }) {
+            for (var includeHosts : new boolean[]{ false, true }) {
+                final var builder = configuration().with(property, value);
+                if (!includeHosts) {
+                    builder.without("database.hosts");
+                }
+                final var raw = builder.build();
+                assertThatThrownBy(() -> new DamengConnectorConfig(raw)).hasMessageContaining(property, "database.hosts");
+                assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("database.hosts").errorMessages()).isNotEmpty();
+                assertRejectedBeforeJdbc(raw, "database.hosts", property, "database.hosts");
+            }
+        }
     }
 
     @Test
@@ -241,7 +274,10 @@ class DamengConnectorConfigTest {
         assertThat(config.getConfig().getString(DamengConnectorConfig.TIME_PRECISION_MODE)).isEqualTo("sqlstring");
         assertThat(DamengConnectorConfig.configDef().configKeys().get("time.precision.mode").defaultValue).isEqualTo("sqlstring");
         assertThat(config.getDatabaseName()).isEqualTo("DAMENG");
-        assertThat(config.getConfig().getInteger(DamengConnectorConfig.PORT)).isEqualTo(5236);
+        assertThat(config.getHosts()).isEqualTo("localhost:5236");
+        assertThat(config.getCaptureRole()).isEqualTo(DamengConnectorConfig.CaptureRole.PRIMARY);
+        assertThat(config.isStandbyMiningEnabled()).isFalse();
+        assertThat(DamengConnectorConfig.configDef().configKeys().get("database.capture.role").defaultValue).isEqualTo("primary");
         assertThat(config.getSnapshotMode()).isEqualTo(DamengConnectorConfig.SnapshotMode.NO_DATA);
         assertThat(config.getSnapshotMode().includeSchema()).isTrue();
         assertThat(config.getSnapshotMode().includeData()).isFalse();
@@ -258,7 +294,10 @@ class DamengConnectorConfigTest {
         assertThat(config.getSnapshotMaxDurationMs()).isEqualTo(600_000L);
         assertThat(config.getSocketTimeoutMs()).isEqualTo(600_000);
         assertThat(config.getJdbcConfig().getInteger("socketTimeout")).isEqualTo(600_000);
-        assertThat(config.isFailoverEnabled()).isFalse();
+        assertThat(config.getJdbcConfig().getString("hosts")).isEqualTo("localhost:5236");
+        assertThat(config.getJdbcConfig().getString("capture.role")).isEqualTo("primary");
+        assertThat(config.getJdbcConfig().getInteger("loginMode")).isEqualTo(1);
+        assertThat(config.getJdbcConfig().getInteger("loginStatus")).isEqualTo(4);
         assertThat(config.getJdbcConfig().getInteger("autoReconnect")).isZero();
         assertThat(config.getJdbcConfig().getInteger("rwSeparate")).isZero();
     }
@@ -271,40 +310,41 @@ class DamengConnectorConfigTest {
     }
 
     @Test
-    void shouldConfigureOnlyOpenPrimariesFromExplicitFailoverEndpoints() {
-        final var raw = configuration().without("database.hostname")
-                .with("database.failover.hosts", " dm-primary:5236, [2001:db8::2]:5237 ").build();
+    void shouldNormalizeMemberEndpointsAndControlPrimarySelection() {
+        final var raw = configuration().with("database.hosts", " dm-primary:5236, [2001:db8::2]:5237 ").build();
         final var config = new DamengConnectorConfig(raw);
-        assertThat(config.isFailoverEnabled()).isTrue();
-        assertThat(config.getFailoverHosts()).isEqualTo("dm-primary:5236,[2001:db8::2]:5237");
+        assertThat(config.getHosts()).isEqualTo("dm-primary:5236,[2001:db8::2]:5237");
+        assertThat(config.getJdbcConfig().getString("hosts")).isEqualTo(config.getHosts());
         assertThat(config.getJdbcConfig().getInteger("loginMode")).isEqualTo(1);
         assertThat(config.getJdbcConfig().getInteger("loginStatus")).isEqualTo(4);
         assertThat(config.getJdbcConfig().getInteger("autoReconnect")).isZero();
         assertThat(config.getJdbcConfig().getInteger("rwSeparate")).isZero();
         assertThat(config.getJdbcConfig().getInteger("switchTimes")).isEqualTo(1);
         assertThat(config.getJdbcConfig().getInteger("switchInterval")).isEqualTo(200);
-        assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("database.hostname").errorMessages()).isEmpty();
-        assertThat(configuration().without("database.hostname").build().validate(DamengConnectorConfig.ALL_FIELDS)
-                .get("database.hostname").errorMessages()).isNotEmpty();
+        assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("database.hosts").errorMessages()).isEmpty();
+    }
+
+    @Test
+    void shouldRejectMissingMemberEndpointsBeforeOpeningJdbc() {
+        final var raw = configuration().without("database.hosts").build();
+        assertThatThrownBy(() -> new DamengConnectorConfig(raw)).hasMessageContaining("database.hosts");
+        assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("database.hosts").errorMessages()).isNotEmpty();
+        assertRejectedBeforeJdbc(raw, "database.hosts", "database.hosts");
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "host", "host:0", "host:65536", "host:abc", "host:5236,", ",host:5236", "2001:db8::2:5236", "host:5236?loginMode=2",
-            "host/path:5236", "host&loginMode=2:5236", "host):5236", "host@other:5236" })
-    void shouldRejectMalformedOrInjectedFailoverEndpoints(String endpoints) {
-        assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("database.failover.hosts", endpoints).build()))
-                .isInstanceOf(IllegalArgumentException.class);
+    @ValueSource(strings = { "", " ", "host", "host:0", "host:65536", "host:abc", "host:5236,", ",host:5236", "2001:db8::2:5236",
+            "host:5236?loginMode=2", "host/path:5236", "host&loginMode=2:5236", "host):5236", "host@other:5236", "${url}:5236" })
+    void shouldRejectMalformedOrInjectedMemberEndpointsBeforeOpeningJdbc(String endpoints) {
+        final var raw = configuration().with("database.hosts", endpoints).build();
+        assertThatThrownBy(() -> new DamengConnectorConfig(raw)).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("database.hosts");
+        assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("database.hosts").errorMessages()).isNotEmpty();
+        assertRejectedBeforeJdbc(raw, "database.hosts", "database.hosts");
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "localhost?loginMode=2", "localhost/path", "localhost#fragment", "localhost&autoReconnect=1", "localhost@other", "${url}" })
-    void shouldRejectJdbcParametersInsideSingleHostnames(String hostname) {
-        assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("database.hostname", hostname).build()))
-                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("hostname");
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = { "database.url", "driver.url", "database.host", "driver.host", "driver.hostname", "driver.port", "driver.failover.hosts",
+    @ValueSource(strings = { "database.url", "driver.url", "database.host", "driver.host", "driver.hostname", "driver.port", "driver.hosts", "driver.capture.role",
+            "driver.failover.hosts",
             "database.connection.factory.class", "database.dmsvcconf", "database.unixSocketFile", "database.debezium" })
     void shouldRejectUncontrolledConnectionRouting(String property) {
         assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with(property, "other").build()))
@@ -321,14 +361,14 @@ class DamengConnectorConfigTest {
     @ParameterizedTest
     @ValueSource(strings = { "database.loginMode", "driver.loginMode", "database.loginStatus", "database.switchTimes", "database.switchInterval",
             "driver.LOGIN_MODE" })
-    void shouldRejectOverridesOfFailoverSelectionAndRetryPolicy(String property) {
-        assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("database.failover.hosts", "primary:5236,standby:5236")
+    void shouldRejectOverridesOfConnectorManagedSelectionAndRetryPolicy(String property) {
+        assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("database.hosts", "primary:5236,standby:5236")
                 .with(property, "0").build())).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
     void shouldAllowExplicitCanonicalSafeDriverValues() {
-        final var config = new DamengConnectorConfig(configuration().with("database.failover.hosts", "primary:5236,standby:5236")
+        final var config = new DamengConnectorConfig(configuration().with("database.hosts", "primary:5236,standby:5236")
                 .with("database.loginMode", 1).with("driver.loginStatus", 4).with("database.autoReconnect", 0).with("driver.rwSeparate", 0).build());
         assertThat(config.getJdbcConfig().getInteger("loginMode")).isEqualTo(1);
         assertThat(config.getJdbcConfig().getInteger("loginStatus")).isEqualTo(4);
@@ -487,20 +527,19 @@ class DamengConnectorConfigTest {
 
     @Test
     void shouldReportInvalidHostsThroughKafkaConfigValidation() {
-        final var invalidHostname = configuration().with("database.hostname", "host?loginMode=2").build();
-        assertThat(invalidHostname.validate(DamengConnectorConfig.ALL_FIELDS).get("database.hostname").errorMessages())
-                .anySatisfy(message -> assertThat(message).contains("JDBC URL parameters"));
+        final var injected = configuration().with("database.hosts", "host?loginMode=2:5236").build();
+        assertThat(injected.validate(DamengConnectorConfig.ALL_FIELDS).get("database.hosts").errorMessages()).isNotEmpty();
 
-        final var invalidFailoverHosts = configuration().with("database.failover.hosts", "primary:5236,standby:65536").build();
-        assertThat(invalidFailoverHosts.validate(DamengConnectorConfig.ALL_FIELDS).get("database.failover.hosts").errorMessages())
+        final var invalidPort = configuration().with("database.hosts", "primary:5236,standby:65536").build();
+        assertThat(invalidPort.validate(DamengConnectorConfig.ALL_FIELDS).get("database.hosts").errorMessages())
                 .anySatisfy(message -> assertThat(message).contains("between 1 and 65535"));
 
-        assertThat(configuration().build().validate(DamengConnectorConfig.ALL_FIELDS).get("database.hostname").errorMessages()).isEmpty();
+        assertThat(configuration().build().validate(DamengConnectorConfig.ALL_FIELDS).get("database.hosts").errorMessages()).isEmpty();
     }
 
     @Test
     void shouldRejectIpv6BracketsThatDoNotEncloseTheEntireHost() {
-        assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("database.failover.hosts", "[::1]extra:5236").build()))
+        assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("database.hosts", "[::1]extra:5236").build()))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("brackets");
     }
 
@@ -527,4 +566,15 @@ class DamengConnectorConfigTest {
         assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("snapshot.locking.mode", "none").build()))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("snapshot locking mode");
     }
+
+    private static void assertRejectedBeforeJdbc(Configuration raw, String fieldName, String... expectedMessages) {
+        try (var connections = mockConstruction(DamengConnection.class)) {
+            final var result = new DamengConnector().validate(raw.asMap());
+            assertThat(result.configValues()).filteredOn(value -> value.name().equals(fieldName))
+                    .singleElement().satisfies(value -> assertThat(value.errorMessages())
+                            .anySatisfy(message -> assertThat(message).contains(expectedMessages)));
+            assertThat(connections.constructed()).isEmpty();
+        }
+    }
+
 }

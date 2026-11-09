@@ -102,7 +102,7 @@ class DamengConnectionResultValidationTest {
         final var metadata = mock(ResultSetMetaData.class);
         when(result.getMetaData()).thenReturn(metadata);
         when(metadata.getColumnType(1)).thenReturn(Types.TIMESTAMP);
-        final var connection = new DamengConnection(JdbcConfiguration.create().build());
+        final var connection = new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build());
         final var date = Column.editor().name("D").jdbcType(Types.DATE).create();
         final var timestamp = Column.editor().name("T").jdbcType(Types.TIMESTAMP).create();
         when(result.getString(1)).thenReturn(stored);
@@ -172,7 +172,7 @@ class DamengConnectionResultValidationTest {
     @Test
     void shouldPreserveTheSqlFailureWhenCheckingAStoredRestartPosition() throws Exception {
         final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         final var failure = new SQLException("V$RLOG temporarily unavailable", "08006");
         doThrow(failure).when(connection).currentLsn();
 
@@ -181,7 +181,7 @@ class DamengConnectionResultValidationTest {
     }
 
     private DamengConnection connectionWithResult(String sql, ResultSet result) throws SQLException {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doAnswer(invocation -> invocation.<JdbcConnection.ResultSetMapper<Object>> getArgument(1).apply(result))
                 .when(connection).queryAndMap(eq(sql), any());
         return connection;

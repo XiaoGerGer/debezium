@@ -59,8 +59,6 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
     private static final String PASSWORD = System.getProperty("dameng.password", "SYSDBA001");
     private static final String SCHEMA = System.getProperty("dameng.schema", "SYSDBA");
     private static String jdbcUrl;
-    private static String hostname;
-    private static int port;
 
     @TempDir
     Path temporaryDirectory;
@@ -74,8 +72,6 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
     static void startDatabase() throws Exception {
         DamengTestDatabase.start();
         jdbcUrl = DamengTestDatabase.jdbcUrl();
-        hostname = DamengTestDatabase.hostname();
-        port = DamengTestDatabase.port();
     }
 
     @AfterAll
@@ -93,8 +89,7 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
         connection.commit();
         config = Configuration.create()
                 .with("topic.prefix", "dameng")
-                .with("database.hostname", hostname)
-                .with("database.port", port)
+                .with("database.hosts", DamengTestDatabase.hosts())
                 .with("database.user", USER)
                 .with("database.password", PASSWORD)
                 .with("database.dbname", System.getProperty("dameng.database", "DAMENG"))

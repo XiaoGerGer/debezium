@@ -36,7 +36,7 @@ class DamengConnectorTaskTest {
 
     @Test
     void shouldCloseBothReaderConnectionsAndPrimaryWhenStandbyCoordinationCannotStart() throws Exception {
-        final var config = DamengTestConfiguration.configuration().with("database.standby.hosts", "replica:5236")
+        final var config = DamengTestConfiguration.configuration().with("database.capture.role", "standby")
                 .with("errors.max.retries", 2).build();
         final var task = new DamengConnectorTask();
         try (var connections = mockConstruction(DamengConnection.class, (connection, context) -> {

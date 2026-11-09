@@ -603,8 +603,7 @@ class DamengDatagenPerformanceIT {
         config.put("connector.class", DamengConnector.class.getName());
         config.put("tasks.max", "1");
         config.put("topic.prefix", prefix);
-        config.put("database.hostname", DamengTestDatabase.hostname());
-        config.put("database.port", Integer.toString(DamengTestDatabase.port()));
+        config.put("database.hosts", DamengTestDatabase.hosts());
         config.put("database.user", DamengTestDatabase.user());
         config.put("database.password", DamengTestDatabase.password());
         config.put("database.dbname", "DAMENG");

@@ -70,7 +70,7 @@ class DamengCaptureScopeStreamingTest {
     @SuppressWarnings("unchecked")
     void before() throws Exception {
         config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dm")
-                .with("database.hostname", "localhost").with("database.user", "APP").with("database.password", "test")
+                .with("database.hosts", "localhost:5236").with("database.user", "APP").with("database.password", "test")
                 .with("table.include.list", "APP\\.A,APP\\.B").with("log.mining.window.strategy", "fixed").build());
         context = mock(ChangeEventSourceContext.class);
         when(context.isRunning()).thenAnswer(invocation -> running.get());

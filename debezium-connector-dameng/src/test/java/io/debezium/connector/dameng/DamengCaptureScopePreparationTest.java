@@ -59,7 +59,7 @@ class DamengCaptureScopePreparationTest {
         when(reader.connection()).thenReturn(jdbc);
         when(reader.currentLsn()).thenReturn(300L);
         when(reader.databaseMagic()).thenReturn(42L);
-        final var quoting = new DamengConnection(DamengTestConfiguration.configuration().build());
+        final var quoting = new DamengConnection(new DamengConnectorConfig(DamengTestConfiguration.configuration().build()).getJdbcConfig());
         when(reader.quotedTableIdString(any())).thenAnswer(invocation -> quoting.quotedTableIdString(invocation.getArgument(0)));
         when(reader.getTableObjectId(any())).thenReturn(81L);
         metadata(reader, List.of(table(FIRST), table(SECOND)));
@@ -150,8 +150,9 @@ class DamengCaptureScopePreparationTest {
         when(primary.connection()).thenReturn(primaryJdbc);
         when(primary.quotedTableIdString(FIRST)).thenReturn(FIRST.toDoubleQuotedString());
         when(standby.snapshotBoundary(reader)).thenReturn(400L);
+        when(reader.requiresDatabaseLineage()).thenReturn(true);
         when(reader.readPrimaryStandbyIdentity()).thenReturn(identity);
-        final var baseline = preparation(configuration().with("database.standby.hosts", "replica:5236"), standby).prepare(List.of(FIRST));
+        final var baseline = preparation(configuration().with("database.capture.role", "standby"), standby).prepare(List.of(FIRST));
         final var order = inOrder(primaryJdbc, primary, standby, reader, jdbc);
         order.verify(jdbc).setAutoCommit(false);
         order.verify(jdbc).rollback();
@@ -252,8 +253,9 @@ class DamengCaptureScopePreparationTest {
 
     @Test
     void shouldRejectPrimaryHistoryChangesEvenWhenTheDatabaseMagicIsUnchanged() throws Exception {
+        when(reader.requiresDatabaseLineage()).thenReturn(true);
         when(reader.readPrimaryStandbyIdentity()).thenReturn(identity(42, "old"), identity(42, "new"));
-        assertThatThrownBy(() -> preparation(configuration().with("database.failover.hosts", "primary:5236"), null).prepare(List.of(FIRST)))
+        assertThatThrownBy(() -> preparation(configuration().with("database.hosts", "primary:5236"), null).prepare(List.of(FIRST)))
                 .isInstanceOf(SQLException.class).hasMessageContaining("database changed");
         verify(jdbc, times(2)).rollback();
     }
@@ -265,6 +267,7 @@ class DamengCaptureScopePreparationTest {
         final var standby = mock(DamengStandbySupport.class);
         when(standby.primary()).thenReturn(primary);
         when(primary.connection()).thenReturn(primaryJdbc);
+        when(reader.requiresDatabaseLineage()).thenReturn(true);
         when(reader.readPrimaryStandbyIdentity()).thenReturn(identity(42, "open"));
         when(primary.quotedTableIdString(FIRST)).thenReturn(FIRST.toDoubleQuotedString());
         final var failure = new SQLException("lock failed");
@@ -273,7 +276,7 @@ class DamengCaptureScopePreparationTest {
         doThrow(failure).when(primary).executeWithoutCommitting(any());
         doNothing().doThrow(readerFailure).when(jdbc).rollback();
         doNothing().doThrow(primaryFailure).when(primaryJdbc).rollback();
-        assertThatThrownBy(() -> preparation(configuration().with("database.standby.hosts", "replica:5236"), standby).prepare(List.of(FIRST)))
+        assertThatThrownBy(() -> preparation(configuration().with("database.capture.role", "standby"), standby).prepare(List.of(FIRST)))
                 .isSameAs(failure).satisfies(error -> assertThat(error.getSuppressed()).containsExactly(readerFailure));
         assertThat(readerFailure.getSuppressed()).containsExactly(primaryFailure);
         verify(primaryJdbc, times(2)).rollback();
@@ -361,8 +364,9 @@ class DamengCaptureScopePreparationTest {
         when(standby.primary()).thenReturn(primary);
         when(primary.connection()).thenReturn(primaryJdbc);
         when(standby.snapshotBoundary(reader)).thenReturn(450L);
+        when(reader.requiresDatabaseLineage()).thenReturn(true);
         when(reader.readPrimaryStandbyIdentity()).thenReturn(identity);
-        final var baseline = preparation(configuration().with("database.standby.hosts", "replica:5236"), standby)
+        final var baseline = preparation(configuration().with("database.capture.role", "standby"), standby)
                 .prepareBoundary(value -> {
                     assertThat(value.lsn()).isEqualTo(450);
                     assertThatCode(() -> verify(jdbc).rollback()).doesNotThrowAnyException();

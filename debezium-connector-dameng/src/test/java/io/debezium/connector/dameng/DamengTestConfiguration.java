@@ -15,7 +15,7 @@ final class DamengTestConfiguration {
     static Configuration.Builder configuration() {
         return Configuration.create()
                 .with("topic.prefix", "dameng")
-                .with("database.hostname", "localhost")
+                .with("database.hosts", "localhost:5236")
                 .with("database.user", "SYSDBA")
                 .with("database.password", "test");
     }

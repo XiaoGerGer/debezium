@@ -34,7 +34,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import io.debezium.config.Configuration;
 import io.debezium.connector.dameng.DamengConnection.ArchiveLogFile;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection.ResultSetConsumer;
@@ -45,7 +44,7 @@ import io.debezium.relational.TableId;
 class DamengConnectionTest {
     @Test
     void shouldNormalizeJdbcTextToTheHistoricalLobType() throws SQLException {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doReturn("1").when(connection).getCaseSensitiveFlag();
         final var metadata = mock(ResultSet.class);
         when(metadata.getString(4)).thenReturn("VALUE");
@@ -59,7 +58,7 @@ class DamengConnectionTest {
     @ParameterizedTest
     @CsvSource({ "NUMBER,3", "DOUBLE,6", "FLOAT,6" })
     void shouldDistinguishDecimalAndBinaryStorageBehindTheJdbcFloatCode(String physicalType, int jdbcType) throws SQLException {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doReturn("1").when(connection).getCaseSensitiveFlag();
         final var metadata = mock(ResultSet.class);
         when(metadata.getString(4)).thenReturn("F");
@@ -91,7 +90,7 @@ class DamengConnectionTest {
 
     @Test
     void shouldRetainOracleDateTimeAndEraWhenTheDriverDisplaysOnlyTheDate() throws SQLException {
-        final var connection = new DamengConnection(JdbcConfiguration.create().build());
+        final var connection = new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build());
         final var rows = mock(ResultSet.class);
         final var metadata = mock(ResultSetMetaData.class);
         when(rows.getMetaData()).thenReturn(metadata);
@@ -110,7 +109,7 @@ class DamengConnectionTest {
 
     @Test
     void shouldCanonicalizeMetadataNamesAndPrimaryKeysWithoutChangingDefaults() throws SQLException {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doReturn("0").when(connection).getCaseSensitiveFlag();
         final var id = new TableId(null, "APP", "MIXED");
         assertThat(connection.createTableId("DAMENG", "app", "MiXeD")).isEqualTo(id);
@@ -134,7 +133,7 @@ class DamengConnectionTest {
 
     @Test
     void shouldFailMetadataDiscoveryWhenTheCaseFlagCannotBeRead() throws SQLException {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doThrow(new SQLException("unavailable")).when(connection).getCaseSensitiveFlag();
         assertThatThrownBy(() -> connection.createTableId(null, "APP", "T"))
                 .hasMessageContaining("Cannot determine Dameng identifier case semantics");
@@ -142,7 +141,7 @@ class DamengConnectionTest {
 
     @Test
     void shouldReadTheDatabaseVersionFromStandardJdbcMetadata() throws SQLException {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         final var jdbc = mock(Connection.class);
         final var metadata = mock(DatabaseMetaData.class);
         doReturn(jdbc).when(connection).connection();
@@ -157,7 +156,7 @@ class DamengConnectionTest {
 
     @Test
     void shouldUseOnlyDeclaredPrimaryKeysForSnapshotEventKeys() throws SQLException {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         final var metadata = mock(DatabaseMetaData.class);
         final var tableId = new TableId(null, "APP", "WITHOUT_PK");
         doReturn(List.of()).when(connection).readPrimaryKeyNames(metadata, tableId);
@@ -178,7 +177,7 @@ class DamengConnectionTest {
         doReturn("0").when(connection).getIniParameter("ORA_DATE_FMT");
         doReturn("1").when(connection).getIniParameter("MY_STRICT_TABLES");
         final var initial = connection.getCompatibilityEnvironment();
-        final var config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
         final var offset = new DamengOffsetContext(config, 100);
         offset.validateCompatibilityEnvironment(initial);
         final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
@@ -222,7 +221,7 @@ class DamengConnectionTest {
     void validatesRestartRetentionWithoutRequiringCurrentRedoToBeArchived() throws SQLException {
         final var connection = archiveConnection(List.of(log("a", 50, 100, 11, 0)));
         doReturn(200L).when(connection).currentLsn();
-        final var config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
         assertThat(connection.validateLogPosition(null, new DamengOffsetContext(config, 50), config)).isTrue();
         assertThat(connection.validateLogPosition(null, new DamengOffsetContext(config, 150), config)).isTrue();
         assertThat(connection.validateLogPosition(null, new DamengOffsetContext(config, 200), config)).isTrue();
@@ -237,7 +236,7 @@ class DamengConnectionTest {
     }
 
     private static DamengConnection archiveConnection(List<ArchiveLogFile> logs) throws SQLException {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doReturn(logs).when(connection).readArchiveLogFiles();
         doReturn(11L).when(connection).databaseMagic();
         return connection;
@@ -292,7 +291,7 @@ class DamengConnectionTest {
         doReturn("0").when(connection).getIniParameter("FLOAT_MODE");
         doReturn("1").when(connection).getIniParameter("MY_STRICT_TABLES");
         final var initial = connection.getCompatibilityEnvironment();
-        final var config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").build());
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
         final var offset = new DamengOffsetContext(config, 100);
         offset.validateCompatibilityEnvironment(initial);
         final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
@@ -307,7 +306,7 @@ class DamengConnectionTest {
     }
 
     private static DamengConnection validConnection() throws SQLException {
-        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().with("hosts", "localhost:5236").build()));
         doReturn(true).when(connection).isArchiveModeEnabled();
         doReturn("2").when(connection).getIniParameter("RLOG_APPEND_LOGIC");
         doReturn("1").when(connection).getIniParameter("RLOG_IGNORE_TABLE_SET");

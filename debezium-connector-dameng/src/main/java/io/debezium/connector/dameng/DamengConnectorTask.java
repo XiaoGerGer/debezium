@@ -169,7 +169,7 @@ public final class DamengConnectorTask extends BaseSourceTask<DamengPartition, D
         if (offsets.getTheOnlyOffset() != null) {
             try {
                 connectionFactory.mainConnection().validateCompatibilityEnvironment(offsets.getTheOnlyOffset());
-                if (config.requiresDatabaseLineage()) {
+                if (connectionFactory.mainConnection().requiresDatabaseLineage()) {
                     connectionFactory.mainConnection().validatePrimaryStandbyIdentity(offsets.getTheOnlyOffset());
                     if (standby != null) {
                         primaryConnection.validateCompatibilityEnvironment(offsets.getTheOnlyOffset());

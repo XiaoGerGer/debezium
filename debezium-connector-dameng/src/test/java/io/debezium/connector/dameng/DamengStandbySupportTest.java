@@ -33,9 +33,10 @@ class DamengStandbySupportTest {
     @BeforeEach
     void before() throws Exception {
         final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
-                .with("database.standby.hosts", "replica:5236").with("database.standby.replay.timeout.ms", 1).build());
+                .with("database.capture.role", "standby").with("database.standby.replay.timeout.ms", 1).build());
         support = new DamengStandbySupport(config, primary);
         when(primary.readPrimaryStandbyIdentity()).thenReturn(primaryIdentity);
+        when(primary.requiresDatabaseLineage()).thenReturn(true);
         when(reader.readPrimaryStandbyIdentity()).thenReturn(identity(1, 10, 20, "open"));
         when(primary.currentLsn()).thenReturn(100L);
         when(reader.readStandbyProgress()).thenReturn(new DamengConnection.StandbyProgress(150, 100));
@@ -44,6 +45,28 @@ class DamengStandbySupportTest {
         when(reader.getCompatibilityEnvironment()).thenReturn(environment);
         when(primary.getDatabaseCharset()).thenReturn(StandardCharsets.UTF_8);
         when(reader.getDatabaseCharset()).thenReturn(StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void shouldRejectStandaloneWriteConnectionBeforeInitializingStandbyCapture() throws Exception {
+        when(primary.requiresDatabaseLineage()).thenReturn(false);
+        assertThatThrownBy(() -> support.initialize(reader))
+                .isInstanceOfSatisfying(SQLException.class, failure -> assertThat(failure.getSQLState()).isEqualTo("08006"))
+                .hasMessageContaining("OPEN PRIMARY").hasMessageContaining("NORMAL");
+        verify(primary, never()).validateLogMiningConfiguration();
+        verify(reader, never()).readPrimaryStandbyIdentity();
+        verify(reader, never()).readStandbyProgress();
+    }
+
+    @Test
+    void shouldRejectStandaloneWriteConnectionBeforeTheNextSnapshotBarrier() throws Exception {
+        support.initialize(reader);
+        when(primary.requiresDatabaseLineage()).thenReturn(false);
+        assertThatThrownBy(() -> support.snapshotBoundary(reader))
+                .isInstanceOfSatisfying(SQLException.class, failure -> assertThat(failure.getSQLState()).isEqualTo("08006"))
+                .hasMessageContaining("OPEN PRIMARY").hasMessageContaining("NORMAL");
+        verify(reader, never()).commit();
+        verify(primary, never()).commit();
     }
 
     @Test

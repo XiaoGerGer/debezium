@@ -50,8 +50,7 @@ class DamengConnectionIT {
     @BeforeEach
     void before() {
         connection = new DamengConnection(Configuration.create()
-                .with("hostname", DamengTestDatabase.hostname())
-                .with("port", DamengTestDatabase.port())
+                .with("hosts", DamengTestDatabase.hosts())
                 .with("user", DamengTestDatabase.user())
                 .with("password", DamengTestDatabase.password())
                 .build());
@@ -70,6 +69,20 @@ class DamengConnectionIT {
             }
             finally {
                 connection.close();
+            }
+        }
+    }
+
+    @Test
+    void shouldRouteStandaloneCaptureThroughOneOrMultipleCandidates() throws Exception {
+        for (var hosts : java.util.List.of(DamengTestDatabase.hosts(), DamengTestDatabase.hosts() + "," + DamengTestDatabase.hosts())) {
+            final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
+                    .with("database.hosts", hosts).with("database.user", DamengTestDatabase.user())
+                    .with("database.password", DamengTestDatabase.password()).build());
+            try (var routed = new DamengConnection(config.getJdbcConfig())) {
+                routed.validateServerRole();
+                assertThat(routed.requiresDatabaseLineage()).isFalse();
+                assertThat(routed.databaseMagic()).isEqualTo(connection.databaseMagic());
             }
         }
     }
@@ -197,7 +210,7 @@ class DamengConnectionIT {
         connection.execute("CREATE USER " + username + " IDENTIFIED BY \"" + password + "\"");
         try {
             final var restrictedConfig = Configuration.create()
-                    .with("hostname", DamengTestDatabase.hostname()).with("port", DamengTestDatabase.port())
+                    .with("hosts", DamengTestDatabase.hosts())
                     .with("user", username).with("password", password).build();
             try (var restricted = new DamengConnection(restrictedConfig)) {
                 assertThatThrownBy(() -> restricted.ensureSignalTable(tableId))
