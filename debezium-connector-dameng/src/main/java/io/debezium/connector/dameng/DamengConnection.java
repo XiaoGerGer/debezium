@@ -399,9 +399,52 @@ public class DamengConnection extends JdbcConnection {
             }
         }
         parameters.put("CASE_SENSITIVE", getCaseSensitiveFlag());
+        if (mode == DamengCompatibilityMode.NATIVE && "1".equals(parameters.get("BACKSLASH_ESCAPE"))) {
+            // Native 8.1.2.128 retains backslashes even with the flag enabled;
+            // 8.1.3.162 decodes them. Observe the session instead of guessing by version.
+            parameters.put("NATIVE_BACKSLASH_SEMANTICS", getNativeBackslashSemantics());
+        }
+        if (mode == DamengCompatibilityMode.NATIVE && "1".equals(parameters.get("NUMBER_MODE"))) {
+            parameters.put("NATIVE_REAL_SEMANTICS", getNativeRealSemantics());
+        }
         final var environment = new DamengCompatibilityEnvironment(mode, parameters);
         profile.validate(environment);
         return environment;
+    }
+
+    String getNativeBackslashSemantics() throws SQLException {
+        return queryAndMap("SELECT LENGTH('a\\nb') FROM DUAL", result -> {
+            if (!result.next()) {
+                throw new SQLException("Cannot determine Dameng native backslash semantics");
+            }
+            return nativeBackslashSemantics(result.getString(1));
+        });
+    }
+
+    private String nativeBackslashSemantics(String length) throws SQLException {
+        if ("3".equals(length)) {
+            return "escaped";
+        }
+        if ("4".equals(length)) {
+            return "raw";
+        }
+        throw new SQLException("Cannot determine Dameng native backslash semantics; literal length was " + length);
+    }
+
+    String getNativeRealSemantics() throws SQLException {
+        return queryAndMap("SELECT CAST(NULL AS REAL) FROM DUAL", result -> nativeRealSemantics(result, 1));
+    }
+
+    private String nativeRealSemantics(ResultSet result, int column) throws SQLException {
+        // NUMBER_MODE=1 changes REAL to decimal on 8.1.3.162, while 8.1.2.128 keeps binary REAL.
+        final int jdbcType = result.getMetaData().getColumnType(column);
+        if (jdbcType == Types.REAL) {
+            return "binary";
+        }
+        if (jdbcType == Types.FLOAT || jdbcType == Types.NUMERIC || jdbcType == Types.DECIMAL) {
+            return "decimal";
+        }
+        throw new SQLException("Cannot determine Dameng native REAL semantics; JDBC type was " + jdbcType);
     }
 
     public String getCaseSensitiveFlag() throws SQLException {
@@ -451,7 +494,11 @@ public class DamengConnection extends JdbcConnection {
         final var names = new HashSet<>(DamengCompatibilityRegistry.builtIn().resolve(compatibilityEnvironment.mode()).parameterNames());
         names.add("COMPATIBLE_MODE");
         final var literals = names.stream().sorted().map(name -> "'" + LogMinerSql.quoteLiteral(name) + "'").collect(Collectors.joining(","));
-        final Map<String, String> observed = queryAndMap("SELECT PARA_NAME, PARA_VALUE, SF_GET_CASE_SENSITIVE_FLAG() FROM V$DM_INI WHERE PARA_NAME IN (" + literals + ")",
+        final boolean nativeBackslash = compatibilityEnvironment.parameters().containsKey("NATIVE_BACKSLASH_SEMANTICS");
+        final boolean nativeReal = compatibilityEnvironment.parameters().containsKey("NATIVE_REAL_SEMANTICS");
+        final Map<String, String> observed = queryAndMap("SELECT PARA_NAME, PARA_VALUE, SF_GET_CASE_SENSITIVE_FLAG()"
+                + (nativeBackslash ? ", LENGTH('a\\nb')" : "") + (nativeReal ? ", CAST(NULL AS REAL)" : "")
+                + " FROM V$DM_INI WHERE PARA_NAME IN (" + literals + ")",
                 result -> {
                     final Map<String, String> parameters = new HashMap<>();
                     while (result.next()) {
@@ -462,6 +509,12 @@ public class DamengConnection extends JdbcConnection {
                         final var sensitive = result.getString(3);
                         if (sensitive != null) {
                             parameters.put("CASE_SENSITIVE", sensitive);
+                        }
+                        if (nativeBackslash) {
+                            parameters.put("NATIVE_BACKSLASH_SEMANTICS", nativeBackslashSemantics(result.getString(4)));
+                        }
+                        if (nativeReal) {
+                            parameters.put("NATIVE_REAL_SEMANTICS", nativeRealSemantics(result, nativeBackslash ? 5 : 4));
                         }
                     }
                     return parameters;

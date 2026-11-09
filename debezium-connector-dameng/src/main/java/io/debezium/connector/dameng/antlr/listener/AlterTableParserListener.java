@@ -54,6 +54,11 @@ final class AlterTableParserListener extends BaseParserListener {
             }
             else {
                 columns.addDefinitions(editor, clause.tableElement(), clause.ifNotExists() != null);
+                if (clause.tableElement().size() > 1) {
+                    // DM recompiles all string defaults once for a multi-column ADD,
+                    // including defaults on newly added columns.
+                    columns.recompileDefaults(editor);
+                }
             }
         }
         else if (clause.MODIFY() != null) {

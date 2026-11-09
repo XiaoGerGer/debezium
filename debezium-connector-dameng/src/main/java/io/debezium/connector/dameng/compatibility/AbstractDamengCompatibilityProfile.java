@@ -14,7 +14,7 @@ import io.debezium.connector.dameng.antlr.DamengDdlParser;
 abstract class AbstractDamengCompatibilityProfile implements DamengCompatibilityProfile {
     @Override
     public Set<String> parameterNames() {
-        return Set.of("LENGTH_IN_CHAR", "NLS_LENGTH_SEMANTICS", "NVARCHAR_LENGTH_IN_CHAR", "BACKSLASH_ESCAPE", "NESTED_C_STYLE_COMMENT", "IDENTIFIER_MODE");
+        return Set.of("NLS_LENGTH_SEMANTICS", "NVARCHAR_LENGTH_IN_CHAR", "BACKSLASH_ESCAPE", "NESTED_C_STYLE_COMMENT", "IDENTIFIER_MODE");
     }
 
     @Override
@@ -29,12 +29,6 @@ abstract class AbstractDamengCompatibilityProfile implements DamengCompatibility
         if (identifierMode != null && !"0".equals(identifierMode) && !"1".equals(identifierMode)) {
             throw new IllegalStateException(
                     "Dameng compatibility profile " + id() + " requires IDENTIFIER_MODE=0 or 1 when available; actual value was " + identifierMode);
-        }
-        if (!"0".equals(environment.parameter("LENGTH_IN_CHAR"))) {
-            // Redo DDL does not identify the original session's default length semantics.
-            throw new IllegalStateException("Dameng compatibility profile " + id()
-                    + " requires LENGTH_IN_CHAR=0 for verified byte length semantics; actual value was "
-                    + environment.parameter("LENGTH_IN_CHAR"));
         }
         // A current parameter value cannot reconstruct historical lexical settings.
         // Keep these settings unchanged throughout the retained archive interval.

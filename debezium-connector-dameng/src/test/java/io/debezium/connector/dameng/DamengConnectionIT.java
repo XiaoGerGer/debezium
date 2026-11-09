@@ -225,7 +225,7 @@ class DamengConnectionIT {
     void shouldSelectNativeCompatibilityRulesFromTheActualServerParameters() throws Exception {
         final var environment = connection.getCompatibilityEnvironment();
         assertThat(environment.mode()).isEqualTo(DamengCompatibilityMode.NATIVE);
-        assertThat(environment.parameter("LENGTH_IN_CHAR")).isEqualTo("0");
+        assertThat(environment.parameters()).doesNotContainKey("LENGTH_IN_CHAR");
         assertThat(DamengCompatibilityRegistry.builtIn().resolve(environment.mode()).id()).isEqualTo("native-v1");
         createTable("ID INT PRIMARY KEY, D DATE, C CHAR(8)");
         final var physical = new Tables();

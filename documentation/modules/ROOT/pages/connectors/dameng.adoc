@@ -57,12 +57,28 @@ offset 中的 `compatibility_signature` 记录兼容和词法环境，`capture_s
 `dameng.compatible.mode` 是测试属性；JDBC 的 `compatibleMode` 驱动选项也不能覆盖服务器检查。
 数据库端的日志和词法参数要求见 <<dameng-database-setup,数据库准备>>。
 
+模式 0 支持 `NUMBER_MODE=0/1` 和 `BACKSLASH_ESCAPE=0/1`。
+`NUMBER_MODE=1` 时，FLOAT(p)、REAL、DOUBLE PRECISION 使用十进制映射；DATE 仍为纯日期，DOUBLE、BINARY_FLOAT、BINARY_DOUBLE 仍为二进制浮点。
+旧 DM 8.1.2.128 在值 1 时仍将 REAL 存为二进制浮点。原生 profile 通过只读 CAST 表达式的 JDBC 元数据识别 REAL 类型，并把派生值 `NATIVE_REAL_SEMANTICS=binary/decimal` 记录到兼容签名和运行边界检查。
+当前 DM 8.1.3.162 构建在 `BACKSLASH_ESCAPE=1` 时会解码普通/N/E 字符串，默认值和多列 ADD 的反斜杠处理与模式 2、4、7 相同。
+旧 DM 8.1.2.128 构建在相同设置下仍保留反斜杠，多列 ADD 也不会加倍默认值中的反斜杠。
+原生 profile 在参数为 1 时通过只读查询识别当前会话的实际行为，作为派生值 `NATIVE_BACKSLASH_SEMANTICS=raw/escaped` 记录到兼容签名并在运行边界复核；该派生值不是 dm.ini 参数或 Connector 配置。
+历史 DDL 应用转义一次；JDBC 默认值和 LogMiner DML 已包含实际值，不再解码。
+当前已测样例中，切换 `FLOAT_MODE` 未改变物理映射或存储值；原生 profile 不对该参数额外设置范围限制，也不将其纳入兼容签名。
+`ORA_DATE_FMT` 仅在模式 2 下有效，原生、MySQL 和 PostgreSQL 模式均不读取、校验或记录该参数，也不因其变化中止恢复或采集。
+原生 profile 新增了 `NUMBER_MODE` 校验和签名记录，缺失或非 0/1 值会被拒绝。
+此前未记录 `NUMBER_MODE` 的原生 offset 不能直接复用，需要建立新的采集基线。
+两种构建的原生反斜杠行为已分别验证；更换数据库构建或驱动时仍需重新核查。
+
 模式 2 使用达梦 JDBC、归档日志和 `DBMS_LOGMNR`，不需要 Oracle Connector 或 Oracle 数据库。
 `DATE` 按达梦实际物理类型 `TIMESTAMP(0)` 采集，保留日期和时分秒；默认 sqlstring 输出如 `2000-02-29 12:34:56`，adaptive 输出毫秒时间戳。
 该规则用于 JDBC 快照、历史 CREATE/ALTER、默认值和流式行像。`ORA_DATE_FMT=1` 的 JDBC 日期显示格式不会截断采集的时间。
 支持 `VARCHAR2`、`NVARCHAR2`、`RAW`、`PLS_INTEGER`、`BINARY_FLOAT`、`BINARY_DOUBLE` 等已映射的达梦类型。
-模式 2 要求 `BACKSLASH_ESCAPE=0`；`NUMBER_MODE`、`FLOAT_MODE` 和 `ORA_DATE_FMT` 可为 `0` 或 `1`，缺失或其他值拒绝。
-这些参数会记录到兼容签名并在运行边界复核；切换 `NUMBER_MODE` 后需要建立新的采集基线。
+模式 2 支持 `BACKSLASH_ESCAPE`、`NUMBER_MODE`、`FLOAT_MODE` 和 `ORA_DATE_FMT` 分别为 `0` 或 `1`，缺失或其他值拒绝。
+当前测试构建中，切换 `FLOAT_MODE` 未改变已测 FLOAT/REAL/DOUBLE 样例的物理类型或 JDBC 数值；映射仍依据实际物理类型和 `NUMBER_MODE`。
+这些参数会记录到兼容签名并在运行边界复核；参数需在所保留的归档区间内保持不变，修改后需要建立新的采集基线。
+`BACKSLASH_ESCAPE=1` 时，历史 DDL 默认值和注释按达梦转义规则解码；JDBC 默认值和 LogMiner DML 已反映实际存储值，不再解码，预编译参数中的字面反斜杠也会保留。
+当前构建编译 DEFAULT 时保留成对反斜杠，Q 字面量默认值中的反斜杠加倍；一次 ADD 多列会使已有和新列字符串默认值中的反斜杠再加倍一次，单列 ADD 不应用该规则。
 `NUMBER_MODE=0` 沿用达梦原有数值映射。
 `NUMBER_MODE=1` 时，`FLOAT(p)`、`REAL` 和 `DOUBLE PRECISION` 存储为可变 scale 的十进制数，默认输出 `VariableScaleDecimal`；string/double 模式分别输出 STRING/FLOAT64。
 当前 Kafka Connect 的 Struct 默认值限制使 VariableScaleDecimal 字段不附带 schema 默认值；数据库实际写入的默认数值仍正常采集，默认表达式仍保存在 schema history 中。
@@ -75,12 +91,13 @@ JDBC 仍将这些列报告为 FLOAT，Connector 根据列的实际物理类型�
 模式 4 使用达梦 JDBC、归档日志和 `DBMS_LOGMNR`，不使用 MySQL binlog 协议。
 支持历史 DDL 中的反引号标识符及双反引号转义、`AUTO_INCREMENT`、`DATETIME(p)`，以及实际存储为 TEXT/BLOB 的 `MEDIUMTEXT`、`LONGTEXT`、`MEDIUMBLOB`、`LONGBLOB`。
 引用名按达梦的 `CASE_SENSITIVE`、`IDENTIFIER_MODE` 处理；未引用名仍采用达梦的大写规则。
-模式 4 支持 `FLOAT_MODE`、`NUMBER_MODE`、`ORA_DATE_FMT`、`BACKSLASH_ESCAPE` 和 `MY_STRICT_TABLES` 分别为 `0` 或 `1`；这些参数均记录到兼容签名，缺失或其他值拒绝。
+模式 4 支持 `FLOAT_MODE`、`NUMBER_MODE`、`BACKSLASH_ESCAPE` 和 `MY_STRICT_TABLES` 分别为 `0` 或 `1`；这些参数均记录到兼容签名，缺失或其他值拒绝。
 `NUMBER_MODE=1` 时，`FLOAT(p)`、`REAL`、`DOUBLE PRECISION` 使用可变 scale 的十进制映射，`DOUBLE` 和 `BINARY_FLOAT/BINARY_DOUBLE` 仍按物理浮点类型处理；`DATE` 仍是纯日期。
-当前测试构建中，切换 `FLOAT_MODE`、`ORA_DATE_FMT` 未改变这些样例的物理类型、JDBC 值或归档行像。
+当前测试构建中，切换 `FLOAT_MODE` 未改变这些样例的物理类型、JDBC 值或归档行像。
 `BACKSLASH_ESCAPE=1` 时，历史 DDL 默认值和列注释按达梦的转义规则解码；JDBC 默认值和 LogMiner DML 已反映数据库存储值，不再应用转义。
 实测 `\n`、`\r`、`\t`、`\b`、`\f` 对应控制字符，未知转义只保留后一个字符，例如 `\0` 为字符 `0`，并非 NUL。
 当前构建编译 DEFAULT 时会保留成对反斜杠，Q 引号默认值中的反斜杠会加倍；Connector 按此行为重建默认值，不能套用 MySQL 字符串规则。
+当 `BACKSLASH_ESCAPE=1` 且一次 ADD 多列时，数据库还会将所有字符串默认值中的反斜杠额外加倍一次，包括新列默认值；历史解析同步该变化，单列 ADD 不应用此规则。
 Connector 采集数据库实际存储的数值和日期，不推断 MySQL 的无符号整数、显示宽度或 TIMESTAMP 时区语义。
 当前测试的 DM 8.1.3.162 不接受 `BOOL`、`BOOLEAN`、`TINYINT(1)`、`INT(11)`、`UNSIGNED`、`MEDIUMINT`、`YEAR`、`BIT(8)`、`JSON`、`ENUM`、`SET`、`TINYTEXT`、`TINYBLOB`，也不接受 `ENGINE=InnoDB`、`MODIFY COLUMN`、`CHANGE COLUMN` 或 `ADD ... AFTER`。
 这些 MySQL 声明不在本次支持范围内；ALTER 使用达梦接受的 `MODIFY`、`RENAME COLUMN`、`ADD` 形式。
@@ -89,8 +106,15 @@ Connector 采集数据库实际存储的数值和日期，不推断 MySQL 的无
 模式 7 使用达梦 JDBC、归档日志和 `DBMS_LOGMNR`，沿用达梦物理类型映射，不使用 PostgreSQL 的复制协议。
 未引用标识符转大写；引用标识符按 `CASE_SENSITIVE` 和 `IDENTIFIER_MODE` 处理，不按 PostgreSQL 规则转小写。
 支持历史 DDL 中的 `TIME/TIMESTAMP ... WITHOUT TIME ZONE` 和 `E'...'` 字面量。
-模式 7 要求 `BACKSLASH_ESCAPE=0`、`FLOAT_MODE=0`、`NUMBER_MODE=0`、`ORA_DATE_FMT=0`；这些参数会记录到兼容签名并在运行边界复核。
-在该设置下，`E'a\n'` 的反斜杠保留为文字，不解释为换行。
+模式 7 支持 `FLOAT_MODE`、`NUMBER_MODE`、`BACKSLASH_ESCAPE` 分别为 `0` 或 `1`；这些参数记录到兼容签名并在运行边界复核，缺失或其他值拒绝。
+参数需在所保留的归档区间内保持不变；修改参数后须建立新的采集基线，不能复用原 offset 和 schema history。
+`NUMBER_MODE=1` 时，`FLOAT(p)`、`REAL`、`DOUBLE PRECISION` 使用可变 scale 的十进制映射；`DOUBLE`、`BINARY_FLOAT/BINARY_DOUBLE` 仍为二进制浮点，`DATE` 仍是纯日期。
+十进制 FLOAT 的精度、默认值和 JDBC 识别规则与前述模式 2、4 相同。
+当前测试构建中，切换 `FLOAT_MODE` 未改变已测样例的物理类型、JDBC 值或归档行像。
+`BACKSLASH_ESCAPE=0` 时，包括 `E'a\n'` 在内的字符串保留反斜杠；值为 `1` 时，历史 DDL 默认值和注释按达梦转义规则解码。
+实测普通字符串及 N/E 字面量中的 `\n` 成为换行，未知转义丢弃反斜杠；编译 DEFAULT 时保留成对反斜杠，Q 字面量默认值中的反斜杠加倍。
+当前构建在一次 ADD 多列时会额外编译所有字符串默认值，反斜杠加倍一次；Connector 对已有及新列默认值应用相同规则，单列 ADD 不应用。
+JDBC 默认值和 LogMiner DML 已反映实际存储值，不再解码，预编译参数中传入的字面反斜杠也会保留。
 模式 7 不代表数据库接受所有 PostgreSQL 类型：当前测试的 DM 8.1.3.162 不接受 `SERIAL`、`INT4`、`BYTEA`、`JSONB`、`UUID` 等声明。
 模式 7 的定向回归使用当前默认的 DM 8.1.3.162 镜像、`DmJdbcDriver18 8.1.3.140` 和 GB18030 字符集，覆盖 `CASE_SENSITIVE=0/1`。
 浮点精度、行外 LOB 和 LOCAL TIME ZONE 的限制同样适用于模式 2、4 和 7，见 <<dameng-data-types,类型映射>>。
@@ -159,14 +183,18 @@ Connector 采集数据库实际存储的数值和日期，不推断 MySQL 的无
 |`RLOG_IGNORE_TABLE_SET` |`1` 或 `0` |`1` 维持全表逻辑日志行为；`0` 时由任务配置者手动为每张采集表开启表级逻辑日志，Connector 在启动时打印 WARN 并继续。其他值会使流式任务拒绝启动。
 |`RLOG_LLOG_COMPRESS` |存在时为 `0` |压缩逻辑日志可能使 INSERT 的值无法完整挖取。旧版本没有该参数时，Connector 接受其缺失。
 |`COMPATIBLE_MODE` |`0`、`2`、`4` 或 `7` |原生、Oracle、MySQL 或 PostgreSQL 兼容模式，其他值或缺失时拒绝。
-|`FLOAT_MODE`、`NUMBER_MODE`、`ORA_DATE_FMT` |模式 2、4：均为 `0` 或 `1`；模式 7：均为 `0` |模式 2、4、7 校验并记录到兼容签名；超出范围或缺失会被拒绝。
+|`NUMBER_MODE` |所有模式：`0` 或 `1` |校验并记录到兼容签名；超出范围或缺失会被拒绝。值 1 启用十进制 FLOAT/DOUBLE PRECISION 映射；原生 REAL 依据实际 JDBC 类型识别，已测旧构建仍为二进制 REAL。
+|`FLOAT_MODE` |模式 2、4、7：`0` 或 `1` |模式 2、4、7 校验并记录到兼容签名；超出范围或缺失会被拒绝。原生模式不额外校验或记录该参数。
+|`ORA_DATE_FMT` |仅模式 2：`0` 或 `1` |官方说明仅在 COMPATIBLE_MODE=2 下有效，Oracle profile 校验并记录到兼容签名；其他模式忽略该参数。
 |`MY_STRICT_TABLES` |模式 4：`0` 或 `1` |采集数据库实际存储的值；该参数记录到兼容签名，变更需重新建立采集基线。
-|`LENGTH_IN_CHAR` |`0` |使用已验证的字节长度语义。其他值或查询不到该参数都会被拒绝。
-|`BACKSLASH_ESCAPE` |模式 4：`0` 或 `1`；模式 2、7：`0` |模式 4 已适配该构建的默认值及注释转义；原生模式范围检查接受 0、1，但值 1 尚未完成同等验证。
+|`BACKSLASH_ESCAPE` |所有模式：`0` 或 `1` |按实际行为解析历史 DDL 默认值及内联注释；JDBC 默认值和 LogMiner DML 不重复解码。原生模式值 1 还识别并记录会话的保留/转义行为，以兼容已测的两种构建。
 |`NESTED_C_STYLE_COMMENT` |`0` 或 `1` |`0` 在第一个 `*/` 结束块注释；`1` 按嵌套层数匹配结束。其他值或缺失会被拒绝。
 |`CASE_SENSITIVE` |`0` 或 `1` |通过 `SF_GET_CASE_SENSITIVE_FLAG()` 读取，命名规则见 <<dameng-case-sensitive,大小写>>。
 |`IDENTIFIER_MODE` |缺失、`0` 或 `1` |缺失/0 保留引用名大小写，1 转大写；显式模式仅有解析单测，需目标库验证。
 |===
+
+`LENGTH_IN_CHAR` 控制 VARCHAR 声明长度的单位，不改变 CDC 字符串值的类型。
+所有兼容模式均不读取、校验该参数，也不将其纳入兼容签名或运行期间的一致性检查。
 
 `RLOG_APPEND_LOGIC` 与 `RLOG_LLOG_COMPRESS` 的 LogMiner 行为见 https://eco.dameng.com/document/dm/zh-cn/pm/dbms_logmnr-package.html[达梦 DBMS_LOGMNR 文档]。
 `RLOG_IGNORE_TABLE_SET=0` 时，任务配置者必须在采集开始前按当前达梦版本的官方操作方法，为每张实际捕获的表开启表级逻辑日志；配置了信号表时，信号表及后续新增的采集表也必须分别处理。
@@ -199,7 +227,6 @@ WHERE UPPER(PARA_NAME) IN (
     'NUMBER_MODE',
     'ORA_DATE_FMT',
     'MY_STRICT_TABLES',
-    'LENGTH_IN_CHAR',
     'BACKSLASH_ESCAPE',
     'NESTED_C_STYLE_COMMENT',
     'IDENTIFIER_MODE'
@@ -713,7 +740,7 @@ EXCHANGE 两端都不在当前采集或历史维护范围时直接过滤；任�
 === 词法和默认值
 
 支持双引号转义、N/Q 字符串、行注释、块注释和 hint；嵌套块注释按 `NESTED_C_STYLE_COMMENT` 处理。
-模式 4 支持 `BACKSLASH_ESCAPE=0/1`；模式 2、7 使用 `0`。标识符规则见 <<dameng-case-sensitive,大小写>>。
+模式 0、2、4、7 支持 `BACKSLASH_ESCAPE=0/1`。标识符规则见 <<dameng-case-sensitive,大小写>>。
 MySQL 可执行注释、`#` 注释和 PostgreSQL dollar string 不作为原生语法处理。
 
 常量默认值按历史列类型转换，包括 DATE/TIME/TIMESTAMP 字面量及已实现 ISO 格式的 TO_DATE/TO_TIMESTAMP/TO_TIMESTAMP_TZ。
@@ -737,7 +764,7 @@ JSON 中 bytes 常呈 Base64；Decimal 的 JSON 表示还取决于 Converter 设
 |DOUBLE、BINARY_DOUBLE / 物理 DOUBLE 或 FLOAT |FLOAT64 |FLOAT(p) 声明在不同模式/参数下可能映射不同，不按名字固定为单精度。
 |DECIMAL(p,s)、NUMERIC(p,s)、NUMBER(p,s) |BYTES |默认逻辑类型 `org.apache.kafka.connect.data.Decimal`，保留 scale；string/double 模式改为 STRING/FLOAT64。
 |未限定精度的 NUMBER/NUMERIC/DECIMAL |STRUCT |元数据长度非正且 precise 模式时使用 `io.debezium.data.VariableScaleDecimal`，包含 scale 和非标度 value。
-|模式 2、4，NUMBER_MODE=1 的 FLOAT(p)、REAL、DOUBLE PRECISION |STRUCT |物理存储为可变 scale 的十进制数，precise 模式使用 `io.debezium.data.VariableScaleDecimal`；string/double 模式改为 STRING/FLOAT64。数值按数据库存储后的精度采集。
+|所有模式，NUMBER_MODE=1 且物理存储为 NUMBER 的 FLOAT(p)、REAL、DOUBLE PRECISION |STRUCT |物理存储为可变 scale 的十进制数，precise 模式使用 `io.debezium.data.VariableScaleDecimal`；string/double 模式改为 STRING/FLOAT64。数值按数据库存储后的精度采集；旧 8.1.2.128 的原生 REAL 仍按二进制 REAL 映射。
 |CHAR、NCHAR、VARCHAR、VARCHAR2、NVARCHAR 等字符列 |STRING |CHAR/NCHAR 保留定长空格；按历史字节长度和字符集补齐 LogMiner 省略的 padding。
 |BINARY、VARBINARY、RAW |BYTES |或按 binary.handling.mode 输出 Base64、URL-safe Base64、hex 字符串。仅二进制列将日志 `'0x'` 解为空数组，文本列仍为文字。
 |DATE（模式 0、4、7） |STRING |默认无逻辑类型名称，例如 `1965-02-03`；显式选择 isostring 时使用 `io.debezium.time.IsoDate` 和末尾 `Z`，adaptive 时输出距 1970-01-01 的 INT32 天数。
@@ -769,7 +796,7 @@ INTERVAL 保留年/月与日/时间单位，不近似折算：例如 `INTERVAL '
 [cols="2,5",options="header"]
 |===
 |类型或路径 |限制
-|二进制浮点物理类型 REAL/FLOAT/DOUBLE |已测构建的 LogMiner 文本可能舍入到六位小数，小非零值变零、相邻值合并。Converter 或 BigDecimal 无法还原日志已丢失的位。模式 2、4，NUMBER_MODE=1 下物理存储为 NUMBER 的 FLOAT/REAL/DOUBLE PRECISION 按十进制数处理。
+|二进制浮点物理类型 REAL/FLOAT/DOUBLE |已测构建的 LogMiner 文本可能舍入到六位小数，小非零值变零、相邻值合并。Converter 或 BigDecimal 无法还原日志已丢失的位。所有支持模式在 NUMBER_MODE=1 下物理存储为 NUMBER 的 FLOAT/REAL/DOUBLE PRECISION 按十进制数处理。
 |TIME WITH TIME ZONE |旧 8.1.2.128 丢失小数秒；已测 8.1.3.162 的 TIME(1..6) WITH TIME ZONE 严格矩阵通过。
 |BLOB/CLOB |快照可读完整内容；流式 OUT_BLOB/OUT_CLOB 或省略的 before 值使用 `unavailable.value.placeholder`。显式 SQL NULL 仍为 null。
 |浮点 JSON 往返 |Kafka 4.3.0 schema-enabled JsonConverter 解码会将负零变正零、NaN 变零。原始 Connect 值与数据库实际存储位严格比较；JSON 测试仅允许零符号不同。
@@ -1511,7 +1538,21 @@ Surefire 在 test 阶段执行单元测试，Failsafe 在 integration-test 执�
 
 嵌套套件与其他类的 `#方法` 筛选应分次执行，混合到一个 it.test 值可能漏跑嵌套套件。核对 XML 中实际执行的类与数量。
 
-PostgreSQL 兼容模式的专用回归覆盖快照、引用名大小写、归档 DDL、默认值、CRUD 和重启恢复。
+原生模式的专用回归遍历 `FLOAT_MODE`、`NUMBER_MODE`、`ORA_DATE_FMT`、`BACKSLASH_ESCAPE` 的全部 16 种组合，并分布验证大小写和块注释设置。
+非 Oracle 模式的矩阵保留 ORA_DATE_FMT 变化作为无效参数的对照，不表示生产代码依赖或限制该参数。
+覆盖二进制/十进制 FLOAT 别名、纯 DATE、编译后的字符串默认值、快照、归档 CREATE/ALTER、CRUD、NULL 更新、删除和两次恢复；行像与默认值分别独立对照 JDBC。
+另用词法矩阵检查 DISQL、绑定控制字符和嵌套注释。一次性参数探针不放入项目代码。
+
+[source,shell]
+----
+./mvnw -pl debezium-connector-dameng -am verify -Pdameng-tests \
+  -Dit.test=DamengNativeCompatibilityIT,DamengLexicalSettingsIT \
+  -Dfailsafe.failIfNoSpecifiedTests=false -Ddameng.compatible.mode=0
+----
+
+PostgreSQL 兼容模式的专用回归自动遍历 `FLOAT_MODE`、`NUMBER_MODE`、`ORA_DATE_FMT`、`BACKSLASH_ESCAPE` 的全部 16 种组合，并分布验证 `CASE_SENSITIVE=0/1` 和两种块注释设置。
+覆盖快照、引用名大小写、TIME/TIMESTAMP WITHOUT TIME ZONE、十进制 FLOAT、转义默认值、离线 CREATE/ALTER、NULL 更新、删除、预编译参数中的字面反斜杠和两次重启恢复。
+预期行像在删除测试行前独立通过 JDBC 读取；同时检查默认值和事件键。
 测试只配置自己创建的容器，不修改外部数据库：
 
 [source,shell]
@@ -1521,10 +1562,13 @@ PostgreSQL 兼容模式的专用回归覆盖快照、引用名大小写、归档
   -Ddameng.compatible.mode=7
 ----
 
-Oracle 兼容模式的专用回归验证 `DATE` 的时分秒和 BCE 年份、日期默认值、数值别名、归档 CREATE/ALTER、NULL 更新、删除及两次重启。
-分别使用 sqlstring 和 adaptive 时间映射。
+Oracle 兼容模式的专用回归自动遍历 `FLOAT_MODE`、`NUMBER_MODE`、`ORA_DATE_FMT`、`BACKSLASH_ESCAPE` 的全部 16 种组合。
+验证 `DATE` 的时分秒和 BCE 年份、日期默认值、数值别名、归档 CREATE/ALTER、NULL 更新、删除及两次重启。
+在矩阵中分布使用 sqlstring/adaptive 时间映射和两种块注释设置；每种 NUMBER_MODE/BACKSLASH_ESCAPE 组合都覆盖两种时间映射。
+字符串行像、schema 默认值分别与 JDBC 独立读取的结果比较，覆盖普通/N/E/Q 字面量、单列和多列 ADD、ALTER DEFAULT 及预编译参数中的字面反斜杠。
+归档 CREATE 中的内联列注释也与 JDBC 比较；当前快照元数据未采集列注释。
 `DamengOracleNumberModeIT` 另外覆盖 `NUMBER_MODE=1` 的高精度数值、极大/极小指数、数据库侧精度舍入、默认值、历史精度变更与恢复，分别使用 precise、string、double 数值映射。
-以下命令使用测试自建库；将 FLOAT_MODE 和 ORA_DATE_FMT 分别取 0、1 可覆盖四种组合，再以 NUMBER_MODE=0 执行 `DamengOracleCompatibilityIT` 回归原有映射：
+以下命令使用测试自建库；`DamengOracleCompatibilityIT` 自动遍历参数组合，命令行参数用于其他回归类，并在每个矩阵用例结束后恢复：
 
 [source,shell]
 ----

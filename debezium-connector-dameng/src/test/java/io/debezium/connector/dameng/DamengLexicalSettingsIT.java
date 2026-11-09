@@ -87,13 +87,15 @@ class DamengLexicalSettingsIT extends AbstractAsyncEngineConnectorTest {
             }
             java.nio.file.Files.writeString(evidenceDirectory.resolve(prefix + "-environment.txt"), evidence);
         }
-        verifyLiteralSemantics(nested);
+        final boolean escaped = backslash == 1 && !"8.1.2.128".equals(jdbc.getMetaData().getDatabaseProductVersion());
+        verifyLiteralSemantics(escaped, nested);
+        final int literalLength = escaped ? 3 : 4;
         final var disql = DamengTestDatabase.executeDisql(
-                "SELECT CASE WHEN LENGTH('A\\nB')=4 AND LENGTH(N'A\\nB')=4 AND LENGTH(q'[A\\nB]')=4 "
-                        + "THEN 'DBZ_RAW_BACKSLASH_OK' ELSE 'DBZ_ESCAPE_CHANGED' END FROM DUAL;");
+                "SELECT CASE WHEN LENGTH('A\\nB')=" + literalLength + " AND LENGTH(N'A\\nB')=" + literalLength + " AND LENGTH(q'[A\\nB]')=4 "
+                        + "THEN 'DBZ_BACKSLASH_OK' ELSE 'DBZ_ESCAPE_CHANGED' END FROM DUAL;");
         java.nio.file.Files.writeString(evidenceDirectory.resolve(prefix + "-disql.txt"), disql);
         // DISQL echoes the input SQL, including both CASE branches. Assert the result row.
-        assertThat(disql).containsPattern("(?m)^1\\s+DBZ_RAW_BACKSLASH_OK\\s*$");
+        assertThat(disql).containsPattern("(?m)^1\\s+DBZ_BACKSLASH_OK\\s*$");
 
         final var comment = nested == 1 ? "/* outer /* ; DROP TABLE X; */ outer */" : "/* outer /* text */";
         final var expressionComment = nested == 1 ? "/* outer /* inner */ -- hidden */" : "/* -- hidden */";
@@ -120,7 +122,8 @@ class DamengLexicalSettingsIT extends AbstractAsyncEngineConnectorTest {
         startEngine();
         final var snapshot = nextData("r").getStruct("after");
         assertValues(snapshot, snapshotValues);
-        assertThat(snapshot.schema().field("V").schema().defaultValue()).isEqualTo(DEFAULT);
+        final var initialDefault = escaped ? DEFAULT.replace("\\n", "\n") : DEFAULT;
+        assertThat(snapshot.schema().field("V").schema().defaultValue()).isEqualTo(initialDefault);
         assertThat(snapshot.getString("S_EXPR")).isEqualTo("xy");
         // JDBC may fold the constant expression. It must never report just its first literal.
         assertThat(snapshot.schema().field("S_EXPR").schema().defaultValue()).isIn(null, "xy");
@@ -135,7 +138,7 @@ class DamengLexicalSettingsIT extends AbstractAsyncEngineConnectorTest {
         startEngine();
         final var inserted = nextData("c").getStruct("after");
         assertValues(inserted, insertedValues);
-        assertThat(inserted.schema().field("EXTRA").schema().defaultValue()).isEqualTo(DEFAULT);
+        assertThat(inserted.schema().field("EXTRA").schema().defaultValue()).isEqualTo(escaped ? initialDefault.replace("\\", "\\\\") : initialDefault);
         assertThat(inserted.getString("EXPR")).isEqualTo("xy");
         // A compound expression must not be mistaken for the first string constant
         // when history/default conversion no longer has the original lexical settings.
@@ -158,19 +161,38 @@ class DamengLexicalSettingsIT extends AbstractAsyncEngineConnectorTest {
         assertValues(nextData("d").getStruct("before"), updatedValues);
     }
 
-    private void verifyLiteralSemantics(int nested) throws Exception {
+    private void verifyLiteralSemantics(boolean backslashEscape, int nested) throws Exception {
         final var lexer = new DamengAntlrSqlLexer(nested == 1);
         for (var prefix : List.of("'", "N'", "q'!")) {
             for (char escaped : "0abfnrtvzZ1234789xu\"\\%_中".toCharArray()) {
                 final var literal = prefix + "A\\" + escaped + "B" + (prefix.startsWith("q") ? "!'" : "'");
                 try (var statement = jdbc.createStatement(); var row = statement.executeQuery("SELECT " + literal + " FROM DUAL")) {
                     assertThat(row.next()).isTrue();
-                    assertThat(row.getString(1)).as("native literal %s", literal).isEqualTo("A\\" + escaped + "B");
-                    assertThat(lexer.tokenize(literal).get(0).stringValue()).isEqualTo(row.getString(1));
+                    final var decoded = switch (escaped) {
+                        case 'b' -> "\b";
+                        case 'f' -> "\f";
+                        case 'n' -> "\n";
+                        case 'r' -> "\r";
+                        case 't' -> "\t";
+                        default -> Character.toString(escaped);
+                    };
+                    assertThat(row.getString(1)).as("native literal %s", literal)
+                            .isEqualTo(!backslashEscape || prefix.startsWith("q") ? "A\\" + escaped + "B" : "A" + decoded + "B");
+                    assertThat(lexer.tokenize(literal).get(0).stringValue(backslashEscape)).isEqualTo(row.getString(1));
                 }
             }
         }
-        assertThatThrownBy(() -> execute("SELECT 'a\\'b' FROM DUAL")).isInstanceOf(SQLException.class);
+        if (!backslashEscape) {
+            assertThatThrownBy(() -> execute("SELECT 'a\\'b' FROM DUAL")).isInstanceOf(SQLException.class);
+        }
+        else {
+            // This SELECT form is accepted on the current build, although the
+            // same escaped-quote literal is rejected in a DEFAULT declaration.
+            try (var statement = jdbc.createStatement(); var row = statement.executeQuery("SELECT 'a\\'b' FROM DUAL")) {
+                assertThat(row.next()).isTrue();
+                assertThat(row.getString(1)).isEqualTo("a'b");
+            }
+        }
         if (nested == 1) {
             assertThatThrownBy(() -> execute("SELECT /* outer /* inner */ 1 FROM DUAL"))
                     .isInstanceOf(SQLException.class);

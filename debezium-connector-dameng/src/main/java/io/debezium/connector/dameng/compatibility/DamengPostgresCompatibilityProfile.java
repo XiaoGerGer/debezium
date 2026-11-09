@@ -10,7 +10,7 @@ import java.util.Set;
 
 /** DM PostgreSQL compatibility retains DM physical types and identifier folding. */
 final class DamengPostgresCompatibilityProfile extends AbstractDamengCompatibilityProfile {
-    private static final Set<String> VERIFIED_ZERO_PARAMETERS = Set.of("FLOAT_MODE", "NUMBER_MODE", "ORA_DATE_FMT", "BACKSLASH_ESCAPE");
+    private static final Set<String> BINARY_PARAMETERS = Set.of("FLOAT_MODE", "NUMBER_MODE", "BACKSLASH_ESCAPE");
 
     @Override
     public String id() {
@@ -25,20 +25,28 @@ final class DamengPostgresCompatibilityProfile extends AbstractDamengCompatibili
     @Override
     public Set<String> parameterNames() {
         final Set<String> names = new HashSet<>(super.parameterNames());
-        names.addAll(VERIFIED_ZERO_PARAMETERS);
+        names.addAll(BINARY_PARAMETERS);
         return Set.copyOf(names);
     }
 
     @Override
     public void validate(DamengCompatibilityEnvironment environment) {
         super.validate(environment);
-        // Bind type and lexical settings to history. BACKSLASH_ESCAPE=1 changes
-        // both defaults and redo strings on recent DM builds.
-        for (var name : VERIFIED_ZERO_PARAMETERS) {
-            if (!"0".equals(environment.parameter(name))) {
+        for (var name : BINARY_PARAMETERS) {
+            if (!"0".equals(environment.parameter(name)) && !"1".equals(environment.parameter(name))) {
                 throw new IllegalStateException("Dameng compatibility profile " + id() + " requires " + name
-                        + "=0 for verified PostgreSQL-mode semantics; actual value was " + environment.parameter(name));
+                        + "=0 or 1 for verified PostgreSQL-mode semantics; actual value was " + environment.parameter(name));
             }
         }
+    }
+
+    @Override
+    protected DamengTypeRules typeRules(DamengCompatibilityEnvironment environment) {
+        return "1".equals(environment.parameter("NUMBER_MODE")) ? DamengTypeRules.NATIVE_NUMBERS : DamengTypeRules.NATIVE;
+    }
+
+    @Override
+    protected boolean backslashEscape(DamengCompatibilityEnvironment environment) {
+        return "1".equals(environment.parameter("BACKSLASH_ESCAPE"));
     }
 }

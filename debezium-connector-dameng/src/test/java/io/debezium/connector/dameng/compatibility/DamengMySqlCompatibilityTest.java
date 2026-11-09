@@ -29,8 +29,8 @@ class DamengMySqlCompatibilityTest {
     private final DamengCompatibilityProfile profile = DamengCompatibilityRegistry.builtIn().resolve(DamengCompatibilityMode.MYSQL);
 
     private DamengCompatibilityEnvironment environment(Map<String, String> overrides) {
-        final Map<String, String> parameters = new HashMap<>(Map.of("CASE_SENSITIVE", "1", "LENGTH_IN_CHAR", "0",
-                "BACKSLASH_ESCAPE", "0", "NESTED_C_STYLE_COMMENT", "0", "FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0",
+        final Map<String, String> parameters = new HashMap<>(Map.of("CASE_SENSITIVE", "1",
+                "BACKSLASH_ESCAPE", "0", "NESTED_C_STYLE_COMMENT", "0", "FLOAT_MODE", "0", "NUMBER_MODE", "0",
                 "MY_STRICT_TABLES", "1"));
         parameters.putAll(overrides);
         return new DamengCompatibilityEnvironment(DamengCompatibilityMode.MYSQL, parameters);
@@ -40,7 +40,7 @@ class DamengMySqlCompatibilityTest {
     void shouldSelectMySqlProfileAndBindItsTypeAndStrictSettings() {
         assertThat(DamengCompatibilityMode.parse("4")).isSameAs(DamengCompatibilityMode.MYSQL);
         assertThat(profile.id()).isEqualTo("mysql-v1");
-        assertThat(profile.parameterNames()).contains("FLOAT_MODE", "NUMBER_MODE", "ORA_DATE_FMT", "MY_STRICT_TABLES", "BACKSLASH_ESCAPE");
+        assertThat(profile.parameterNames()).contains("FLOAT_MODE", "NUMBER_MODE", "MY_STRICT_TABLES", "BACKSLASH_ESCAPE").doesNotContain("ORA_DATE_FMT");
         profile.validate(environment(Map.of("MY_STRICT_TABLES", "0")));
         assertThat(environment(Map.of()).signature()).isNotEqualTo(environment(Map.of("MY_STRICT_TABLES", "0")).signature());
     }
@@ -147,7 +147,7 @@ class DamengMySqlCompatibilityTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "FLOAT_MODE", "NUMBER_MODE", "ORA_DATE_FMT", "BACKSLASH_ESCAPE", "MY_STRICT_TABLES" })
+    @ValueSource(strings = { "FLOAT_MODE", "NUMBER_MODE", "BACKSLASH_ESCAPE", "MY_STRICT_TABLES" })
     void shouldRejectUnverifiedOrMissingParameters(String name) {
         final var invalid = "2";
         assertThatThrownBy(() -> profile.validate(environment(Map.of(name, invalid)))).hasMessageContaining(name);

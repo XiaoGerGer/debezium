@@ -6,6 +6,7 @@
 package io.debezium.connector.dameng;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.math.BigDecimal;
 import java.nio.file.Path;
@@ -15,20 +16,24 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import io.debezium.config.Configuration;
 import io.debezium.data.VariableScaleDecimal;
@@ -50,20 +55,12 @@ class DamengOracleCompatibilityIT extends AbstractAsyncEngineConnectorTest {
 
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private final List<String> createdTables = new ArrayList<>();
+    private final Map<String, String> originalParameters = new HashMap<>();
     private Connection jdbc;
     private Configuration config;
     private boolean databaseStarted;
+    private boolean decimalFloats;
     private String precision;
-
-    @BeforeAll
-    static void startDatabase() throws Exception {
-        DamengTestDatabase.start();
-    }
-
-    @AfterAll
-    static void stopDatabase() {
-        DamengTestDatabase.stop();
-    }
 
     @AfterEach
     void cleanup() throws Exception {
@@ -84,23 +81,47 @@ class DamengOracleCompatibilityIT extends AbstractAsyncEngineConnectorTest {
                 }
             }
             finally {
-                if (databaseStarted) {
-                    DamengTestDatabase.stop();
+                try {
+                    if (databaseStarted) {
+                        DamengTestDatabase.stop();
+                    }
+                }
+                finally {
+                    originalParameters.forEach((name, value) -> {
+                        if (value == null) {
+                            System.clearProperty(name);
+                        }
+                        else {
+                            System.setProperty(name, value);
+                        }
+                    });
                 }
             }
         }
     }
 
-    @ParameterizedTest(name = "Oracle snapshot/history/CRUD/recovery time.precision.mode={0}")
-    @ValueSource(strings = { "sqlstring", "adaptive" })
-    void shouldCaptureOracleDatesAliasesHistoricalDdlAndRecovery(String precision) throws Exception {
-        this.precision = precision;
-        DamengTestDatabase.start();
+    static Stream<Arguments> parameterCombinations() {
+        return IntStream.range(0, 16).mapToObj(value -> Arguments.of(value & 1, (value >> 1) & 1, (value >> 2) & 1, (value >> 3) & 1));
+    }
+
+    @ParameterizedTest(name = "Oracle FLOAT_MODE={0}, NUMBER_MODE={1}, ORA_DATE_FMT={2}, BACKSLASH_ESCAPE={3}")
+    @MethodSource("parameterCombinations")
+    void shouldCaptureOracleDatesAliasesHistoricalDdlAndRecovery(int floatMode, int numberMode, int dateFormat, int backslash) throws Exception {
+        assumeTrue(System.getProperty("dameng.hostname") == null, "The parameter matrix owns its disposable databases");
+        setParameter("FLOAT_MODE", floatMode);
+        setParameter("NUMBER_MODE", numberMode);
+        setParameter("ORA_DATE_FMT", dateFormat);
+        final int nested = floatMode ^ dateFormat;
+        precision = nested == 0 ? "sqlstring" : "adaptive";
+        decimalFloats = numberMode == 1;
+        DamengTestDatabase.start(backslash, nested);
         databaseStarted = true;
         jdbc = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password());
         jdbc.setAutoCommit(true);
         createTable(TABLE);
         insert(TABLE, 1);
+        final var initialStrings = stringValues(TABLE, 1);
+        final var initialDefaults = stringDefaults(TABLE);
         config = Configuration.create()
                 .with("topic.prefix", "ora")
                 .with("database.hostname", DamengTestDatabase.hostname())
@@ -115,24 +136,41 @@ class DamengOracleCompatibilityIT extends AbstractAsyncEngineConnectorTest {
                 .with("time.precision.mode", precision)
                 .with("poll.interval.ms", 100)
                 .with("include.schema.changes", false)
+                .with("include.schema.comments", true)
                 .with("tombstones.on.delete", false)
                 .build();
         startEngine();
         final var snapshot = nextData(TABLE, "r", 1).getStruct("after");
         assertValues(snapshot);
+        assertStrings(snapshot, initialStrings);
+        assertDefaults(snapshot, initialDefaults);
         assertThat(snapshot.schema().field("D").schema().defaultValue()).isEqualTo(dateValue(DATE));
         assertThat(snapshot.schema().field("MIDNIGHT").schema().defaultValue()).isEqualTo(dateValue("2000-02-29 00:00:00"));
         stopConnector();
 
         execute("ALTER TABLE " + TABLE + " ADD extra DATE DEFAULT " + DATE_FUNCTION);
+        final var comment = nested == 1 ? "/* outer /* nested */ outer */" : "/* regular */";
+        execute("ALTER" + comment + "TABLE " + TABLE + " ADD (added_value VARCHAR(100) DEFAULT Q'[a\\nb]', marker INT)");
+        execute("ALTER TABLE " + TABLE + " ALTER COLUMN escaped_value SET DEFAULT E'new\\t\\qb'");
         execute("ALTER TABLE " + TABLE + " RENAME COLUMN d TO \"NewDate\"");
+        final var alteredDefaults = stringDefaults(TABLE);
         insert(TABLE, 2);
-        execute("UPDATE " + TABLE + " SET \"NewDate\"=NULL, ancient=NULL, v=NULL WHERE id=2");
-        execute("UPDATE " + TABLE + " SET \"NewDate\"=TO_DATE('" + UPDATED_DATE
-                + "','YYYY-MM-DD HH24:MI:SS'), ancient=TIMESTAMP'" + ANCIENT + "', v='汉字' WHERE id=2");
+        final var insertedStrings = stringValues(TABLE, 2);
+        execute("UPDATE " + TABLE + " SET \"NewDate\"=NULL, ancient=NULL, v=NULL, escaped_value=NULL WHERE id=2");
+        final var nulledStrings = stringValues(TABLE, 2);
+        try (var statement = jdbc.prepareStatement("UPDATE " + TABLE + " SET \"NewDate\"=TO_DATE('" + UPDATED_DATE
+                + "','YYYY-MM-DD HH24:MI:SS'), ancient=TIMESTAMP'" + ANCIENT + "', v='汉字', escaped_value=? WHERE id=2")) {
+            // JDBC-bound strings already contain literal backslashes; redo must retain them.
+            statement.setString(1, "literal\\n\\path");
+            statement.executeUpdate();
+        }
+        final var restoredStrings = stringValues(TABLE, 2);
         execute("DELETE FROM " + TABLE + " WHERE id=2");
         createTable(LATE_TABLE);
         insert(LATE_TABLE, 4);
+        final var lateStrings = stringValues(LATE_TABLE, 4);
+        final var lateDefaults = stringDefaults(LATE_TABLE);
+        final var lateComment = columnComment(LATE_TABLE);
         execute("DELETE FROM " + LATE_TABLE + " WHERE id=4");
 
         // Both rows are gone before the engine resumes. Only archived redo and
@@ -140,32 +178,51 @@ class DamengOracleCompatibilityIT extends AbstractAsyncEngineConnectorTest {
         startEngine();
         final var created = nextData(TABLE, "c", 2).getStruct("after");
         assertValues(created);
+        assertStrings(created, insertedStrings);
+        assertDefaults(created, alteredDefaults);
         assertThat(created.getWithoutDefault("EXTRA")).isEqualTo(dateValue(DATE));
         assertThat(created.schema().field("EXTRA").schema().defaultValue()).isEqualTo(dateValue(DATE));
         final var nulled = nextData(TABLE, "u", 2);
         assertValues(nulled.getStruct("before"));
         assertNulls(nulled.getStruct("after"));
+        assertStrings(nulled.getStruct("before"), insertedStrings);
+        assertStrings(nulled.getStruct("after"), nulledStrings);
         final var restored = nextData(TABLE, "u", 2);
         assertNulls(restored.getStruct("before"));
         assertValues(restored.getStruct("after"), UPDATED_DATE);
-        assertValues(nextData(TABLE, "d", 2).getStruct("before"), UPDATED_DATE);
+        assertStrings(restored.getStruct("before"), nulledStrings);
+        assertStrings(restored.getStruct("after"), restoredStrings);
+        final var deleted = nextData(TABLE, "d", 2).getStruct("before");
+        assertValues(deleted, UPDATED_DATE);
+        assertStrings(deleted, restoredStrings);
         final var historical = nextData(LATE_TABLE, "c", 4).getStruct("after");
         assertValues(historical);
+        assertStrings(historical, lateStrings);
+        assertDefaults(historical, lateDefaults);
+        assertThat(historical.schema().field("E_VALUE").schema().doc()).isEqualTo(lateComment);
         assertThat(historical.schema().field("D").schema()).isEqualTo(snapshot.schema().field("D").schema());
-        assertValues(nextData(LATE_TABLE, "d", 4).getStruct("before"));
+        final var lateDeleted = nextData(LATE_TABLE, "d", 4).getStruct("before");
+        assertValues(lateDeleted);
+        assertStrings(lateDeleted, lateStrings);
         stopConnector();
 
         insert(TABLE, 3);
+        final var recoveredStrings = stringValues(TABLE, 3);
         startEngine();
         final var recovered = nextData(TABLE, "c", 3).getStruct("after");
         assertValues(recovered);
+        assertStrings(recovered, recoveredStrings);
+        assertDefaults(recovered, alteredDefaults);
         assertThat(recovered.schema()).isEqualTo(created.schema());
     }
 
     private void createTable(String table) throws Exception {
         execute("CREATE TABLE " + table + "(id PLS_INTEGER PRIMARY KEY, d DATE DEFAULT " + DATE_FUNCTION
                 + ", midnight DATE DEFAULT DATE'2000-02-29', ancient DATE, v NVARCHAR2(30), "
-                + "n NUMBER, fixed NUMBER(12,2), f FLOAT(24), wide FLOAT(126), bf BINARY_FLOAT, bd BINARY_DOUBLE, raw RAW(8))");
+                + "n NUMBER, fixed NUMBER(12,2), f FLOAT(24), wide FLOAT(126), bf BINARY_FLOAT, bd BINARY_DOUBLE, raw RAW(8), "
+                + "escaped_value VARCHAR(200) DEFAULT 'a\\n\\r\\t\\b\\f\\q\\0\\Z\\%\\_\\\\b',"
+                + "q_value VARCHAR(100) DEFAULT Q'[a\\nb]',n_value VARCHAR(100) DEFAULT N'a\\tb',"
+                + "e_value VARCHAR(100) DEFAULT E'a\\rb' COMMENT 'a\\tb')");
         createdTables.add(table);
     }
 
@@ -187,7 +244,7 @@ class DamengOracleCompatibilityIT extends AbstractAsyncEngineConnectorTest {
         assertThat(VariableScaleDecimal.toLogical(value.getStruct("N")).getDecimalValue())
                 .contains(new BigDecimal("12345678901234567890.123456"));
         assertThat(value.get("FIXED")).isEqualTo(new BigDecimal("12.34"));
-        if ("1".equals(System.getProperty("dameng.test.ini.NUMBER_MODE", "0"))) {
+        if (decimalFloats) {
             assertThat(VariableScaleDecimal.toLogical(value.getStruct("F")).getDecimalValue()).contains(new BigDecimal("1.25"));
             assertThat(VariableScaleDecimal.toLogical(value.getStruct("WIDE")).getDecimalValue()).contains(new BigDecimal("2.5"));
         }
@@ -206,6 +263,64 @@ class DamengOracleCompatibilityIT extends AbstractAsyncEngineConnectorTest {
         assertThat(value.getWithoutDefault("NewDate")).isNull();
         assertThat(value.getWithoutDefault("ANCIENT")).isNull();
         assertThat(value.getWithoutDefault("V")).isNull();
+    }
+
+    private Map<String, String> stringValues(String table, int id) throws Exception {
+        final Map<String, String> values = new LinkedHashMap<>();
+        try (var statement = jdbc.createStatement(); var result = statement.executeQuery("SELECT * FROM " + table + " WHERE id=" + id)) {
+            assertThat(result.next()).as("stored row %s", id).isTrue();
+            for (int index = 1; index <= result.getMetaData().getColumnCount(); index++) {
+                final var column = result.getMetaData().getColumnName(index);
+                if (column.endsWith("_VALUE")) {
+                    values.put(column, result.getString(index));
+                }
+            }
+        }
+        assertThat(values.size()).isGreaterThanOrEqualTo(4);
+        return values;
+    }
+
+    private Map<String, String> stringDefaults(String table) throws Exception {
+        final Map<String, String> defaults = new LinkedHashMap<>();
+        final var tableName = table.substring(table.indexOf('.') + 1);
+        try (var columns = jdbc.getMetaData().getColumns(null, "SYSDBA", null, null)) {
+            while (columns.next()) {
+                final var column = columns.getString("COLUMN_NAME");
+                if (tableName.equals(columns.getString("TABLE_NAME")) && column.endsWith("_VALUE")) {
+                    // Compiled metadata defaults and stored row defaults can differ
+                    // after a multi-column ADD. Check the schema independently.
+                    final var literal = columns.getString("COLUMN_DEF").trim();
+                    assertThat(literal).startsWith("'").endsWith("'");
+                    defaults.put(column, literal.substring(1, literal.length() - 1).replace("''", "'"));
+                }
+            }
+        }
+        assertThat(defaults.size()).isGreaterThanOrEqualTo(4);
+        return defaults;
+    }
+
+    private String columnComment(String table) throws Exception {
+        final var tableName = table.substring(table.indexOf('.') + 1);
+        try (var statement = jdbc.createStatement();
+                var result = statement.executeQuery("SELECT COMMENTS FROM ALL_COL_COMMENTS "
+                        + "WHERE OWNER='SYSDBA' AND TABLE_NAME='" + tableName + "' AND COLUMN_NAME='E_VALUE'")) {
+            assertThat(result.next()).isTrue();
+            return result.getString(1);
+        }
+    }
+
+    private void assertStrings(Struct value, Map<String, String> expected) {
+        expected.forEach((column, stored) -> assertThat(value.getWithoutDefault(column)).as(column).isEqualTo(stored));
+    }
+
+    private void assertDefaults(Struct value, Map<String, String> expected) {
+        expected.forEach((column, stored) -> assertThat(value.schema().field(column).schema().defaultValue()).as(column).isEqualTo(stored));
+    }
+
+    private void setParameter(String name, int value) {
+        final var property = "dameng.test.ini." + name;
+        originalParameters.put(property, System.getProperty(property));
+        System.setProperty(property, Integer.toString(value));
     }
 
     private Object dateValue(String value) {

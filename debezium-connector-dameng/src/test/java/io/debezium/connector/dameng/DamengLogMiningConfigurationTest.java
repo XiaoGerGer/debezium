@@ -46,10 +46,11 @@ class DamengLogMiningConfigurationTest {
         when(connection.getIniParameter("RLOG_IGNORE_TABLE_SET")).thenReturn("1");
         when(connection.getIniParameter("RLOG_LLOG_COMPRESS")).thenReturn("0");
         when(connection.getIniParameter("COMPATIBLE_MODE")).thenReturn("0");
-        when(connection.getIniParameter("LENGTH_IN_CHAR")).thenReturn("0");
+        when(connection.getIniParameter("NUMBER_MODE")).thenReturn("0");
         when(connection.getIniParameter("BACKSLASH_ESCAPE")).thenReturn("0");
         when(connection.getIniParameter("NESTED_C_STYLE_COMMENT")).thenReturn("0");
         when(connection.getCaseSensitiveFlag()).thenReturn("1");
+        when(connection.getNativeBackslashSemantics()).thenReturn("escaped");
     }
 
     @ParameterizedTest

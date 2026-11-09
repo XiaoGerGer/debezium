@@ -15,7 +15,9 @@ import java.util.Set;
 import org.antlr.v4.runtime.ParserRuleContext;
 
 import io.debezium.connector.dameng.DamengInterval;
+import io.debezium.connector.dameng.antlr.DamengAntlrSqlLexer;
 import io.debezium.connector.dameng.antlr.DamengParseTree;
+import io.debezium.connector.dameng.antlr.DamengSqlToken.Kind;
 import io.debezium.connector.dameng.compatibility.DamengIdentifierRules;
 import io.debezium.connector.dameng.compatibility.DamengTypeRules;
 import io.debezium.ddl.parser.dameng.generated.DamengSqlParser.ColumnAttributeContext;
@@ -90,6 +92,25 @@ public final class ColumnDefinitionParser {
         // A table constraint may precede the columns that it references.
         for (var constraint : constraints) {
             addConstraint(table, constraint);
+        }
+    }
+
+    public void recompileDefaults(TableEditor table) {
+        if (!backslashEscape) {
+            return;
+        }
+        for (var column : table.columns()) {
+            column.defaultValueExpression().filter(expression -> expression.indexOf('\\') >= 0).ifPresent(expression -> {
+                final var result = new StringBuilder();
+                int previousEnd = 0;
+                for (var token : new DamengAntlrSqlLexer().tokenize(expression)) {
+                    result.append(expression, previousEnd, token.start());
+                    result.append(token.kind() == Kind.STRING ? token.text().replace("\\", "\\\\") : token.text());
+                    previousEnd = token.end();
+                }
+                result.append(expression.substring(previousEnd));
+                table.updateColumn(column.edit().defaultValueExpression(result.toString()).create());
+            });
         }
     }
 
@@ -301,7 +322,7 @@ public final class ColumnDefinitionParser {
         }
         boolean timeZone = false;
         boolean localTimeZone = false;
-        if (typeRules.decimalFloat() && (name.equals("FLOAT") || name.equals("REAL")
+        if (typeRules.decimalFloat() && (name.equals("FLOAT") || (name.equals("REAL") && typeRules.decimalReal())
                 || name.equals("DOUBLE") && type.PRECISION() != null)) {
             // NUMBER_MODE=1 stores these declarations as variable-scale NUMBER.
             // JDBC calls them FLOAT and reports their original binary precision.

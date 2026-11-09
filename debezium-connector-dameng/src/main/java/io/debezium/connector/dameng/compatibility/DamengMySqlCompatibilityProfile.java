@@ -10,7 +10,7 @@ import java.util.Set;
 
 /** DM MySQL compatibility uses DM physical types and archived redo. */
 final class DamengMySqlCompatibilityProfile extends AbstractDamengCompatibilityProfile {
-    private static final Set<String> BINARY_PARAMETERS = Set.of("FLOAT_MODE", "NUMBER_MODE", "ORA_DATE_FMT", "BACKSLASH_ESCAPE", "MY_STRICT_TABLES");
+    private static final Set<String> BINARY_PARAMETERS = Set.of("FLOAT_MODE", "NUMBER_MODE", "BACKSLASH_ESCAPE", "MY_STRICT_TABLES");
 
     @Override
     public String id() {

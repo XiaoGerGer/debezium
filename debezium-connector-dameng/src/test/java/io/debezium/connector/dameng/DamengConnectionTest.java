@@ -32,6 +32,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.dameng.DamengConnection.ArchiveLogFile;
@@ -168,14 +169,27 @@ class DamengConnectionTest {
         assertThat(connection.readPrimaryKeyOrUniqueIndexNames(metadata, tableId)).containsExactly("ID");
     }
 
-    @Test
-    void rejectsUnverifiedOrUnknownCharacterLengthSemantics() throws SQLException {
+    @ParameterizedTest
+    @ValueSource(strings = { "0", "2", "4", "7" })
+    void shouldIgnoreVarcharLengthUnitInAllModes(String mode) throws SQLException {
         final var connection = validConnection();
-        connection.validateCompatibilityMode();
-        doReturn("1").when(connection).getIniParameter("LENGTH_IN_CHAR");
-        assertThatThrownBy(connection::validateCompatibilityMode).hasMessageContaining("LENGTH_IN_CHAR=0", "byte length semantics");
-        doReturn(null).when(connection).getIniParameter("LENGTH_IN_CHAR");
-        assertThatThrownBy(connection::validateCompatibilityMode).hasMessageContaining("LENGTH_IN_CHAR=0");
+        doReturn(mode).when(connection).getIniParameter("COMPATIBLE_MODE");
+        doReturn("0").when(connection).getIniParameter("FLOAT_MODE");
+        doReturn("0").when(connection).getIniParameter("ORA_DATE_FMT");
+        doReturn("1").when(connection).getIniParameter("MY_STRICT_TABLES");
+        final var initial = connection.getCompatibilityEnvironment();
+        final var config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").build());
+        final var offset = new DamengOffsetContext(config, 100);
+        offset.validateCompatibilityEnvironment(initial);
+        final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        for (var value : java.util.Arrays.asList(null, "", "0", "1", "2", "unknown")) {
+            doReturn(value).when(connection).getIniParameter("LENGTH_IN_CHAR");
+            final var observed = connection.getCompatibilityEnvironment();
+            assertThat(observed.parameters()).doesNotContainKey("LENGTH_IN_CHAR");
+            assertThat(observed).isEqualTo(initial);
+            recovered.validateCompatibilityEnvironment(observed);
+        }
+        verify(connection, never()).getIniParameter("LENGTH_IN_CHAR");
     }
 
     @Test
@@ -188,16 +202,16 @@ class DamengConnectionTest {
         assertThat(table.columnWithName("D").jdbcType()).isEqualTo(java.sql.Types.DATE);
         assertThat(table.columnWithName("C").typeExpression()).isEqualTo("CHAR(8 BYTE)");
         assertThat(table.columnWithName("N").typeExpression()).isEqualTo("NCHAR(8 BYTE)");
-        assertThat(connection.getCompatibilityEnvironment().parameters()).containsEntry("LENGTH_IN_CHAR", "0");
+        assertThat(connection.getCompatibilityEnvironment().parameters()).doesNotContainKey("LENGTH_IN_CHAR");
     }
 
     @Test
     void shouldPropagateParameterQueryFailuresWithoutSubstitutingDefaults() throws SQLException {
         final var connection = validConnection();
         final var failure = new SQLException("permission denied", "28000");
-        doThrow(failure).when(connection).getIniParameter("LENGTH_IN_CHAR");
+        doThrow(failure).when(connection).getIniParameter("NUMBER_MODE");
         assertThatThrownBy(connection::getCompatibilityEnvironment).isSameAs(failure);
-        doReturn("0").when(connection).getIniParameter("LENGTH_IN_CHAR");
+        doReturn("0").when(connection).getIniParameter("NUMBER_MODE");
         doReturn("0").when(connection).getIniParameter("BACKSLASH_ESCAPE");
         doReturn("0").when(connection).getIniParameter("NESTED_C_STYLE_COMMENT");
         doReturn(null).when(connection).getIniParameter("NLS_LENGTH_SEMANTICS");
@@ -229,6 +243,69 @@ class DamengConnectionTest {
         return connection;
     }
 
+    @ParameterizedTest
+    @CsvSource({ "3,escaped", "4,raw" })
+    void shouldObserveNativeBackslashSemanticsAndTrackThemInTheSignature(String length, String semantics) throws SQLException {
+        final var connection = validConnection();
+        doReturn("1").when(connection).getIniParameter("BACKSLASH_ESCAPE");
+        final var rows = mock(ResultSet.class);
+        when(rows.next()).thenReturn(true);
+        when(rows.getString(1)).thenReturn(length);
+        doAnswer(invocation -> {
+            assertThat((String) invocation.getArgument(0)).isEqualTo("SELECT LENGTH('a\\nb') FROM DUAL");
+            return ((io.debezium.jdbc.JdbcConnection.ResultSetMapper<?>) invocation.getArgument(1)).apply(rows);
+        }).when(connection).queryAndMap(anyString(), any());
+        final var environment = connection.getCompatibilityEnvironment();
+        assertThat(environment.parameter("NATIVE_BACKSLASH_SEMANTICS")).isEqualTo(semantics);
+        assertThat(environment.signature()).contains("NATIVE_BACKSLASH_SEMANTICS", semantics);
+        when(rows.getString(1)).thenReturn("5");
+        assertThatThrownBy(connection::getCompatibilityEnvironment).isInstanceOf(SQLException.class).hasMessageContaining("literal length was 5");
+        when(rows.next()).thenReturn(false);
+        assertThatThrownBy(connection::getCompatibilityEnvironment).isInstanceOf(SQLException.class).hasMessageContaining("Cannot determine");
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "6,decimal", "7,binary", "2,decimal", "3,decimal" })
+    void shouldObserveNativeRealSemanticsWithoutChangingTheDatabase(int jdbcType, String semantics) throws SQLException {
+        final var connection = validConnection();
+        doReturn("1").when(connection).getIniParameter("NUMBER_MODE");
+        final var rows = mock(ResultSet.class);
+        final var metadata = mock(ResultSetMetaData.class);
+        when(rows.getMetaData()).thenReturn(metadata);
+        when(metadata.getColumnType(1)).thenReturn(jdbcType);
+        doAnswer(invocation -> {
+            assertThat((String) invocation.getArgument(0)).isEqualTo("SELECT CAST(NULL AS REAL) FROM DUAL");
+            return ((io.debezium.jdbc.JdbcConnection.ResultSetMapper<?>) invocation.getArgument(1)).apply(rows);
+        }).when(connection).queryAndMap(anyString(), any());
+        final var environment = connection.getCompatibilityEnvironment();
+        assertThat(environment.parameter("NATIVE_REAL_SEMANTICS")).isEqualTo(semantics);
+        assertThat(environment.signature()).contains("NATIVE_REAL_SEMANTICS", semantics);
+        when(metadata.getColumnType(1)).thenReturn(Types.VARCHAR);
+        assertThatThrownBy(connection::getCompatibilityEnvironment).isInstanceOf(SQLException.class).hasMessageContaining("REAL semantics");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "0", "4", "7" })
+    void shouldIgnoreOracleDateFormatOutsideOracleMode(String mode) throws SQLException {
+        final var connection = validConnection();
+        doReturn(mode).when(connection).getIniParameter("COMPATIBLE_MODE");
+        doReturn("0").when(connection).getIniParameter("FLOAT_MODE");
+        doReturn("1").when(connection).getIniParameter("MY_STRICT_TABLES");
+        final var initial = connection.getCompatibilityEnvironment();
+        final var config = new DamengConnectorConfig(Configuration.create().with("topic.prefix", "dameng").build());
+        final var offset = new DamengOffsetContext(config, 100);
+        offset.validateCompatibilityEnvironment(initial);
+        final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        for (var value : java.util.Arrays.asList(null, "", "0", "1", "2", "unknown")) {
+            doReturn(value).when(connection).getIniParameter("ORA_DATE_FMT");
+            final var observed = connection.getCompatibilityEnvironment();
+            assertThat(observed.parameters()).doesNotContainKey("ORA_DATE_FMT");
+            assertThat(observed).isEqualTo(initial);
+            recovered.validateCompatibilityEnvironment(observed);
+        }
+        verify(connection, never()).getIniParameter("ORA_DATE_FMT");
+    }
+
     private static DamengConnection validConnection() throws SQLException {
         final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
         doReturn(true).when(connection).isArchiveModeEnabled();
@@ -236,7 +313,7 @@ class DamengConnectionTest {
         doReturn("1").when(connection).getIniParameter("RLOG_IGNORE_TABLE_SET");
         doReturn("0").when(connection).getIniParameter("RLOG_LLOG_COMPRESS");
         doReturn("0").when(connection).getIniParameter("COMPATIBLE_MODE");
-        doReturn("0").when(connection).getIniParameter("LENGTH_IN_CHAR");
+        doReturn("0").when(connection).getIniParameter("NUMBER_MODE");
         doReturn("0").when(connection).getIniParameter("BACKSLASH_ESCAPE");
         doReturn("0").when(connection).getIniParameter("NESTED_C_STYLE_COMMENT");
         doReturn("BYTE").when(connection).getIniParameter("NLS_LENGTH_SEMANTICS");

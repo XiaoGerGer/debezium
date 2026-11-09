@@ -17,9 +17,12 @@ import static org.mockito.Mockito.when;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.Types;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.Test;
@@ -40,8 +43,8 @@ class DamengCompatibilitySafetyTest {
     private final DamengConnectorConfig config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
 
     private DamengCompatibilityEnvironment environment(String identifier) {
-        final Map<String, String> parameters = new HashMap<>(Map.of("LENGTH_IN_CHAR", "0", "CASE_SENSITIVE", "1",
-                "BACKSLASH_ESCAPE", "0", "NESTED_C_STYLE_COMMENT", "0"));
+        final Map<String, String> parameters = new HashMap<>(Map.of("CASE_SENSITIVE", "1",
+                "BACKSLASH_ESCAPE", "0", "NESTED_C_STYLE_COMMENT", "0", "NUMBER_MODE", "0"));
         if (identifier != null) {
             parameters.put("IDENTIFIER_MODE", identifier);
         }
@@ -95,6 +98,19 @@ class DamengCompatibilitySafetyTest {
         assertThat(tables.forTable(id)).isSameAs(original);
     }
 
+    @Test
+    void shouldRejectNativeOffsetsThatDidNotTrackNumberMode() {
+        final var current = environment(null);
+        final Map<String, String> previousParameters = new HashMap<>(current.parameters());
+        previousParameters.remove("NUMBER_MODE");
+        final var previous = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, previousParameters);
+        final var offset = new DamengOffsetContext(config, 100);
+        offset.validateCompatibilityEnvironment(previous);
+        final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(current)).hasMessageContaining("differ from the stored offset");
+        assertThat(recovered.getOffset()).isEqualTo(offset.getOffset());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = { "2", "4", "7" })
     void shouldPersistTypeSettingsAndRejectSwitchingSupportedModes(String mode) {
@@ -134,10 +150,13 @@ class DamengCompatibilitySafetyTest {
     }
 
     @ParameterizedTest
-    @CsvSource({ "2,0", "2,1", "4,0", "4,1" })
+    @CsvSource({ "0,0", "0,1", "2,0", "2,1", "4,0", "4,1", "7,0", "7,1" })
     void shouldRejectChangingNumberModeWhenRecoveringAnOffset(String mode, String numberMode) {
         final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
         parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", numberMode, "ORA_DATE_FMT", "0", "MY_STRICT_TABLES", "1"));
+        if (mode.equals("0")) {
+            parameters.put("NATIVE_REAL_SEMANTICS", "decimal");
+        }
         final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.parse(mode), parameters);
         DamengCompatibilityRegistry.builtIn().resolve(initial.mode()).validate(initial);
         final var offset = new DamengOffsetContext(config, 100);
@@ -152,6 +171,134 @@ class DamengCompatibilitySafetyTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = { "0", "1" })
+    void shouldRejectChangingOracleBackslashSettingWhenRecoveringAnOffset(String backslash) {
+        final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
+        parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0", "BACKSLASH_ESCAPE", backslash));
+        final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.ORACLE, parameters);
+        DamengCompatibilityRegistry.builtIn().resolve(initial.mode()).validate(initial);
+        final var offset = new DamengOffsetContext(config, 100);
+        offset.validateCompatibilityEnvironment(initial);
+        final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        recovered.validateCompatibilityEnvironment(initial);
+        parameters.put("BACKSLASH_ESCAPE", backslash.equals("0") ? "1" : "0");
+        final var changed = new DamengCompatibilityEnvironment(initial.mode(), parameters);
+        DamengCompatibilityRegistry.builtIn().resolve(changed.mode()).validate(changed);
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(changed)).hasMessageContaining("differ from the stored offset");
+        assertThat(recovered.getOffset()).isEqualTo(offset.getOffset());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "0", "1" })
+    void shouldRejectChangedNativeRealSemanticsDuringRecoveryAndStreaming(String backslash) throws Exception {
+        final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
+        parameters.putAll(Map.of("NUMBER_MODE", "1", "NATIVE_REAL_SEMANTICS", "decimal", "BACKSLASH_ESCAPE", backslash));
+        if (backslash.equals("1")) {
+            parameters.put("NATIVE_BACKSLASH_SEMANTICS", "escaped");
+        }
+        final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, parameters);
+        final var offset = new DamengOffsetContext(config, 100);
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        doReturn(initial).when(connection).getCompatibilityEnvironment();
+        connection.validateCompatibilityEnvironment(offset);
+        final var entries = new java.util.ArrayList<>(parameters.entrySet());
+        entries.removeIf(e -> Set.of("CASE_SENSITIVE", "NATIVE_BACKSLASH_SEMANTICS", "NATIVE_REAL_SEMANTICS").contains(e.getKey()));
+        entries.add(Map.entry("COMPATIBLE_MODE", "0"));
+        final var index = new AtomicInteger(-1);
+        final var rows = mock(ResultSet.class);
+        final var metadata = mock(ResultSetMetaData.class);
+        when(rows.getMetaData()).thenReturn(metadata);
+        final int realColumn = backslash.equals("1") ? 5 : 4;
+        when(metadata.getColumnType(realColumn)).thenReturn(Types.FLOAT);
+        when(rows.next()).thenAnswer(invocation -> index.incrementAndGet() < entries.size());
+        when(rows.getString(1)).thenAnswer(invocation -> entries.get(index.get()).getKey());
+        when(rows.getString(2)).thenAnswer(invocation -> entries.get(index.get()).getValue());
+        when(rows.getString(3)).thenReturn("1");
+        when(rows.getString(4)).thenReturn("3");
+        doAnswer(invocation -> {
+            assertThat((String) invocation.getArgument(0)).contains("CAST(NULL AS REAL)").doesNotContain("'NATIVE_REAL_SEMANTICS'");
+            index.set(-1);
+            return ((ResultSetMapper<?>) invocation.getArgument(1)).apply(rows);
+        }).when(connection).queryAndMap(anyString(), any());
+        connection.validateUnchangedCompatibility();
+        when(metadata.getColumnType(realColumn)).thenReturn(Types.REAL);
+        assertThatThrownBy(connection::validateUnchangedCompatibility).hasMessageContaining("changed while the task was running");
+        parameters.put("NATIVE_REAL_SEMANTICS", "binary");
+        final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, parameters)))
+                .hasMessageContaining("differ from the stored offset");
+    }
+
+    @Test
+    void shouldRejectChangedNativeBackslashSemanticsDuringRecoveryAndStreaming() throws Exception {
+        final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
+        parameters.putAll(Map.of("BACKSLASH_ESCAPE", "1", "NATIVE_BACKSLASH_SEMANTICS", "raw"));
+        final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, parameters);
+        final var offset = new DamengOffsetContext(config, 100);
+        final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
+        doReturn(initial).when(connection).getCompatibilityEnvironment();
+        connection.validateCompatibilityEnvironment(offset);
+        final var entries = new java.util.ArrayList<>(parameters.entrySet());
+        entries.removeIf(e -> Set.of("CASE_SENSITIVE", "NATIVE_BACKSLASH_SEMANTICS").contains(e.getKey()));
+        entries.add(Map.entry("COMPATIBLE_MODE", "0"));
+        final var index = new AtomicInteger(-1);
+        final var rows = mock(ResultSet.class);
+        when(rows.next()).thenAnswer(invocation -> index.incrementAndGet() < entries.size());
+        when(rows.getString(1)).thenAnswer(invocation -> entries.get(index.get()).getKey());
+        when(rows.getString(2)).thenAnswer(invocation -> entries.get(index.get()).getValue());
+        when(rows.getString(3)).thenReturn("1");
+        when(rows.getString(4)).thenReturn("4");
+        doAnswer(invocation -> {
+            assertThat((String) invocation.getArgument(0)).contains("LENGTH('a\\nb')").doesNotContain("'NATIVE_BACKSLASH_SEMANTICS'");
+            index.set(-1);
+            return ((ResultSetMapper<?>) invocation.getArgument(1)).apply(rows);
+        }).when(connection).queryAndMap(anyString(), any());
+        connection.validateUnchangedCompatibility();
+        when(rows.getString(4)).thenReturn("3");
+        assertThatThrownBy(connection::validateUnchangedCompatibility).hasMessageContaining("changed while the task was running");
+        parameters.put("NATIVE_BACKSLASH_SEMANTICS", "escaped");
+        final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(new DamengCompatibilityEnvironment(DamengCompatibilityMode.NATIVE, parameters)))
+                .hasMessageContaining("differ from the stored offset");
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "4,0", "4,1", "7,0", "7,1" })
+    void shouldRejectLegacyNonOracleSignaturesWithOracleDateFormat(String mode, String dateFormat) {
+        final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
+        parameters.put("FLOAT_MODE", "0");
+        if (mode.equals("4")) {
+            parameters.put("MY_STRICT_TABLES", "1");
+        }
+        final var current = new DamengCompatibilityEnvironment(DamengCompatibilityMode.parse(mode), parameters);
+        final Map<String, String> legacyParameters = new HashMap<>(parameters);
+        legacyParameters.put("ORA_DATE_FMT", dateFormat);
+        final var legacy = new DamengCompatibilityEnvironment(current.mode(), legacyParameters);
+        final var offset = new DamengOffsetContext(config, 100);
+        offset.validateCompatibilityEnvironment(legacy);
+        final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(current)).hasMessageContaining("differ from the stored offset");
+        assertThat(recovered.getOffset()).isEqualTo(offset.getOffset());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "0", "1" })
+    void shouldKeepOracleDateFormatInTheOracleRecoverySignature(String dateFormat) {
+        final Map<String, String> parameters = new HashMap<>(environment(null).parameters());
+        parameters.putAll(Map.of("FLOAT_MODE", "0", "ORA_DATE_FMT", dateFormat));
+        final var initial = new DamengCompatibilityEnvironment(DamengCompatibilityMode.ORACLE, parameters);
+        final var offset = new DamengOffsetContext(config, 100);
+        offset.validateCompatibilityEnvironment(initial);
+        final var recovered = new DamengOffsetContext.Loader(config).load(offset.getOffset());
+        parameters.put("ORA_DATE_FMT", dateFormat.equals("0") ? "1" : "0");
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(new DamengCompatibilityEnvironment(initial.mode(), parameters)))
+                .hasMessageContaining("differ from the stored offset");
+        parameters.remove("ORA_DATE_FMT");
+        assertThatThrownBy(() -> recovered.validateCompatibilityEnvironment(new DamengCompatibilityEnvironment(initial.mode(), parameters)))
+                .hasMessageContaining("differ from the stored offset");
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = { "0", "2", "4", "7" })
     void shouldCheckLiveParametersWithoutRebindingAChangedSnapshotOrOffset(String mode) throws Exception {
         final var connection = spy(new DamengConnection(JdbcConfiguration.create().build()));
@@ -159,6 +306,8 @@ class DamengCompatibilitySafetyTest {
         if (!mode.equals("0")) {
             parameters.putAll(Map.of("FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0", "MY_STRICT_TABLES", "1"));
         }
+        final var names = DamengCompatibilityRegistry.builtIn().resolve(DamengCompatibilityMode.parse(mode)).parameterNames();
+        parameters.keySet().removeIf(name -> !name.equals("CASE_SENSITIVE") && !names.contains(name));
         final var environment = new DamengCompatibilityEnvironment(DamengCompatibilityMode.parse(mode), parameters);
         doReturn(environment).when(connection).getCompatibilityEnvironment();
         assertThatThrownBy(connection::validateUnchangedCompatibility).hasMessageContaining("not been bound");
@@ -174,14 +323,21 @@ class DamengCompatibilitySafetyTest {
         when(rows.getString(2)).thenAnswer(invocation -> entries.get(index.get()).getValue());
         when(rows.getString(3)).thenReturn("1");
         doAnswer(invocation -> {
+            assertThat((String) invocation.getArgument(0)).contains("'NUMBER_MODE'").doesNotContain("'LENGTH_IN_CHAR'");
             if (!mode.equals("0")) {
-                assertThat((String) invocation.getArgument(0)).contains("'FLOAT_MODE'", "'NUMBER_MODE'", "'ORA_DATE_FMT'");
+                assertThat((String) invocation.getArgument(0)).contains("'FLOAT_MODE'", "'NUMBER_MODE'");
+            }
+            if (mode.equals("2")) {
+                assertThat((String) invocation.getArgument(0)).contains("'ORA_DATE_FMT'");
+            }
+            else {
+                assertThat((String) invocation.getArgument(0)).doesNotContain("'ORA_DATE_FMT'");
             }
             index.set(-1);
             return ((ResultSetMapper<?>) invocation.getArgument(1)).apply(rows);
         }).when(connection).queryAndMap(anyString(), any());
         connection.validateUnchangedCompatibility();
-        final var changedParameter = mode.equals("2") ? "NUMBER_MODE" : (mode.equals("4") || mode.equals("7")) ? "FLOAT_MODE" : "NESTED_C_STYLE_COMMENT";
+        final var changedParameter = mode.equals("0") || mode.equals("2") ? "NUMBER_MODE" : "FLOAT_MODE";
         entries.removeIf(e -> e.getKey().equals(changedParameter));
         entries.add(Map.entry(changedParameter, "1"));
         assertThatThrownBy(connection::validateUnchangedCompatibility).hasMessageContaining("changed while the task was running");

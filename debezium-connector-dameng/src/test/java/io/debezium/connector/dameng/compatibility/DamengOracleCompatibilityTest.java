@@ -12,10 +12,14 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Types;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.relational.TableId;
@@ -25,7 +29,7 @@ class DamengOracleCompatibilityTest {
     private final DamengCompatibilityProfile profile = DamengCompatibilityRegistry.builtIn().resolve(DamengCompatibilityMode.ORACLE);
 
     private DamengCompatibilityEnvironment environment(Map<String, String> overrides) {
-        final Map<String, String> parameters = new HashMap<>(Map.of("CASE_SENSITIVE", "1", "LENGTH_IN_CHAR", "0",
+        final Map<String, String> parameters = new HashMap<>(Map.of("CASE_SENSITIVE", "1",
                 "BACKSLASH_ESCAPE", "0", "NESTED_C_STYLE_COMMENT", "0", "FLOAT_MODE", "0", "NUMBER_MODE", "0", "ORA_DATE_FMT", "0"));
         parameters.putAll(overrides);
         return new DamengCompatibilityEnvironment(DamengCompatibilityMode.ORACLE, parameters);
@@ -37,6 +41,44 @@ class DamengOracleCompatibilityTest {
         assertThat(profile.parameterNames()).contains("FLOAT_MODE", "NUMBER_MODE", "ORA_DATE_FMT", "BACKSLASH_ESCAPE");
         assertThat(DamengCompatibilityRegistry.builtIn().registeredModes())
                 .containsExactly(DamengCompatibilityMode.NATIVE, DamengCompatibilityMode.ORACLE, DamengCompatibilityMode.MYSQL, DamengCompatibilityMode.POSTGRES);
+    }
+
+    static Stream<Arguments> parameterCombinations() {
+        return IntStream.range(0, 16).mapToObj(value -> Arguments.of(Integer.toString(value & 1),
+                Integer.toString((value >> 1) & 1), Integer.toString((value >> 2) & 1), Integer.toString((value >> 3) & 1)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("parameterCombinations")
+    void shouldCombineOracleTypesWithDmDefaultAndCommentEscapes(String floatMode, String numberMode, String dateFormat, String backslash) {
+        final var parser = profile.createDdlParser(environment(Map.of("FLOAT_MODE", floatMode, "NUMBER_MODE", numberMode,
+                "ORA_DATE_FMT", dateFormat, "BACKSLASH_ESCAPE", backslash)), StandardCharsets.UTF_8);
+        final var tables = new Tables();
+        final var id = new TableId(null, "APP", "T");
+        parser.parse("CREATE TABLE APP.T(ID INT, D DATE, F FLOAT(24), "
+                + "V VARCHAR(100) DEFAULT E'a\\n''b', S VARCHAR(100) DEFAULT 'a\\\\b', Q VARCHAR(100) DEFAULT Q'[a\\nb]', "
+                + "N VARCHAR(100) DEFAULT N'a\\rb', C VARCHAR(100) COMMENT 'a\\tb')", tables, "APP");
+        final var initial = tables.forTable(id);
+        assertThat(initial.columnWithName("D").jdbcType()).isEqualTo(Types.TIMESTAMP);
+        assertThat(initial.columnWithName("D").scale()).contains(0);
+        assertThat(initial.columnWithName("F").jdbcType()).isEqualTo(numberMode.equals("1") ? Types.DECIMAL : Types.REAL);
+        assertThat(initial.columnWithName("V").defaultValueExpression()).contains(backslash.equals("1") ? "'a\n''b'" : "E'a\\n''b'");
+        assertThat(initial.columnWithName("S").defaultValueExpression()).contains("'a\\\\b'");
+        assertThat(initial.columnWithName("Q").defaultValueExpression()).contains(backslash.equals("1") ? "'a\\\\nb'" : "Q'[a\\nb]'");
+        assertThat(initial.columnWithName("N").defaultValueExpression()).contains(backslash.equals("1") ? "'a\rb'" : "N'a\\rb'");
+        assertThat(initial.columnWithName("C").comment()).isEqualTo(backslash.equals("1") ? "a\tb" : "a\\tb");
+
+        parser.parse("ALTER TABLE APP.T ADD (SINGLE_VALUE INT)", tables, "APP");
+        assertThat(tables.forTable(id).columnWithName("Q")).isEqualTo(initial.columnWithName("Q"));
+        parser.parse("ALTER TABLE APP.T ADD (A VARCHAR(100) DEFAULT Q'[a\\nb]', B DATE)", tables, "APP");
+        final var altered = tables.forTable(id);
+        assertThat(altered.columnWithName("Q").defaultValueExpression()).contains(backslash.equals("1") ? "'a" + "\\".repeat(4) + "nb'" : "Q'[a\\nb]'");
+        assertThat(altered.columnWithName("A").defaultValueExpression()).isEqualTo(altered.columnWithName("Q").defaultValueExpression());
+        assertThat(altered.columnWithName("S").defaultValueExpression()).contains("'a" + "\\".repeat(backslash.equals("1") ? 4 : 2) + "b'");
+        assertThat(altered.columnWithName("B").jdbcType()).isEqualTo(Types.TIMESTAMP);
+        parser.parse("ALTER TABLE APP.T ALTER COLUMN V SET DEFAULT E'new\\t\\qb'", tables, "APP");
+        assertThat(tables.forTable(id).columnWithName("V").defaultValueExpression()).contains(backslash.equals("1") ? "'new\tqb'" : "E'new\\t\\qb'");
+        assertThat(tables.forTable(id).columnWithName("C").comment()).isEqualTo(initial.columnWithName("C").comment());
     }
 
     @ParameterizedTest
@@ -112,9 +154,6 @@ class DamengOracleCompatibilityTest {
     void shouldRejectMissingAndUnverifiedSettings(String name) {
         for (var value : new String[]{ "2", "" }) {
             assertThatThrownBy(() -> profile.validate(environment(Map.of(name, value)))).hasMessageContaining(name);
-        }
-        if (name.equals("BACKSLASH_ESCAPE")) {
-            assertThatThrownBy(() -> profile.validate(environment(Map.of(name, "1")))).hasMessageContaining(name + "=0");
         }
         final Map<String, String> parameters = new HashMap<>(environment(Map.of()).parameters());
         parameters.remove(name);

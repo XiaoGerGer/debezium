@@ -36,14 +36,15 @@ final class DamengOracleCompatibilityProfile extends AbstractDamengCompatibility
                         + "=0 or 1 for verified Oracle-mode semantics; actual value was " + environment.parameter(name));
             }
         }
-        if (!"0".equals(environment.parameter("BACKSLASH_ESCAPE"))) {
-            throw new IllegalStateException("Dameng compatibility profile " + id()
-                    + " requires BACKSLASH_ESCAPE=0 for verified Oracle-mode semantics; actual value was " + environment.parameter("BACKSLASH_ESCAPE"));
-        }
     }
 
     @Override
     protected DamengTypeRules typeRules(DamengCompatibilityEnvironment environment) {
         return "1".equals(environment.parameter("NUMBER_MODE")) ? DamengTypeRules.ORACLE_NUMBERS : DamengTypeRules.ORACLE;
+    }
+
+    @Override
+    protected boolean backslashEscape(DamengCompatibilityEnvironment environment) {
+        return "1".equals(environment.parameter("BACKSLASH_ESCAPE"));
     }
 }

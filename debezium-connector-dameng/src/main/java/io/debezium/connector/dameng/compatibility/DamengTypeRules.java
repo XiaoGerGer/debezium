@@ -9,6 +9,7 @@ package io.debezium.connector.dameng.compatibility;
 public enum DamengTypeRules {
     NATIVE(false, false),
     NATIVE_NUMBERS(false, true),
+    NATIVE_NUMBERS_BINARY_REAL(false, true),
     ORACLE(true, false),
     ORACLE_NUMBERS(true, true);
 
@@ -26,5 +27,9 @@ public enum DamengTypeRules {
 
     public boolean decimalFloat() {
         return decimalFloat;
+    }
+
+    public boolean decimalReal() {
+        return decimalFloat && this != NATIVE_NUMBERS_BINARY_REAL;
     }
 }

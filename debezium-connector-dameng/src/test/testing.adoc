@@ -300,12 +300,39 @@ An external `dameng.hostname` is read and checked against the requested mode; it
 The fixture records server build, JDBC version, driver, charset, selected parameters and a numbered case catalog.
 Production supports modes `0`, `2`, `4` and `7` through explicit compatibility profiles. The component tests invoke the real connection, archived LogMiner, DML/DDL parsers and converters directly;
 they do not mock the mode guard. Their success is component evidence, not full Connector support.
-Unsupported modes fail when parsing the server value, before selecting a compatibility profile. Mode `7` additionally requires `FLOAT_MODE=0`, `NUMBER_MODE=0`, `ORA_DATE_FMT=0` and `BACKSLASH_ESCAPE=0`.
-Mode `2` requires `BACKSLASH_ESCAPE=0`, with `NUMBER_MODE`, `FLOAT_MODE` and `ORA_DATE_FMT` each in `{0,1}`.
-`DamengOracleCompatibilityIT`, selected with `dameng.compatible.mode=2`, checks DATE as TIMESTAMP(0) in sqlstring and adaptive modes,
+Unsupported modes fail when parsing the server value, before selecting a compatibility profile.
+LENGTH_IN_CHAR is not read, validated or tracked in any mode because the VARCHAR declaration's length unit does not change its CDC string type.
+Mode `0` accepts NUMBER_MODE and BACKSLASH_ESCAPE each in `{0,1}` and binds them to the compatibility signature.
+FLOAT_MODE is not restricted or tracked in the native signature; switching it did not change the sampled types or values on DM 8.1.3.162.
+ORA_DATE_FMT is effective only in mode `2`. Native, MySQL and PostgreSQL profiles do not read, validate or track it at startup or runtime.
+The matrices retain ORA_DATE_FMT variation outside Oracle mode as a control for this behavior.
+`DamengNativeCompatibilityIT`, selected with `dameng.compatible.mode=0`, owns disposable databases and covers all 16 combinations of these four parameters.
+It checks pure DATE, binary/decimal FLOAT aliases and precision changes, plain/N/E/Q defaults,
+snapshot, archived CREATE/ALTER and CRUD, NULL transitions, deleted rows and recovery across two restarts.
+Expected images and schema defaults are read independently through JDBC before deletion.
+On this fixture, NUMBER_MODE=1 selects decimal FLOAT/REAL/DOUBLE PRECISION and BACKSLASH_ESCAPE=1 enables DM escape decoding.
+The older DM 8.1.2.128 fixture retains backslashes with the same flag. Native BACKSLASH_ESCAPE=1 therefore observes the session's actual
+literal behavior and includes derived NATIVE_BACKSLASH_SEMANTICS=raw/escaped in the offset signature and runtime checks.
+With NUMBER_MODE=1, the native profile also observes CAST(NULL AS REAL) metadata and tracks derived NATIVE_REAL_SEMANTICS=binary/decimal.
+The older fixture keeps binary REAL; the current fixture stores REAL as NUMBER. FLOAT and DOUBLE PRECISION use decimal rules on both.
+Multi-column ADD recompiles retained default backslashes once more; single-column ADD does not.
+Older native offsets without NUMBER_MODE in their signature are rejected and require a new capture baseline.
+`DamengLexicalSettingsIT` additionally checks DISQL, bound control characters and nested comments.
+Mode `7` accepts `FLOAT_MODE`, `NUMBER_MODE` and `BACKSLASH_ESCAPE` each in `{0,1}` and binds them to the compatibility signature.
+Mode `2` accepts `BACKSLASH_ESCAPE`, `NUMBER_MODE`, `FLOAT_MODE` and `ORA_DATE_FMT` each in `{0,1}` and binds them to the compatibility signature.
+`DamengOracleCompatibilityIT`, selected with `dameng.compatible.mode=2`, owns disposable databases and covers all 16 combinations.
+It checks DATE as TIMESTAMP(0) in sqlstring and adaptive modes,
 including non-midnight and BCE values, defaults, unconstrained NUMBER, numeric aliases, RAW and NVARCHAR2,
 offline CREATE/ALTER, value-to-NULL and NULL-to-value updates, DELETE and recovery across two restarts.
 The rows are deleted before replay, ensuring the engine cannot substitute current-row reads for historical values.
+Sqlstring/adaptive time modes and nested-comment settings are distributed across the matrix;
+each NUMBER_MODE/BACKSLASH_ESCAPE combination covers both time modes.
+Plain/N/E/Q defaults, single/multi-column ADD, ALTER DEFAULT, CREATE inline comments and bound literal backslashes
+are checked during archived replay and recovery; string images and defaults are also checked in snapshot.
+String images, schema defaults and archived CREATE inline comments are compared independently with JDBC before deletion.
+Current snapshot metadata does not capture column comments. Historical DDL applies DM escape rules once;
+JDBC defaults and LogMiner DML already contain stored values and are not decoded again.
+On the tested build, multi-column ADD doubles retained backslashes in existing and new string defaults once more.
 `DamengOracleNumberModeIT` additionally requires `dameng.test.ini.NUMBER_MODE=1` and verifies decimal FLOAT/REAL/DOUBLE PRECISION,
 38-digit integers, tiny and large exponent values, defaults, database-side precision rounding, NULL transitions,
 offline precision widening, column rename/addition, historical CREATE and recovery across two restarts.
@@ -315,8 +342,16 @@ VariableScaleDecimal schema defaults are omitted because the current Kafka Conne
 following the Oracle connector's workaround. Database-applied defaults are still checked in snapshot and archived row values.
 Use `DamengCaseSensitivityIT` with mode `2` to exercise initialized CASE_SENSITIVE=0/1 databases, DDL, signals and recovery.
 These embedded-engine tests validate SourceRecords, not a standalone Kafka Connect Worker/Broker deployment.
-`DamengPostgresCompatibilityIT`, selected with `dameng.compatible.mode=7`, covers both nested-comment settings, E-prefixed defaults,
-TIME/TIMESTAMP WITHOUT TIME ZONE, mixed-case quoted identifiers, offline DDL/CRUD and recovery from the persisted offset and history.
+`DamengPostgresCompatibilityIT`, selected with `dameng.compatible.mode=7`, covers all 16 FLOAT_MODE/NUMBER_MODE/ORA_DATE_FMT/BACKSLASH_ESCAPE combinations,
+with CASE_SENSITIVE=0/1 and both nested-comment settings distributed across the matrix.
+It checks TIME/TIMESTAMP WITHOUT TIME ZONE, mixed-case quoted identifiers, decimal FLOAT and precision changes,
+plain/Q/N/E defaults, ALTER DEFAULT, bound literal backslashes, offline CREATE/ALTER and CRUD,
+NULL transitions, deleted rows and recovery across two restarts.
+Expected images are read independently through JDBC before deletion, and real SourceRecords and defaults are checked.
+NUMBER_MODE=1 selects decimal FLOAT while DATE remains a pure date.
+Historical DDL applies DM default escape semantics; JDBC defaults and LogMiner DML are not decoded again.
+Multi-column ADD recompiles string defaults once on the tested build, doubling retained backslashes in existing and new columns.
+Schema defaults are checked independently against JDBC COLUMN_DEF, while row images are checked against stored JDBC values.
 
 `DamengMySqlCompatibilityIT`, selected with `dameng.compatible.mode=4`, checks backtick identifiers and escaped backticks,
 auto-increment keys, DATETIME precision, high-precision decimals, TEXT/BLOB aliases and constant defaults.
@@ -324,7 +359,7 @@ It covers all 16 FLOAT_MODE/NUMBER_MODE/ORA_DATE_FMT/BACKSLASH_ESCAPE combinatio
 both nested-comment settings and strict modes distributed across the matrix, plus archived CREATE/ALTER,
 NULL transitions, deleted rows and recovery across two restarts. Expected values are read independently through JDBC before deletion.
 Optionally fix `MY_STRICT_TABLES` with `-Ddameng.test.ini.MY_STRICT_TABLES=0` or `1`.
-Mode `4` accepts each of these five parameters in `{0,1}` and binds them to the compatibility signature.
+Mode `4` accepts FLOAT_MODE, NUMBER_MODE, BACKSLASH_ESCAPE and MY_STRICT_TABLES each in `{0,1}` and binds them to the compatibility signature.
 NUMBER_MODE=1 uses decimal FLOAT without changing DATE to TIMESTAMP.
 Escaped defaults, Q/N/E literals, ALTER DEFAULT, precision changes and bound literal backslashes check that
 historical DDL is decoded exactly once, while JDBC defaults and LogMiner DML preserve their stored values.
@@ -346,7 +381,10 @@ Run the component layer for an explicitly selected mode from the repository root
 ----
 
 Repeat the component command with `dameng.compatible.mode` for modes under investigation.
-For mode `2`, `-Ddameng.test.ini.NUMBER_MODE=1 -Ddameng.test.ini.FLOAT_MODE=1 -Ddameng.test.ini.ORA_DATE_FMT=1` configures that combination in the test-owned database. Repeat with each setting in `{0,1}` for the Oracle regression matrix.
+For mode `0`, select `DamengNativeCompatibilityIT,DamengLexicalSettingsIT` with `-Pdameng-tests` to run the native parameter and lexical matrices.
+For mode `2`, `DamengOracleCompatibilityIT` automatically runs the 16 parameter combinations.
+`-Ddameng.test.ini.NUMBER_MODE=1 -Ddameng.test.ini.FLOAT_MODE=1 -Ddameng.test.ini.ORA_DATE_FMT=1` configures other Oracle tests;
+the matrix restores these properties after each case.
 The production task rejects unregistered modes; component results alone do not establish full Connector support.
 `dameng.datatype.case` filters the shared catalog, not other datatype or capability tests.
 Reports are ordinary Surefire/Failsafe XML, with environment and case catalog under `target/dameng-mode-evidence`.
@@ -932,6 +970,8 @@ The test compares ordinary, national and alternative string values from JDBC wit
 It checks initial snapshot defaults, offline commented DDL, INSERT/UPDATE/DELETE before/after values, bound control characters and backslashes, and schema/default recovery after restarting the engine.
 A compound default with a nested comment containing `--` must retain its operator when saved to history; it must not become an incorrect constant schema default.
 The native DM 8.1.2.128 test build retains backslashes in these strings with either backslash parameter value. This is a measured native-mode result, not a claim about MySQL/PostgreSQL modes or all DM versions.
+The current DM 8.1.3.162 fixture decodes plain/N/E escapes when BACKSLASH_ESCAPE=1.
+The maintained test checks the appropriate behavior on each fixture; the preceding 8.1.2.128 result is retained as historical evidence.
 The parameter/profile unit tests also cover unknown values, analysis/planning consistency, empty defaults, unchanged models after failure and nested-comment termination.
 `target/dameng-lexical-evidence` contains each combination's effective parameters and DISQL transcript.
 The current lexical and DDL support boundary is maintained in the link:../../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-ddl[connector manual].
