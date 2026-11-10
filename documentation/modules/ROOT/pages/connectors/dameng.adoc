@@ -202,8 +202,23 @@ ORDER BY ARCH_LSN;
 
 === CDC 账号
 
+==== 创建用户和连接授权
+
+由具备创建用户和授权权限的管理员执行。以下以 `CDC_USER` 为例，用户名和密码须替换为实际值，密码须符合目标数据库的口令策略：
+
+[source,sql]
+----
+CREATE USER CDC_USER IDENTIFIED BY "Replace_With_Strong_Password_123!";
+GRANT CREATE SESSION TO CDC_USER;
+----
+
+创建用户时，达梦会自动创建同名 schema（模式），这里的“用户名目录”即 `CDC_USER` 模式。
+新建用户默认具有连接权限，示例显式授予 `CREATE SESSION`，也适用于该权限曾被撤销的账号。
+
+==== CDC 读取授权
+
 在上面注明的 DM8 版本中，以下权限已用于验证 JDBC 元数据读取、共享快照锁和 LogMiner。
-先由 DBA 创建账号，再将示例中的用户、schema 和表名替换为实际值：
+创建账号后，由具备相应授权权限的管理员执行，将示例中的用户、schema 和表名替换为实际值：
 
 [source,sql]
 ----
@@ -214,7 +229,6 @@ GRANT SELECT ON APP.CUSTOMERS TO CDC_USER;
 GRANT SELECT ON APP.ORDERS TO CDC_USER;
 ----
 
-若 `CREATE SESSION` 已被撤销，需补授连接权限。
 每张新纳入采集的业务表也需授予 `SELECT`。
 初始快照通过当前账号的 `ALL_TABLES` 发现表；不可见的表不会进入快照范围。
 最终发现完成后，Connector 以 INFO 输出实际选择的结构采集表和数据快照表，并对没有选择到任何可见表的 `table.include.list` 规则打印 WARN。
@@ -223,6 +237,52 @@ GRANT SELECT ON APP.ORDERS TO CDC_USER;
 这组权限无需 `DBA` 或 `SELECT ANY TABLE`，但 `SOI` 和 `VTI` 是较宽的系统目录读取角色；应在实际 DM 版本验证授权。
 `SOI` 允许读取非安全、非审计系统表，包括对象与约束目录；`VTI` 允许读取系统动态视图，包括运行状态和 LogMiner 视图。
 这是一组已经验证可用的权限，不是已证明不可再缩小的最小权限集。基线构建拒绝对 SYS.SYSOBJECTS、SYS.SYSCONS 直接进行对象级授权，不能用未经验证的单对象 GRANT 替代。
+
+==== 在同名模式下建表、删表和增删改查
+
+需要由 `CDC_USER` 在同名模式下创建信号表或维护其他表和数据时，由管理员按需追加以下授权：
+
+[source,sql]
+----
+GRANT CREATE TABLE, ALTER TABLE, DROP TABLE TO CDC_USER;
+GRANT SELECT TABLE, INSERT TABLE, UPDATE TABLE, DELETE TABLE TO CDC_USER;
+----
+
+这些不带 `ANY` 的数据库权限适用于该用户自己的模式。
+`CREATE TABLE`、`ALTER TABLE`、`DROP TABLE` 分别允许建表、修改表结构和删表；`SELECT TABLE`、`INSERT TABLE`、`UPDATE TABLE`、`DELETE TABLE` 分别允许查询、插入、更新和删除行。
+这些附加权限按实际建表和数据维护需求选择；源端信号表的逐表授权和配置见 <<dameng-signals,信号表>>。
+
+授权后，以 `CDC_USER` 登录，在同名模式下执行以下示例：
+
+[source,sql]
+----
+CREATE TABLE CDC_USER.CDC_ACCOUNT_DEMO (
+    ID INT PRIMARY KEY,
+    NAME VARCHAR(100)
+);
+ALTER TABLE CDC_USER.CDC_ACCOUNT_DEMO ADD REMARK VARCHAR(200);
+
+INSERT INTO CDC_USER.CDC_ACCOUNT_DEMO (ID, NAME) VALUES (1, 'Alice');
+COMMIT;
+
+UPDATE CDC_USER.CDC_ACCOUNT_DEMO SET NAME = 'Bob' WHERE ID = 1;
+COMMIT;
+
+SELECT ID, NAME FROM CDC_USER.CDC_ACCOUNT_DEMO WHERE ID = 1;
+
+DELETE FROM CDC_USER.CDC_ACCOUNT_DEMO WHERE ID = 1;
+COMMIT;
+----
+
+验证完成后，以 `CDC_USER` 删除示例表；`DROP TABLE` 会删除表结构及其中的数据：
+
+[source,sql]
+----
+DROP TABLE CDC_USER.CDC_ACCOUNT_DEMO;
+----
+
+上例用于核查账号权限。需要观察其 CDC 事件时，还须将示例表纳入采集范围，并按 <<dameng-database-setup,逻辑日志设置>> 确保其产生逻辑日志。
+同名模式权限和跨模式对象授权的含义见达梦官方 https://eco.dameng.com/document/dm/zh-cn/pm/discretionary-access-control.html[自主访问控制]。
 
 === 主备准备
 
@@ -261,30 +321,33 @@ Oracle 模块的官方镜像配置来自统一镜像项目，本分支达梦的 
 
 === 构建、导出与内网导入
 
-从仓库根目录使用根 POM 要求的构建 JDK 和 Maven Wrapper：
+使用根 POM 要求的构建 JDK，在仓库根目录执行：
 
 [source,shell]
 ----
-./mvnw -pl debezium-connector-dameng,debezium-assembly-descriptors -am process-sources
-./mvnw -pl debezium-connector-dameng,debezium-assembly-descriptors -am install -Passembly -DskipITs
-bash debezium-connector-dameng/docker/monitoring/fetch-agent.sh
-cd debezium-connector-dameng
-docker build --build-arg KAFKA_BASE_IMAGE=apache/kafka:3.9.1 \
-  --build-arg CONNECTOR_VERSION=3.6.4-xingchuang-kafka2.0 \
-  -f docker/Dockerfile -t debezium-connect-dameng:3.6.4-xingchuang-kafka2.0 .
-bash docker/test-env-config.sh debezium-connect-dameng:3.6.4-xingchuang-kafka2.0
-docker tag debezium-connect-dameng:3.6.4-xingchuang-kafka2.0 debezium-connect-dameng:kafka2.0
-docker save debezium-connect-dameng:3.6.4-xingchuang-kafka2.0 \
-  debezium-connect-dameng:kafka2.0 | gzip -1 \
-  > target/debezium-connect-dameng-3.6.4-xingchuang-kafka2.0-linux-amd64.tar.gz
-cd target
-sha256sum debezium-connect-dameng-3.6.4-xingchuang-kafka2.0-linux-amd64.tar.gz \
-  > debezium-connect-dameng-3.6.4-xingchuang-kafka2.0-linux-amd64.tar.gz.sha256
+bash debezium-connector-dameng/docker/build-image.sh
 ----
 
-构建命令跳过数据库集成测试，不代表发布验收完成。
-Agent 下载脚本在联网构建机执行；已有已校验 JAR 时无需重复下载。Docker 构建会再次校验 Agent SHA-256，并将 JAR 和指标映射配置写入镜像，运行时无需下载或挂载它们。
-离线机器同时复制归档和 SHA-256 文件，然后执行：
+脚本也可从任意工作目录通过绝对路径调用。它使用 Maven Wrapper 执行 `process-sources install -Passembly -DskipITs`，构建达梦 Connector、assembly 描述符及其依赖，运行单元测试并跳过数据库集成测试。
+脚本从 Maven 读取项目版本，以 `apache/kafka:3.9.1` 为基础构建 `linux/amd64` 镜像 `debezium-connect-dameng:<version>`，随后运行环境变量回归脚本 `test-env-config.sh`。
+Agent JAR 校验通过时复用，缺失或损坏时调用下载脚本；Docker 构建会再次校验 SHA-256。镜像内置 Agent 和指标映射配置，运行时无需下载或挂载。
+
+默认导出到 `debezium-connector-dameng/target/debezium-connect-dameng-<version>-linux-amd64.tar.gz`，并生成同名 `.sha256` 文件。脚本只构建、验证和导出，不推送镜像或部署容器；这些检查不代替发布验收。
+
+[cols="2,5",options="header"]
+|===
+|选项 |作用
+|`--image IMAGE` |覆盖镜像名称和标签。
+|`--base-image IMAGE` |覆盖基础镜像。
+|`--platform PLATFORM` |覆盖目标平台。
+|`--output FILE` |覆盖导出文件路径。
+|`--skip-build` |复用已有插件打包产物，跳过 Maven 编译打包；仍通过 Maven 读取项目版本。
+|`--no-export` |构建和验证镜像后不导出归档。
+|`--help` |查看用法。
+|`-- MAVEN_ARGS...` |追加 Maven 构建参数，例如 `-- -Dquick`。
+|===
+
+离线机器同时复制归档和 SHA-256 文件，在文件所在目录执行。以下以项目版本 `3.6.4-xingchuang-kafka2.0` 为例：
 
 [source,shell]
 ----
@@ -292,7 +355,14 @@ sha256sum -c debezium-connect-dameng-3.6.4-xingchuang-kafka2.0-linux-amd64.tar.g
 docker load -i debezium-connect-dameng-3.6.4-xingchuang-kafka2.0-linux-amd64.tar.gz
 ----
 
-版本标签标识插件版本，`kafka2.0` 是兼容旧 Compose 的别名。更新 tag 不会更新运行中的容器。
+脚本不自动创建 `kafka2.0` 别名。旧 Compose 使用该标签时，在构建机或导入后的机器上手动设置：
+
+[source,shell]
+----
+docker tag debezium-connect-dameng:3.6.4-xingchuang-kafka2.0 debezium-connect-dameng:kafka2.0
+----
+
+版本标签标识插件版本，`kafka2.0` 仅为兼容旧 Compose 的别名。更新 tag 不会更新运行中的容器。
 替换现有 Worker 前先按恢复章节核查 offset；不要删除 Kafka 数据卷来完成升级。
 
 === Kafka 2.0 的 Topic 准备
@@ -562,6 +632,54 @@ COMMIT;
 停止动作不撤回已经发布的行。`pause-snapshot`、`resume-snapshot`、`additional-conditions` 和 Kafka/JMX/file 信号通道来自公共框架，但尚无本模块与源表基本流程同等范围的端到端验收，应先在目标环境验证。
 即使使用其他触发通道，当前达梦增量快照仍需要源信号表协调水位，不能只配 Kafka 信号 Topic 就省略它。
 
+[id="dameng-incremental-snapshot-additional-conditions"]
+==== 带条件的增量初始化
+
+在 `execute-snapshot` 信号中添加 `additional-conditions`，可只对满足条件的存量行执行增量快照。
+沿用上述信号表配置，目标表须已纳入采集范围、建立结构基线并具有主键；使用默认 `snapshot.mode=no_data` 时，也可在进入持续采集后发送信号补数。
+
+例如，仅补数 `APP.CUSTOMERS` 中主键满足 `ID >= 1000 AND ID < 2000` 的行：
+
+[source,sql]
+----
+INSERT INTO APP.DBZ_SIGNAL (ID, TYPE, DATA) VALUES (
+    'customers-range-001',
+    'execute-snapshot',
+    '{"type":"incremental",
+      "data-collections":["APP.CUSTOMERS"],
+      "additional-conditions":[
+        {"data-collection":"APP.CUSTOMERS","filter":"ID >= 1000 AND ID < 2000"}
+      ]}'
+);
+COMMIT;
+----
+
+`data-collections` 指定本次补数的表，`additional-conditions` 中的 `data-collection` 指定条件适用的表，均使用 Connector 识别的 `schema.table` 名称。
+`filter` 只填写达梦 SQL 条件表达式，不带 `WHERE`、完整 `SELECT` 或结尾分号；Connector 会将其与主键分块条件组合。
+
+条件可以组合多个列。例如，表中另有 `NAME` 列时，补数上述主键范围内且 `NAME = 'Alice'` 的行：
+
+[source,sql]
+----
+INSERT INTO APP.DBZ_SIGNAL (ID, TYPE, DATA) VALUES (
+    'customers-range-name-001',
+    'execute-snapshot',
+    '{"type":"incremental",
+      "data-collections":["APP.CUSTOMERS"],
+      "additional-conditions":[
+        {"data-collection":"APP.CUSTOMERS","filter":"ID >= 1000 AND ID < 2000 AND NAME = ''Alice''"}
+      ]}'
+);
+COMMIT;
+----
+
+示例将 JSON 放在 SQL 字符串字面量中，因此条件中的单引号写成 `''`；信号表实际保存的 `filter` 为 `ID >= 1000 AND ID < 2000 AND NAME = 'Alice'`。
+每次请求使用新的唯一信号 ID；以上两条是独立示例，执行条件有重叠的请求可能重复输出同一行，下游仍需幂等处理。
+
+条件只限制本次增量快照读取的行，不改变后续 INSERT、UPDATE、DELETE 的 CDC 采集范围，也不会撤回下游已有数据。
+检查业务 Topic 中的 `op=r`、`source.snapshot=incremental`，并结合日志、通知或指标判断完成情况；并发更新或删除可能由 CDC 事件替代对应的快照行。
+`additional-conditions` 的模块验收范围仍以上述说明为准，使用前须在目标环境验证条件语法和结果。
+
 [id="dameng-logminer"]
 == 日志挖掘与资源调优
 
@@ -609,6 +727,7 @@ Connector 校验 LogMiner 必需字段、长 SQL 分片顺序、对象身份和�
 未支持操作仅在能够确定属于已排除表时过滤，否则停止。错误日志提供 LSN、XID、对象编号和归档位置。
 DDL/DML 解析失败还会输出完整拼接后的 SQL_REDO 和堆栈，日志应按源数据权限保护。
 `DATA_OBJV#` 仅用于诊断与分片一致性检查，不能代替历史表结构。
+直接核查归档与 `SQL_REDO` 的步骤见 <<dameng-manual-logminer,手动排查 LogMiner>>。
 
 === 调优顺序
 
@@ -1068,7 +1187,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`heartbeat.interval.ms` |`0` |0 关闭心跳，正值启用周期心跳，帮助低变更量来源提交安全位置；不强制数据库归档。
 |`heartbeat.action.query` |未指定 |心跳时通过独立数据库连接执行的 SQL，可产生源端活动；需要权限且应避免修改业务数据，不替代归档策略。
 |`heartbeat.topics.prefix` |`__debezium-heartbeat` |旧字段；默认命名策略使用 `topic.heartbeat.prefix`。
-|`errors.max.retries` |`-1` |可重试连接错误的重试上限，-1 不限制、0 不重试；不使 DDL、缺档、结构或磁盘错误变为可重试。
+|`errors.max.retries` |`-1` |可重试连接和数据库状态错误的重试上限，-1 不限制、0 不重试；不使 DDL、缺档、结构或磁盘错误变为可重试。
 |`retriable.restart.connector.wait.ms` |`10000` |可重试错误后重新启动 Task 的等待。
 |`event.processing.failure.handling.mode` |`fail` |公共分发处理策略 fail/warn/skip；warn/skip 可能丢事件，且不能绕过分发之前的达梦 DDL/DML、归档和身份校验。
 |`connection.validation.timeout.ms` |`60000` |公共连接有效性检查预算，不替代 statement/socket timeout。
@@ -1431,6 +1550,123 @@ docker run --rm --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules \
   prom/prometheus:v3.5.0 test rules prometheus-rules.test.yaml
 ----
 
+[id="dameng-manual-logminer"]
+== 手动排查 LogMiner
+
+以下步骤用于核对数据库能否从指定归档区间挖出变更。使用 CDC 账号建立独立连接，并在同一物理会话中完成文件注册、启动、查询和结束；权限要求见 <<dameng-database-setup,数据库准备>>。
+示例中的 `100000`、`101000` 为起止 LSN，占位路径也须替换为实际值。`STARTSCN`、`ENDSCN` 和结果中的 `SCN` 在此均指达梦 LSN，区间两端包含。
+SQL 块后的 `/` 用于 disql 执行；JDBC 或图形工具按其方式执行整个 `BEGIN ... END;` 块，不把 `/` 发给服务器。
+
+=== 确认实例与可挖掘范围
+
+[source,sql]
+----
+SET TIME ZONE '+00:00';
+SELECT MODE$, STATUS$ FROM V$INSTANCE;
+SELECT DB_MAGIC, CUR_LSN FROM V$RLOG;
+
+SELECT MIN(ARCH_LSN) AS FIRST_ARCHIVED_LSN,
+       MAX(CLSN) AS LAST_ARCHIVED_LSN
+FROM V$ARCH_FILE
+WHERE PATH IS NOT NULL;
+
+SELECT PATH, ARCH_LSN, CLSN, PREV_LSN,
+       DB_MAGIC, PMNT_MAGIC, SRC_DB_MAGIC, DSC_SEQNO
+FROM V$ARCH_FILE
+WHERE PATH IS NOT NULL
+  AND ARCH_LSN <= 101000
+  AND CLSN >= 100000
+ORDER BY ARCH_LSN;
+----
+
+从 Connector 错误日志或 offset 选择待核查区间。`CUR_LSN` 可能领先归档，不能直接用作可挖掘上界；归档最小/最大值也不能证明中间没有缺口，须核查文件区间和 `PREV_LSN` 链。
+注册覆盖区间的全部文件，路径是数据库服务器上的文件路径；多个本地归档目的地的副本不能重复注册。主备切换后的来源与连续性要求见 <<dameng-primary-standby-recovery,主备恢复>>。
+
+在备库上还需查询：
+
+[source,sql]
+----
+SELECT SLSN FROM V$RAPPLY_SYS;
+SELECT RPKG_LSN
+FROM V$RAPPLY_PARALLEL_INFO
+WHERE DSC_SEQNO = 0;
+----
+
+备库结束 LSN 不得超过 `min(连续归档上界, SLSN, RPKG_LSN)`。`SLSN` 表示允许重演的位置，`RPKG_LSN` 表示已经完成重演的位置。
+本手册验证的备库 LogMiner 构建为 8.1.3.162；旧 8.1.2.128 注册归档会报 `-710`，不能通过放开任意备库写入解决。
+
+=== 注册归档并启动挖掘
+
+在新建的排查会话中，对上一步选出的每个文件执行一次 `ADD_LOGFILE`。下例假设区间由两个文件覆盖；文件数量按实际结果调整，路径中的单引号须写成两个单引号。
+
+[source,sql]
+----
+BEGIN
+    DBMS_LOGMNR.ADD_LOGFILE(
+        LOGFILENAME => '/实际归档目录/归档1.log',
+        OPTIONS => DBMS_LOGMNR.ADDFILE);
+    DBMS_LOGMNR.ADD_LOGFILE(
+        LOGFILENAME => '/实际归档目录/归档2.log',
+        OPTIONS => DBMS_LOGMNR.ADDFILE);
+END;
+/
+
+SELECT LOG_ID, FILENAME, LOW_SCN, NEXT_SCN
+FROM V$LOGMNR_LOGS
+ORDER BY LOG_ID;
+
+BEGIN
+    DBMS_LOGMNR.START_LOGMNR(
+        STARTSCN => 100000,
+        ENDSCN => 101000,
+        OPTIONS => 2048);
+END;
+/
+----
+
+`2048` 为 `NO_ROWID_IN_STMT`，与 Connector 一致。为复现采集结果，保持此值，不额外叠加在线字典 `16`、去分隔符 `64` 或只取已提交事务 `2`。
+在线字典使用当前表结构解释日志，可能与历史列布局不一致；无在线字典时出现 `OBJ#`、`COL n` 是正常结果，Connector 通过 schema history 还原表名和列名。
+
+=== 查询原始日志记录
+
+启动成功后，在同一会话执行与 Connector 相同的字段查询和排序：
+
+[source,sql]
+----
+SELECT SCN, START_SCN, COMMIT_SCN, TIMESTAMP, XID,
+       OPERATION_CODE, ROLL_BACK, SEG_OWNER, TABLE_NAME, USERNAME,
+       SQL_REDO, RS_ID, SSN, CSF, DATA_OBJ#, DATA_OBJV#,
+       RBASQN, RBABLK, RBABYTE
+FROM V$LOGMNR_CONTENTS
+WHERE SCN >= 100000 AND SCN <= 101000
+ORDER BY SCN, RBASQN, RBABLK, RBABYTE, SSN;
+----
+
+初查保留所有表和操作，不只筛选 `SEG_OWNER`、`TABLE_NAME` 或 INSERT/UPDATE/DELETE，否则可能遗漏事务提交、回滚和 SQL 后续分片。
+
+* `XID` 标识事务；常见 `OPERATION_CODE` 为 `1` INSERT、`2` DELETE、`3` UPDATE、`5` DDL、`6` START、`7` COMMIT、`36` ROLLBACK、`38` XA COMMIT。
+* `CSF=1` 表示 SQL 还有后续片段，同一记录的 `SQL_REDO` 需按 `SSN` 顺序拼接到 `CSF=0`。检查客户端是否截断长文本，不能把单个片段当作完整 SQL。
+* `ROLL_BACK=1` 表示回滚记录。原始记录不等于最终 CDC 事件，Connector 还会重建事务并排除回滚结果。
+* 窗口内没有 COMMIT 不能证明事务最终未提交；扩大起止 LSN 并补齐归档，覆盖事务开始、提交或回滚后再判断。
+
+查询为空时，依次核查区间、归档注册、事务提交，以及 <<dameng-database-setup,逻辑日志设置>>；`RLOG_IGNORE_TABLE_SET=0` 时还须确认业务表和信号表都开启了表级逻辑日志。
+
+=== 结束排查会话
+
+[source,sql]
+----
+BEGIN
+    DBMS_LOGMNR.END_LOGMNR();
+END;
+/
+----
+
+即使中途查询失败，也应结束 LogMiner 或关闭专用连接。再次分析时重新注册文件并启动。
+备库排查在挖掘后还需复查角色、来源身份和回放边界；切换期间的结果不能直接作为同一稳定窗口的证据。
+手动查询不修改 Connector 的 offset 或 schema history，也不能替代其恢复校验。
+
+接口和视图定义见达梦官方 https://eco.dameng.com/document/dm/zh-cn/pm/dbms_logmnr-package.html[DBMS_LOGMNR 包]与 https://eco.dameng.com/document/dm/zh-cn/pm/dm8-admin-manual-appendix2.html[系统动态视图]。
+
 [id="dameng-faq"]
 == 常见问题与故障处理
 
@@ -1457,6 +1693,22 @@ docker run --rm --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules \
 |===
 
 连接类 IOException、SQLState 08、可恢复连接错误及主备无可用主库的特定错误按 errors.max.retries 重试。
+以下达梦错误在 Task 启动和运行期间也允许自动重启重试，按错误码识别，不依赖错误文字或 SQLState 是否存在：
+
+[cols="1,3,5",options="header"]
+|===
+|错误码 |错误描述 |恢复条件
+|`-510` |System in mount status |数据库结束 MOUNT 并恢复 OPEN，存在符合配置采集角色的可用节点。
+|`-517` |System in status changing |数据库状态切换完成，节点恢复可用。
+|`-522` |Session has been disabled, please reconnect |账号仍可登录，能够重新建立有效会话。
+|`-2082` |Primary or self node status changed |节点状态稳定，能够重新选择符合采集角色的节点，并通过恢复身份和归档连续性校验。
+|`-515` |System in suspend status |数据库解除 SUSPEND 并恢复 OPEN。
+|===
+
+这些错误沿用现有 Task 重启流程，关闭旧连接后重新按配置角色建连，并从持久化 offset 恢复；未确认事件可能重放。
+启动失败和运行期间的重试共用 `errors.max.retries` 预算，重启等待由 `retriable.restart.connector.wait.ms` 控制，默认 10000 毫秒。
+允许重试不保证能够恢复；数据库持续 MOUNT/SUSPEND、账号无法登录或没有合适节点时，仍需处理数据库原因，重试不会绕过身份、位点和归档校验。
+
 快照预算、SQL timeout、history 存储、落盘损坏、未知 DDL 和缺档等不是靠重连能修复的错误，应先处理原因。
 首次排查保存版本、配置键名、脱敏日志、LSN 和失败语句；不要把凭据、业务行或 history 全文直接公开。
 

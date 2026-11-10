@@ -17,16 +17,21 @@ import java.sql.SQLException;
 import java.sql.SQLRecoverableException;
 import java.sql.SQLTimeoutException;
 import java.sql.SQLTransientConnectionException;
+import java.time.Duration;
 
+import org.apache.kafka.connect.errors.RetriableException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.connector.dameng.logminer.LogMinerRow;
 import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer;
+import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.relational.history.SchemaHistoryException;
+import io.debezium.util.LoggingContext;
 
 class DamengErrorHandlerTest {
     @TempDir
@@ -47,6 +52,53 @@ class DamengErrorHandlerTest {
         assertThat(roleHandler.isRetriable(new SQLException("unrelated transaction error", "25000", -6509))).isFalse();
         assertThat(roleHandler.isRetriable(new SQLException("different SQLState", "42000", -6508))).isFalse();
         assertThat(roleHandler.isRetriable(new SQLException("invalid password", "28000", 6002))).isFalse();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "primary, -510", "primary, -517", "primary, -522", "primary, -2082", "primary, -515",
+            "standby, -510", "standby, -517", "standby, -522", "standby, -2082", "standby, -515"
+    })
+    void shouldRestartForDatabaseStatusErrorsWithinSharedRetryBudget(String role, int errorCode) {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
+                .with("database.capture.role", role).with("errors.max.retries", 2).build());
+        final var failure = new SQLException("database status or session changed", "22000", errorCode);
+        final var startup = new DamengErrorHandler(config, null, null);
+        assertThat(startup.canRetry(new IllegalStateException("startup failed", failure))).isTrue();
+
+        final var queue = new ChangeEventQueue.Builder<DataChangeEvent>()
+                .pollInterval(Duration.ofMillis(1)).maxBatchSize(8).maxQueueSize(64)
+                .loggingContextSupplier(() -> LoggingContext.forConnector("dameng", "test", "test")).build();
+        final var streaming = new DamengErrorHandler(config, queue, startup);
+        final var wrapper = new SQLException("query failed");
+        wrapper.setNextException(failure);
+        streaming.setProducerThrowable(wrapper);
+        assertThat(catchThrowable(queue::poll)).isInstanceOf(RetriableException.class).hasCause(wrapper);
+
+        final var exhausted = new DamengErrorHandler(config, null, streaming);
+        assertThat(exhausted.canRetry(failure)).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { -510, -517, -522, -2082, -515 })
+    void shouldRecognizeDatabaseStatusErrorsWithoutDependingOnSqlState(int errorCode) {
+        assertThat(handler.isRetriable(new SQLException("database status or session changed", null, errorCode))).isTrue();
+        assertThat(handler.isRetriable(new SQLException("database status or session changed", "", errorCode))).isTrue();
+        assertThat(handler.isRetriable(new SQLException("database status or session changed", "HY000", errorCode))).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { -510, -517, -522, -2082, -515 })
+    void shouldNotRetryDatabaseStatusErrorsWrappedByTimeoutOrHistoryFailure(int errorCode) {
+        final var failure = new SQLException("database status or session changed", "22000", errorCode);
+        assertThat(handler.isRetriable(new SQLTimeoutException("query exceeded its budget", failure))).isFalse();
+        assertThat(handler.isRetriable(new SchemaHistoryException("Cannot persist DDL", failure))).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { -501, -502, -503, -504, -511, -514, -518, -519 })
+    void shouldNotRetryOtherDatabaseStatusOrResourceErrors(int errorCode) {
+        assertThat(handler.isRetriable(new SQLException("System in status changing", "22000", errorCode))).isFalse();
     }
 
     @Test

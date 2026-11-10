@@ -71,16 +71,16 @@ public final class DamengErrorHandler extends ErrorHandler {
                 connectionFailure = true;
             }
             if (failure instanceof SQLException sql) {
-                // DM JDBC 8.1.3.140 reports no eligible member as 6091, and
-                // an in-flight transaction interrupted by manual MOUNT as
-                // -6508 / 25000, or a query racing with MOUNT as -510 / 22000.
-                // These require rebuilding the role-routed sessions.
-                if (sql.getErrorCode() == 6091
-                        || (sql.getErrorCode() == -6508 && "25000".equals(sql.getSQLState()))
-                        || (sql.getErrorCode() == -510 && "22000".equals(sql.getSQLState()))) {
-                    connectionFailure = true;
-                }
-                if (sql.getSQLState() != null && sql.getSQLState().startsWith("08")) {
+                // Rebuild role-routed sessions after status/node changes or a
+                // disabled session. Match these exact DM codes even when the
+                // driver omits SQLState; unrelated data errors remain fatal.
+                final boolean reconnectRequired = switch (sql.getErrorCode()) {
+                    case 6091, -510, -515, -517, -522, -2082 -> true;
+                    // An in-flight transaction interrupted by MOUNT.
+                    case -6508 -> "25000".equals(sql.getSQLState());
+                    default -> false;
+                };
+                if (reconnectRequired || (sql.getSQLState() != null && sql.getSQLState().startsWith("08"))) {
                     connectionFailure = true;
                 }
                 if (sql.getNextException() != null) {

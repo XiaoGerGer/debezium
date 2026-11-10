@@ -6,5 +6,7 @@
 
 [达梦 Connector 使用手册：部署与 REST 管理](../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-deployment)
 
+构建入口为 `bash debezium-connector-dameng/docker/build-image.sh`（仓库根目录），使用 `--help` 查看选项；也可从任意目录通过脚本绝对路径调用。
+
 此目录保留 Dockerfile、Worker 配置、启动脚本和环境变量回归脚本；使用说明只在统一手册维护。
 监控部署见同一手册的[监控与 Grafana](../../documentation/modules/ROOT/pages/connectors/dameng.adoc#dameng-monitoring)章节。
