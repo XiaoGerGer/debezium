@@ -102,7 +102,7 @@ class DamengCaptureScopeIT extends AbstractAsyncEngineConnectorTest {
     @ParameterizedTest
     @ValueSource(strings = { "initial", "no_data" })
     void shouldExpandShrinkAndReAddWithoutMovingTheRetainedTableOffsetOrBackfillingRows(String snapshotMode) throws Exception {
-        config = config.edit().with("snapshot.mode", snapshotMode).build();
+        config = config.edit().with("snapshot.mode", snapshotMode).with("snapshot.locking.mode", "shared").build();
         startAndWait();
         if (snapshotMode.equals("initial")) {
             assertRow(nextData(), retained, "r", 1, "NAME");
@@ -256,7 +256,7 @@ class DamengCaptureScopeIT extends AbstractAsyncEngineConnectorTest {
     void shouldRejectScopeChangesWhileAnInitialSnapshotIsIncomplete() throws Exception {
         insert(retained, 2);
         writer.commit();
-        config = config.edit().with("snapshot.mode", "initial").build();
+        config = config.edit().with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").build();
         startAndWait();
         final var checkpoint = assertRow(nextData(), retained, "r", 1, "NAME");
         assertThat(envelope(checkpoint).getStruct("source").getString("snapshot")).isIn("first", "true");

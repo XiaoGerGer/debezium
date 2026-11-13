@@ -115,6 +115,48 @@ class DamengRuntimeSafetyIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
+    void shouldAllowBusinessWritesButBlockTableAlterWhileHoldingIntentShared() throws Exception {
+        final var lockConfig = new DamengConnectorConfig(config);
+        try (var snapshot = new DamengConnection(lockConfig.getJdbcConfig())) {
+            snapshot.connection().setAutoCommit(false);
+            final var lock = java.util.ServiceLoader.load(io.debezium.snapshot.spi.SnapshotLock.class).stream()
+                    .map(java.util.ServiceLoader.Provider::get).filter(provider -> provider.name().equals("intent_shared")).findFirst().orElseThrow();
+            snapshot.executeWithoutCommitting(lock.tableLockingStatement(Duration.ofSeconds(1), tableName()).orElseThrow());
+            try (var statement = writer.createStatement()) {
+                statement.setQueryTimeout(1);
+                statement.execute("INSERT INTO " + tableName() + " VALUES(1,0)");
+                statement.execute("UPDATE " + tableName() + " SET REVISION=1 WHERE ID=1");
+                statement.execute("DELETE FROM " + tableName() + " WHERE ID=1");
+                writer.commit();
+                assertThatThrownBy(() -> statement.execute("ALTER TABLE " + tableName() + " ADD EXTRA INT"))
+                        .isInstanceOf(SQLException.class);
+                writer.rollback();
+                snapshot.rollback();
+                statement.execute("ALTER TABLE " + tableName() + " ADD EXTRA INT");
+                writer.commit();
+            }
+        }
+    }
+
+    @Test
+    void shouldCaptureOnlyPostBaselineWritesOfATransactionOpenBeforeIntentSnapshot() throws Exception {
+        config = config.edit().with("snapshot.locking.mode", "intent_shared").build();
+        execute("INSERT INTO " + tableName() + " VALUES(1,0)");
+        startEngine();
+        waitForStreamingRunning("dameng", "dameng");
+        assertThat(failure.get()).isNull();
+        execute("INSERT INTO " + tableName() + " VALUES(2,0)");
+        writer.commit();
+        final var record = nextDataRecord();
+        assertThat(((Struct) record.value()).getStruct("after").getInt32("ID")).isEqualTo(2);
+        assertThat(record.sourceOffset()).containsKey("snapshot_baseline_lsn");
+        execute("INSERT INTO " + tableName() + " VALUES(3,0)");
+        writer.commit();
+        assertThat(((Struct) nextDataRecord().value()).getStruct("after").getInt32("ID")).isEqualTo(3);
+        assertThat(failure.get()).isNull();
+    }
+
+    @Test
     void shouldExposeSnapshotLockWaitingAndConfirmedReleaseThroughJmx() throws Exception {
         execute("INSERT INTO " + tableName() + " VALUES(1,0)");
         config = config.edit().with("snapshot.mode", "initial").with("snapshot.max.duration.ms", 30_000).build();
@@ -161,7 +203,7 @@ class DamengRuntimeSafetyIT extends AbstractAsyncEngineConnectorTest {
     void shouldReleaseSnapshotLocksWhenDownstreamStallsPastTheDeadline() throws Exception {
         insertRows(500);
         writer.commit();
-        config = config.edit().with("snapshot.mode", "initial").with("snapshot.max.duration.ms", 2_000).build();
+        config = config.edit().with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("snapshot.max.duration.ms", 2_000).build();
         startEngine();
         // The consumer deliberately does not drain its 64-record queue. Snapshot
         // work must terminate even while the event producer is blocked enqueueing.
@@ -187,7 +229,7 @@ class DamengRuntimeSafetyIT extends AbstractAsyncEngineConnectorTest {
         insertRows(500);
         writer.commit();
         // Explicit shutdown must release the lock well before the snapshot timer.
-        config = config.edit().with("snapshot.mode", "initial").with("snapshot.max.duration.ms", 60_000).build();
+        config = config.edit().with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("snapshot.max.duration.ms", 60_000).build();
         startEngine();
         Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> consumedLines.size() == 64);
         assertThat(failure.get()).isNull();

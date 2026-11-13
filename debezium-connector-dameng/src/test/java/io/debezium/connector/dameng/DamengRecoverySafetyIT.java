@@ -105,7 +105,7 @@ class DamengRecoverySafetyIT extends AbstractAsyncEngineConnectorTest {
                 .with("table.include.list", DamengTestDatabase.schema() + "\\." + table)
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", directory.resolve("schema-history.dat").toString())
-                .with("snapshot.mode", "initial").with("poll.interval.ms", 100)
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("poll.interval.ms", 100)
                 .with("retriable.restart.connector.wait.ms", 100).with("offset.flush.interval.ms", 100)
                 .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
     }

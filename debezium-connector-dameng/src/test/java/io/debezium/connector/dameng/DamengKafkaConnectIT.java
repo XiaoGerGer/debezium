@@ -433,6 +433,7 @@ class DamengKafkaConnectIT {
         config.put("database.dbname", "DAMENG");
         config.put("table.include.list", "SYSDBA\\." + table);
         config.put("snapshot.mode", "initial");
+        config.put("snapshot.locking.mode", "shared");
         config.put("schema.history.internal.kafka.bootstrap.servers", environment.internalBootstrapServers());
         config.put("schema.history.internal.kafka.topic", historyTopic);
         config.put("include.schema.changes", "false");

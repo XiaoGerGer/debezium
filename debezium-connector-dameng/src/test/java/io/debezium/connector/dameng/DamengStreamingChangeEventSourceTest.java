@@ -190,6 +190,55 @@ class DamengStreamingChangeEventSourceTest {
         return Map.of("SCN", lsn, "START_SCN", start, "COMMIT_SCN", lsn, "XID", new byte[]{ (byte) xid }, "OPERATION_CODE", 7);
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = { false, true })
+    void shouldBoundAnOldTransactionSuffixAcrossWindowsAndRestart(boolean restarted) throws Exception {
+        config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10).build());
+        createSource();
+        final var stored = new HashMap<String, Object>(new DamengOffsetContext(config, 100).getOffset());
+        stored.put("snapshot_baseline_lsn", 100L);
+        final var offset = new DamengOffsetContext.Loader(config).load(stored);
+        final var polls = new AtomicInteger();
+        when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
+            if (polls.incrementAndGet() > (restarted ? 2 : 3)) {
+                running.set(false);
+            }
+            return 130L;
+        });
+        final List<Long> starts = new ArrayList<>();
+        doAnswer(invocation -> {
+            final long start = invocation.getArgument(0);
+            starts.add(start);
+            if (start == 100 && starts.size() == 1) {
+                records(List.of());
+            }
+            else if (start == 111 || (start == 110 && starts.size() == 1)) {
+                // Its START and earlier writes preceded the schema baseline.
+                records(List.of(dml(115, 50, 0, 1)));
+            }
+            else if (start == 121) {
+                records(List.of(commit(125, 0, 1), commit(126, 0, 2)));
+            }
+            else if (start == 100) {
+                records(List.of(dml(115, 50, 125, 1), commit(125, 50, 1), commit(126, 0, 2)));
+            }
+            else {
+                throw new AssertionError("Unexpected mining start " + start);
+            }
+            return null;
+        }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
+        if (restarted) {
+            // Restart resumes an acknowledged empty window with the same floor.
+            offset.setLsn(110);
+        }
+        source.execute(context, new DamengPartition("dm"), offset);
+        assertThat(failure.get()).isNull();
+        assertThat(starts).contains(restarted ? new Long[]{ 110L, 121L, 100L } : new Long[]{ 100L, 111L, 121L, 100L });
+        assertThat(delivered).singleElement().satisfies(value -> assertThat(value).containsEntry("change_lsn", 115L));
+        assertThat(offset.getLsn()).isEqualTo(130);
+        assertThat(offset.getOffset().get("snapshot_baseline_lsn")).isEqualTo(100L);
+    }
+
     @Nested
     class MiningWindows {
         @ParameterizedTest

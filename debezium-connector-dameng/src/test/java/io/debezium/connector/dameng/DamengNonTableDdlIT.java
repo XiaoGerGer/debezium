@@ -140,7 +140,7 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
                 .with("table.include.list", Pattern.quote(table))
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
-                .with("snapshot.mode", "initial").with("poll.interval.ms", 100)
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("poll.interval.ms", 100)
                 .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
         startEngine();
         rowSchema = after(next("r", 0)).schema();
@@ -351,7 +351,7 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
                     .with("table.include.list", Pattern.quote(table))
                     .with("schema.history.internal", FileSchemaHistory.class.getName())
                     .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
-                    .with("snapshot.mode", "initial").with("poll.interval.ms", 100)
+                    .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("poll.interval.ms", 100)
                     .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
             startEngine();
             rowSchema = after(next("r", 0)).schema();
@@ -441,7 +441,7 @@ class DamengNonTableDdlIT extends AbstractAsyncEngineConnectorTest {
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
                 .with(DamengConnectorConfig.CASCADE_DROP_IGNORE, true)
-                .with("snapshot.mode", "initial").with("poll.interval.ms", 100)
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("poll.interval.ms", 100)
                 .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
         startEngine();
         final var snapshot = next("r", 0);

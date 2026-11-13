@@ -177,6 +177,7 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
 
     private void lockTables(ChangeEventSourceContext sourceContext, Collection<TableId> tables) throws SQLException, InterruptedException {
         final var currentNonRow = connection.readNonRowTableIds();
+        final var lockMode = config.getSnapshotLockingMode().orElseThrow().getValue();
         for (TableId table : tables) {
             if (!sourceContext.isRunning()) {
                 throw new InterruptedException("Interrupted while locking " + table);
@@ -188,24 +189,25 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
             }
             // Use the configured statement timeout without committing the transaction
             // that must hold these locks until the snapshot has finished.
-            LOGGER.info("Dameng snapshot acquiring shared lock on table {} (currently locked tables={})", table, locks.lockedTableCount());
+            LOGGER.info("Dameng snapshot acquiring {} lock on table {} (currently locked tables={})", lockMode, table, locks.lockedTableCount());
             locks.lockWaitStarted();
             try {
                 final var lockConnection = standby == null ? connection : standby.primary();
-                lockConnection.executeWithoutCommitting("LOCK TABLE " + lockConnection.quotedTableIdString(table) + " IN SHARE MODE");
+                lockConnection.executeWithoutCommitting(snapshotterService.getSnapshotLock()
+                        .tableLockingStatement(config.snapshotLockTimeout(), lockConnection.quotedTableIdString(table)).orElseThrow());
             }
             catch (SQLException | RuntimeException | Error e) {
                 final long elapsedMillis = locks.lockWaitFinished(false);
-                LOGGER.warn("Dameng snapshot could not acquire shared lock on table {} after {} ms (currently locked tables={}): {}",
-                        table, elapsedMillis, locks.lockedTableCount(), e.getMessage());
+                LOGGER.warn("Dameng snapshot could not acquire {} lock on table {} after {} ms (currently locked tables={}): {}",
+                        lockMode, table, elapsedMillis, locks.lockedTableCount(), e.getMessage());
                 if (standby != null && e instanceof SQLException) {
                     standby.validate(connection);
                 }
                 throw e;
             }
             final long elapsedMillis = locks.lockWaitFinished(true);
-            LOGGER.info("Dameng snapshot acquired shared lock on table {} in {} ms (currently locked tables={})",
-                    table, elapsedMillis, locks.lockedTableCount());
+            LOGGER.info("Dameng snapshot acquired {} lock on table {} in {} ms (currently locked tables={})",
+                    lockMode, table, elapsedMillis, locks.lockedTableCount());
         }
     }
 
@@ -230,16 +232,17 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
         if (snapshotConnection != null) {
             locks.locksReleased();
             if (locks.resultAvailable()) {
-                LOGGER.info("Dameng snapshot transaction rolled back; shared table locks released "
+                LOGGER.info("Dameng snapshot transaction rolled back; {} table locks released "
                         + "(tables={}, total acquisition time={} ms, maximum single-table acquisition time={} ms, holding time={} ms)",
-                        locks.lastLockedTableCount(), locks.lastWaitDurationMillis(), locks.lastMaxWaitDurationMillis(), locks.lastHoldDurationMillis());
+                        config.getSnapshotLockingMode().orElseThrow().getValue(), locks.lastLockedTableCount(), locks.lastWaitDurationMillis(),
+                        locks.lastMaxWaitDurationMillis(), locks.lastHoldDurationMillis());
             }
         }
     }
 
     @Override
     protected void releaseSchemaSnapshotLocks(RelationalSnapshotContext<DamengPartition, DamengOffsetContext> context) throws SQLException {
-        // Keep all shared table locks through the data snapshot. The base class rolls
+        // Keep the selected table locks until the snapshot finishes. The base class rolls
         // back this transaction after data and schema have been read, including on failure.
     }
 
@@ -262,9 +265,17 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
             context.offset = previousOffset;
         }
         else {
-            context.offset = new DamengOffsetContext(config, snapshotBoundary());
+            context.offset = newSnapshotOffset();
         }
         validateDatabaseIdentity(context.offset);
+    }
+
+    private DamengOffsetContext newSnapshotOffset() throws SQLException {
+        final var offset = new DamengOffsetContext(config, snapshotBoundary());
+        if (config.getSnapshotLockingMode().orElseThrow() == DamengConnectorConfig.SnapshotLockingMode.INTENT_SHARED) {
+            offset.setSnapshotBaselineLsn(offset.getLsn());
+        }
+        return offset;
     }
 
     @Override
@@ -364,7 +375,7 @@ public final class DamengSnapshotChangeEventSource extends RelationalSnapshotCha
             schemaTables.addAll(addedSchemaTables);
             context.capturedSchemaTables = schemaTables;
             if (!addedSchemaTables.isEmpty()) {
-                context.offset = new DamengOffsetContext(config, snapshotBoundary());
+                context.offset = newSnapshotOffset();
                 validateDatabaseIdentity(context.offset);
             }
             if (!addedDataTables.isEmpty()) {

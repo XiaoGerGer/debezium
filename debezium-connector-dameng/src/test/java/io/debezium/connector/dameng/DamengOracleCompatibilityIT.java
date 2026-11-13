@@ -131,7 +131,7 @@ class DamengOracleCompatibilityIT extends AbstractAsyncEngineConnectorTest {
                 .with("table.include.list", "SYSDBA\\.DBZ_ORA(_LATE)?")
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
-                .with("snapshot.mode", "initial")
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared")
                 .with("time.precision.mode", precision)
                 .with("poll.interval.ms", 100)
                 .with("include.schema.changes", false)

@@ -1,1 +1,2 @@
 io.debezium.connector.dameng.snapshot.SharedSnapshotLock
+io.debezium.connector.dameng.snapshot.IntentSharedSnapshotLock

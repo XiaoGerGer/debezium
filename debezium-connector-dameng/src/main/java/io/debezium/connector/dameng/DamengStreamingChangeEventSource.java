@@ -113,7 +113,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
         metrics.onRecoveryBaseline(offset);
         try (var buffer = new LogMinerTransactionBuffer(config.getLogMiningBufferMemoryBytes(), config.getLogMiningBufferMaxSqlBytes(),
                 config.getLogMiningBufferMaxTransactions(), Path.of(config.getLogMiningBufferSpillPath()), config.getLogMiningBufferSpillMaxBytes(),
-                offset.getRecoveryBaselineLsn())) {
+                offset.getTransactionBaselineLsn())) {
             connection.validateLogMiningConfiguration();
             connection.validateCompatibilityEnvironment(offset);
             ddlParser = connection.createDdlParser();

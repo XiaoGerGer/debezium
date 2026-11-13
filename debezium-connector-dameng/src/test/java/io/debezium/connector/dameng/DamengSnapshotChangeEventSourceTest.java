@@ -84,6 +84,7 @@ class DamengSnapshotChangeEventSourceTest {
         running = mock(ChangeEventSourceContext.class);
         listener = mock(SnapshotProgressListener.class);
         snapshotterService = mock(SnapshotterService.class);
+        when(snapshotterService.getSnapshotLock()).thenReturn(new io.debezium.connector.dameng.snapshot.SharedSnapshotLock());
         clock = Clock.SYSTEM;
         when(connection.quotedTableIdString(any())).thenAnswer(invocation -> ((TableId) invocation.getArgument(0)).toDoubleQuotedString());
         when(connection.currentLsn()).thenReturn(100L, 200L, 300L);
@@ -94,7 +95,7 @@ class DamengSnapshotChangeEventSourceTest {
     @ParameterizedTest
     @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
     void shouldKeepNonRowIdentityInHistoryWithoutLockingOrScanningRows(DamengTableType kind) throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         context.capturedTables.add(ADDED);
         final var identity = new DamengTableType.Identity(kind, 71);
@@ -123,7 +124,7 @@ class DamengSnapshotChangeEventSourceTest {
     @ParameterizedTest
     @CsvSource({ "EXTERNAL,0", "EXTERNAL,72", "TEMPORARY,0", "TEMPORARY,72" })
     void shouldRejectChangedNonRowIdentityAcrossSnapshotBoundary(DamengTableType kind, long replacement) throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         when(connection.readNonRowTableIds()).thenReturn(Map.of(EXISTING, new DamengTableType.Identity(kind, 71)),
                 replacement == 0 ? Map.of() : Map.of(EXISTING, new DamengTableType.Identity(kind, replacement)));
@@ -137,7 +138,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldRejectANonRowKindChangeEvenWhenTheObjectNumberIsUnchanged() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         when(connection.readNonRowTableIds()).thenReturn(Map.of(EXISTING, new DamengTableType.Identity(DamengTableType.EXTERNAL, 71)),
                 Map.of(EXISTING, new DamengTableType.Identity(DamengTableType.TEMPORARY, 71)));
@@ -152,7 +153,7 @@ class DamengSnapshotChangeEventSourceTest {
     @EnumSource(value = DamengTableType.class, names = { "EXTERNAL", "TEMPORARY" })
     @SuppressWarnings("unchecked")
     void shouldPersistNonRowOnlySnapshotWithoutPublishingSchemaEvents(DamengTableType kind) throws Exception {
-        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
+        final var config = new DamengConnectorConfig(sharedConfiguration().build());
         final var schema = mock(DamengDatabaseSchema.class);
         final var dispatcher = mock(EventDispatcher.class);
         final MainConnectionProvidingConnectionFactory<DamengConnection> factory = mock(MainConnectionProvidingConnectionFactory.class);
@@ -174,8 +175,25 @@ class DamengSnapshotChangeEventSourceTest {
     }
 
     @Test
-    void shouldHoldPrimaryLocksBeforeChoosingAReplayedStandbySnapshotBoundary() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().with("database.capture.role", "standby").build());
+    void shouldReplaceTheIntentSharedBaselineWhenDiscoveringTables() throws Exception {
+        final var source = source(DamengTestConfiguration.configuration().with("snapshot.locking.mode", "intent_shared").build());
+        final var context = context();
+        when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING, ADDED));
+        source.lockTablesForSchemaSnapshot(running, context);
+        source.determineSnapshotOffset(context, null);
+        assertThat(context.offset.getOffset().get("snapshot_baseline_lsn")).isEqualTo(100L);
+        source.readTableStructure(running, context, null, new SnapshottingTask(true, false, List.of(), Map.of(), false));
+        verify(connection).executeWithoutCommitting("LOCK TABLE \"APP\".\"EXISTING\" IN INTENT SHARE MODE");
+        verify(connection).executeWithoutCommitting("LOCK TABLE \"APP\".\"ADDED\" IN INTENT SHARE MODE");
+        assertThat(context.offset.getLsn()).isEqualTo(200);
+        assertThat(context.offset.getOffset().get("snapshot_baseline_lsn")).isEqualTo(200L);
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "shared,SHARE", "intent_shared,INTENT SHARE" })
+    void shouldHoldPrimaryLocksBeforeChoosingAReplayedStandbySnapshotBoundary(String mode, String sqlMode) throws Exception {
+        final var source = source(sharedConfiguration().with("database.capture.role", "standby")
+                .with("snapshot.locking.mode", mode).build());
         when(connection.requiresDatabaseLineage()).thenReturn(true);
         final var primary = mock(DamengConnection.class);
         final var standby = mock(DamengStandbySupport.class);
@@ -187,7 +205,7 @@ class DamengSnapshotChangeEventSourceTest {
         source.lockTablesForSchemaSnapshot(running, context);
         source.determineSnapshotOffset(context, null);
         final var order = inOrder(primary, standby, connection);
-        order.verify(primary).executeWithoutCommitting("LOCK TABLE \"APP\".\"EXISTING\" IN SHARE MODE");
+        order.verify(primary).executeWithoutCommitting("LOCK TABLE \"APP\".\"EXISTING\" IN " + sqlMode + " MODE");
         order.verify(standby).snapshotBoundary(connection);
         order.verify(connection).validatePrimaryStandbyIdentity(context.offset);
         assertThat(context.offset.getLsn()).isEqualTo(432);
@@ -200,7 +218,7 @@ class DamengSnapshotChangeEventSourceTest {
     @Test
     @SuppressWarnings("unchecked")
     void shouldPersistOneRecoveryBaselineWithoutPublishingIndividualSchemaEvents() throws Exception {
-        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("recovery.restart.nonce", "first").build());
+        final var config = new DamengConnectorConfig(sharedConfiguration().with("recovery.restart.nonce", "first").build());
         final var recovery = mock(DamengRecovery.class);
         when(recovery.isRequested()).thenReturn(true);
         final var schema = mock(DamengDatabaseSchema.class);
@@ -229,7 +247,7 @@ class DamengSnapshotChangeEventSourceTest {
     @ValueSource(strings = { "stopped", "missing", "history" })
     @SuppressWarnings("unchecked")
     void shouldAbortRecoveryBeforeAnyEventIfBaselineCannotBeEstablished(String fault) throws Exception {
-        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
+        final var config = new DamengConnectorConfig(sharedConfiguration().build());
         final var recovery = mock(DamengRecovery.class);
         when(recovery.isRequested()).thenReturn(true);
         final var dispatcher = mock(EventDispatcher.class);
@@ -266,7 +284,7 @@ class DamengSnapshotChangeEventSourceTest {
         final var nanos = new AtomicLong();
         clock = mock(Clock.class);
         when(clock.currentTimeInNanos()).thenAnswer(invocation -> nanos.get());
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         context.capturedTables.add(ADDED);
         doAnswer(invocation -> {
@@ -294,7 +312,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldLogFailedAcquisitionAndNotCountTheFailedTableAsLocked() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         doThrow(new SQLException("lock timed out")).when(connection).executeWithoutCommitting(any());
         assertThatThrownBy(() -> source.lockTablesForSchemaSnapshot(running, context())).isInstanceOf(SQLException.class);
         assertThat(logs.containsWarnMessage("could not acquire shared lock on table APP.EXISTING")).isTrue();
@@ -305,7 +323,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldKeepObservedLocksAndWarnWhenRollbackFails() throws Exception {
-        final var raw = DamengTestConfiguration.configuration().build();
+        final var raw = sharedConfiguration().build();
         final var config = new DamengConnectorConfig(raw);
         final var metrics = new DamengSnapshotChangeEventSourceMetrics(new DamengTaskContext(raw, config),
                 mock(ChangeEventQueueMetrics.class), new DamengEventMetadataProvider());
@@ -324,7 +342,7 @@ class DamengSnapshotChangeEventSourceTest {
     }
 
     @Test
-    void shouldLockNewlyDiscoveredTablesBeforeAdvancingSnapshotPosition() throws Exception {
+    void shouldUseDefaultSharedLocksForNewlyDiscoveredTablesBeforeAdvancingSnapshotPosition() throws Exception {
         final var source = source(DamengTestConfiguration.configuration().with("table.include.list", "APP\\.EXISTING,APP\\.ADDED").build());
         final var context = context();
         when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING, ADDED));
@@ -335,6 +353,7 @@ class DamengSnapshotChangeEventSourceTest {
 
         assertThat(context.capturedTables).containsExactly(ADDED, EXISTING);
         assertThat(context.offset.getLsn()).isEqualTo(200);
+        assertThat(context.offset.getOffset()).doesNotContainKey("snapshot_baseline_lsn");
         final var order = inOrder(connection);
         order.verify(connection).executeWithoutCommitting("LOCK TABLE \"APP\".\"EXISTING\" IN SHARE MODE");
         order.verify(connection).currentLsn();
@@ -348,7 +367,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldWarnAboutAnUndiscoveredConfiguredTableAndLogOnlySelectedTables() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration()
+        final var source = source(sharedConfiguration()
                 .with("table.include.list", "APP\\.EXISTING,APP\\.MISSING").with("database.user", "CDC_USER").build());
         final var context = context();
         context.capturedSchemaTables.add(new TableId(null, "SYSDBA", "##PLAN_TABLE"));
@@ -367,7 +386,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldWarnAboutUnmatchedFutureTablePatternsWithoutStoppingTheSnapshot() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration()
+        final var source = source(sharedConfiguration()
                 .with("table.include.list", "APP\\.EXISTING,APP\\.FUTURE_.*").build());
         final var context = context();
         when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING));
@@ -382,7 +401,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldUseFullNameMatchingWhenWarningAboutIncludePatterns() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().with("table.include.list", "APP\\.EXIST").build());
+        final var source = source(sharedConfiguration().with("table.include.list", "APP\\.EXIST").build());
         final var context = context();
         context.capturedTables.clear();
         context.capturedSchemaTables.clear();
@@ -399,7 +418,7 @@ class DamengSnapshotChangeEventSourceTest {
     @Test
     void shouldPreserveCaseInsensitiveMatchingQuantifiersAndEscapedCommasInDiagnostics() throws Exception {
         final var table = new TableId(null, "APP", "ORDER,LOG12");
-        final var source = source(DamengTestConfiguration.configuration().with("table.include.list", "app\\.order\\,log\\d{1\\,3}").build());
+        final var source = source(sharedConfiguration().with("table.include.list", "app\\.order\\,log\\d{1\\,3}").build());
         final var context = context();
         context.capturedTables = new LinkedHashSet<>(Set.of(table));
         context.capturedSchemaTables = new LinkedHashSet<>(Set.of(table));
@@ -414,7 +433,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldNotWarnForSchemaTablesExcludedOnlyFromTheRowSnapshot() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().with("table.include.list", "APP\\.EXISTING,APP\\.ADDED").build());
+        final var source = source(sharedConfiguration().with("table.include.list", "APP\\.EXISTING,APP\\.ADDED").build());
         final var context = context();
         context.capturedSchemaTables.add(ADDED);
         when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING, ADDED));
@@ -429,7 +448,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldNotWarnForOtherConfiguredTablesDuringAnOnDemandSnapshot() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().with("table.include.list", "APP\\.EXISTING,APP\\.ADDED").build());
+        final var source = source(sharedConfiguration().with("table.include.list", "APP\\.EXISTING,APP\\.ADDED").build());
         final var context = context();
 
         source.readTableStructure(running, context, null, new SnapshottingTask(true, true, List.of("APP\\.EXISTING"), Map.of(), true));
@@ -440,7 +459,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldLogNoDataTablesForASchemaOnlySnapshot() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING));
 
@@ -455,7 +474,7 @@ class DamengSnapshotChangeEventSourceTest {
     @Test
     void shouldRepeatDiscoveryUntilNoAdditionalTableAppears() throws Exception {
         final var third = new TableId(null, "APP", "THIRD");
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING, ADDED), Set.of(EXISTING, ADDED, third));
 
@@ -473,7 +492,7 @@ class DamengSnapshotChangeEventSourceTest {
     void shouldRespectSnapshotAndTableFiltersDuringRediscovery() throws Exception {
         final var excluded = new TableId(null, "APP", "EXCLUDED");
         final var otherSnapshot = new TableId(null, "APP", "OTHER_SNAPSHOT");
-        final var source = source(DamengTestConfiguration.configuration().with("table.exclude.list", "APP\\.EXCLUDED").build());
+        final var source = source(sharedConfiguration().with("table.exclude.list", "APP\\.EXCLUDED").build());
         final var context = context();
         when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING, ADDED, excluded, otherSnapshot));
 
@@ -490,7 +509,7 @@ class DamengSnapshotChangeEventSourceTest {
     @Test
     void shouldRediscoverSignalTableOutsideTheUserTableIncludeList() throws Exception {
         final var signal = new TableId(null, "APP", "SIGNAL");
-        final var source = source(DamengTestConfiguration.configuration().with("table.include.list", "APP\\.EXISTING")
+        final var source = source(sharedConfiguration().with("table.include.list", "APP\\.EXISTING")
                 .with("signal.data.collection", "APP.SIGNAL").build());
         final var context = context();
         when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING, ADDED, signal));
@@ -505,7 +524,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldKeepOriginalPositionWhenNoCapturedTableWasAdded() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING));
 
@@ -519,9 +538,9 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldNotAdvanceARecoveredStreamingOffset() throws Exception {
-        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().build());
+        final var config = new DamengConnectorConfig(sharedConfiguration().build());
         final var previous = new DamengOffsetContext(config, 50);
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
 
         source.determineSnapshotOffset(context, previous);
@@ -534,7 +553,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldAbortRediscoveryWhenTheConnectorStops() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         source.determineSnapshotOffset(context, null);
         when(running.isRunning()).thenReturn(false);
@@ -546,7 +565,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldDelegateSelectToTheConfiguredSnapshotQuery() {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var query = mock(SnapshotQuery.class);
         final List<String> columns = List.of("\"ID\"", "\"NAME\"");
         when(snapshotterService.getSnapshotQuery()).thenReturn(query);
@@ -558,7 +577,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldUseSchemaTableSetWhenPersistingDefinitionsForNonSnapshottedTables() {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         context.capturedSchemaTables = new LinkedHashSet<>(Set.of(EXISTING, ADDED));
 
@@ -568,7 +587,7 @@ class DamengSnapshotChangeEventSourceTest {
     @Test
     void shouldExcludeUncapturedSchemaTablesAndKeepTheSignalTable() throws Exception {
         final var signal = new TableId(null, "APP", "SIGNAL");
-        final var source = source(DamengTestConfiguration.configuration().with("table.include.list", "APP\\.EXISTING")
+        final var source = source(sharedConfiguration().with("table.include.list", "APP\\.EXISTING")
                 .with("signal.data.collection", "APP.SIGNAL").build());
         final var context = context();
         context.capturedTables.add(signal);
@@ -584,7 +603,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldLockTablesExcludedFromTheRowSnapshotBeforeReadingTheOffset() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         context.capturedSchemaTables.add(ADDED);
 
@@ -600,7 +619,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldRejectSnapshotCompletionAfterPrimaryChanges() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         source.determineSnapshotOffset(context, null);
         context.offset.preSnapshotStart(false);
@@ -613,7 +632,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldValidatePrimaryAtTheSnapshotCompletionBoundary() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         source.determineSnapshotOffset(context, null);
         context.offset.preSnapshotStart(false);
@@ -627,7 +646,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldDiscoverSchemaOnlyTablesWithoutAddingTheirRowsToTheSnapshot() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var context = context();
         when(connection.getAllTableIds(null)).thenReturn(Set.of(EXISTING, ADDED));
 
@@ -649,7 +668,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldReadSchemaForTablesExcludedFromTheDataSnapshot() throws Exception {
-        final var source = source(DamengTestConfiguration.configuration().with("column.exclude.list", "APP\\.ADDED\\.SECRET").build());
+        final var source = source(sharedConfiguration().with("column.exclude.list", "APP\\.ADDED\\.SECRET").build());
         final var context = context();
         context.capturedSchemaTables = new LinkedHashSet<>(Set.of(EXISTING, ADDED));
         context.tables.overwriteTable(Table.editor().tableId(ADDED)
@@ -672,7 +691,7 @@ class DamengSnapshotChangeEventSourceTest {
     @Test
     @SuppressWarnings("unchecked")
     void shouldUseConfiguredDatabaseNameForInitialSnapshotSchemaChanges() {
-        final var configuration = DamengTestConfiguration.configuration()
+        final var configuration = sharedConfiguration()
                 .with("database.dbname", "DM_TEST")
                 .with("include.schema.changes", true)
                 .build();
@@ -695,7 +714,7 @@ class DamengSnapshotChangeEventSourceTest {
 
     @Test
     void shouldHonorACustomSnapshotQueryThatSkipsATable() {
-        final var source = source(DamengTestConfiguration.configuration().build());
+        final var source = source(sharedConfiguration().build());
         final var query = mock(SnapshotQuery.class);
         when(snapshotterService.getSnapshotQuery()).thenReturn(query);
         when(query.snapshotQuery("\"APP\".\"EXISTING\"", List.of("\"ID\""))).thenReturn(Optional.empty());
@@ -703,11 +722,19 @@ class DamengSnapshotChangeEventSourceTest {
         assertThat(source.getSnapshotSelect(context(), EXISTING, List.of("\"ID\""))).isEmpty();
     }
 
+    private static Configuration.Builder sharedConfiguration() {
+        return DamengTestConfiguration.configuration().with("snapshot.locking.mode", "shared");
+    }
+
     @SuppressWarnings("unchecked")
     private DamengSnapshotChangeEventSource source(Configuration configuration) {
+        final var config = new DamengConnectorConfig(configuration);
+        if (config.getSnapshotLockingMode().orElseThrow() == DamengConnectorConfig.SnapshotLockingMode.INTENT_SHARED) {
+            when(snapshotterService.getSnapshotLock()).thenReturn(new io.debezium.connector.dameng.snapshot.IntentSharedSnapshotLock());
+        }
         final MainConnectionProvidingConnectionFactory<DamengConnection> factory = mock(MainConnectionProvidingConnectionFactory.class);
         when(factory.mainConnection()).thenReturn(connection);
-        return new DamengSnapshotChangeEventSource(new DamengConnectorConfig(configuration), factory, mock(DamengDatabaseSchema.class),
+        return new DamengSnapshotChangeEventSource(config, factory, mock(DamengDatabaseSchema.class),
                 mock(EventDispatcher.class), clock, listener, mock(NotificationService.class), snapshotterService);
     }
 

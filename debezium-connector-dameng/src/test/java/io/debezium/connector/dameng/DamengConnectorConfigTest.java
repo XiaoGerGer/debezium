@@ -182,7 +182,8 @@ class DamengConnectorConfigTest {
         assertThat(defaults.getRecoveryRestartNonce()).isEmpty();
         assertThat(defaults.isRecoveryIncrementalSnapshotAutoStart()).isFalse();
         assertThat(DamengConnectorConfig.configDef().configKeys().get("recovery.incremental.snapshot.auto.start").defaultValue).isEqualTo(false);
-        assertThat(new DamengConnectorConfig(configuration().with("recovery.restart.nonce", "incident-1").build()).getRecoveryRestartNonce())
+        assertThat(new DamengConnectorConfig(configuration().with("recovery.restart.nonce", "incident-1")
+                .with("snapshot.locking.mode", "shared").build()).getRecoveryRestartNonce())
                 .isEqualTo("incident-1");
         assertThat(new DamengConnectorConfig(configuration().with("recovery.restart.nonce", "  ").build()).getRecoveryRestartNonce()).isEmpty();
         assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("recovery.restart.nonce", "new")
@@ -487,7 +488,7 @@ class DamengConnectorConfigTest {
     @ParameterizedTest
     @ValueSource(strings = { "initial", "initial_only", "no_data", "never" })
     void shouldAcceptSupportedSnapshotModes(String mode) {
-        final var config = new DamengConnectorConfig(configuration().with("snapshot.mode", mode).build());
+        final var config = new DamengConnectorConfig(configuration().with("snapshot.mode", mode).with("snapshot.locking.mode", "shared").build());
 
         assertThat(config.getSnapshotMode().getValue()).isEqualTo(mode);
     }
@@ -501,8 +502,9 @@ class DamengConnectorConfigTest {
 
     @Test
     void shouldRejectUnknownSnapshotMode() {
-        assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("snapshot.mode", "unknown").build()))
-                .isInstanceOf(IllegalArgumentException.class);
+        final var raw = configuration().with("snapshot.mode", "unknown").build();
+        assertThatThrownBy(() -> new DamengConnectorConfig(raw)).isInstanceOf(IllegalArgumentException.class);
+        assertRejectedBeforeJdbc(raw, "snapshot.mode", "Value must be one of");
     }
 
     @Test
@@ -546,7 +548,7 @@ class DamengConnectorConfigTest {
     @ParameterizedTest
     @CsvSource({ "initial,true,true,true", "initial_only,true,true,false", "no_data,true,false,true", "never,false,false,true" })
     void shouldExposeSnapshotModeCapabilities(String mode, boolean schema, boolean data, boolean stream) {
-        final var config = new DamengConnectorConfig(configuration().with("snapshot.mode", mode).build());
+        final var config = new DamengConnectorConfig(configuration().with("snapshot.mode", mode).with("snapshot.locking.mode", "shared").build());
 
         assertThat(config.getSnapshotMode().includeSchema()).isEqualTo(schema);
         assertThat(config.getSnapshotMode().includeData()).isEqualTo(data);
@@ -563,8 +565,48 @@ class DamengConnectorConfigTest {
                 .isEqualTo(DamengConnectorConfig.SnapshotLockingMode.SHARED);
         assertThat(new DamengConnectorConfig(configuration().build()).getSnapshotLockingMode())
                 .contains(DamengConnectorConfig.SnapshotLockingMode.SHARED);
+        assertThat(DamengConnectorConfig.configDef().configKeys().get("snapshot.locking.mode").defaultValue).isEqualTo("shared");
         assertThatThrownBy(() -> new DamengConnectorConfig(configuration().with("snapshot.locking.mode", "none").build()))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("snapshot locking mode");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "no_data", "never" })
+    void shouldAcceptExplicitIntentSharedForSchemaOnlySnapshots(String mode) {
+        final var config = new DamengConnectorConfig(configuration().with("snapshot.mode", mode)
+                .with("snapshot.locking.mode", "intent_shared").build());
+        assertThat(config.getSnapshotLockingMode().orElseThrow().getValue()).isEqualTo("intent_shared");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "initial", "initial_only" })
+    void shouldAcceptIntentSharedForDataSnapshots(String mode) {
+        final var raw = configuration().with("snapshot.mode", mode).with("snapshot.locking.mode", "intent_shared").build();
+        assertThat(new DamengConnectorConfig(raw).getSnapshotLockingMode())
+                .contains(DamengConnectorConfig.SnapshotLockingMode.INTENT_SHARED);
+    }
+
+    @Test
+    void shouldAcceptExplicitIntentSharedForRecovery() {
+        final var raw = configuration().with("recovery.restart.nonce", "incident-1")
+                .with("snapshot.locking.mode", "intent_shared").build();
+        assertThat(new DamengConnectorConfig(raw).getSnapshotLockingMode())
+                .contains(DamengConnectorConfig.SnapshotLockingMode.INTENT_SHARED);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "initial", "initial_only" })
+    void shouldDefaultToSharedForDataSnapshots(String mode) {
+        final var raw = configuration().with("snapshot.mode", mode).build();
+        assertThat(new DamengConnectorConfig(raw).getSnapshotLockingMode())
+                .contains(DamengConnectorConfig.SnapshotLockingMode.SHARED);
+    }
+
+    @Test
+    void shouldDefaultToSharedForRecovery() {
+        final var raw = configuration().with("recovery.restart.nonce", "incident-1").build();
+        assertThat(new DamengConnectorConfig(raw).getSnapshotLockingMode())
+                .contains(DamengConnectorConfig.SnapshotLockingMode.SHARED);
     }
 
     private static void assertRejectedBeforeJdbc(Configuration raw, String fieldName, String... expectedMessages) {

@@ -30,7 +30,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     private final long maxSqlBytes;
     private final long maxTransactions;
     private final LogMinerSpillStore store;
-    private final long recoveryBaselineLsn;
+    private final long baselineLsn;
     private long memoryBytes;
     private long bufferedRecords;
     private long spilledTransactions;
@@ -50,14 +50,14 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     }
 
     public LogMinerTransactionBuffer(long memoryLimit, long maxSqlBytes, long maxTransactions, Path spillPath, long spillLimit,
-                                     long recoveryBaselineLsn) {
+                                     long baselineLsn) {
         if (memoryLimit <= 0 || maxSqlBytes <= 0 || maxTransactions <= 0 || spillLimit <= 0) {
             throw new IllegalArgumentException("Dameng transaction buffer limits must be positive");
         }
         this.memoryLimit = memoryLimit;
         this.maxSqlBytes = maxSqlBytes;
         this.maxTransactions = maxTransactions;
-        this.recoveryBaselineLsn = recoveryBaselineLsn;
+        this.baselineLsn = baselineLsn;
         store = new LogMinerSpillStore(spillPath, spillLimit);
     }
 
@@ -166,15 +166,14 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         }
         Transaction tx = transactions.get(row.transactionId());
         if (tx == null) {
-            if (recoveryBaselineLsn > 0 && row.startLsn() == 0 && (eventType == EventType.COMMIT || eventType == EventType.XA_COMMIT ||
+            if (baselineLsn > 0 && row.startLsn() == 0 && (eventType == EventType.COMMIT || eventType == EventType.XA_COMMIT ||
                     (eventType == EventType.ROLLBACK && row.rollback() == 1 && "-1".equals(row.recordSetId())))) {
-                // A terminal marker without any post-cut row has no captured
-                // data to publish. Writers of captured tables were drained by
-                // the recovery locks before the baseline was selected.
+                // A terminal marker without any post-baseline row has no captured
+                // data to publish. Pre-baseline operations are outside this stream.
                 return;
             }
             // A mid-transaction row without a remembered start cannot be safely committed.
-            if (!initialWindow && recoveryBaselineLsn == 0 && row.startLsn() == 0 && eventType != EventType.START) {
+            if (!initialWindow && baselineLsn == 0 && row.startLsn() == 0 && eventType != EventType.START) {
                 throw new IllegalStateException("Missing cached Dameng transaction " + row.transactionId() + " at LSN " + row.lsn()
                         + "; retain archives and restart from a complete transaction boundary");
             }
@@ -187,12 +186,11 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
                 throw capacityFailure("Dameng pending transaction metadata exceeds log.mining.buffer.memory.bytes=" + memoryLimit);
             }
             tx = new Transaction(row, metadata);
-            // Recovery schema locks drained every pre-cut writer of captured tables.
-            // Thus an older transaction can contribute only post-cut captured rows,
-            // even when LogMiner omits its pre-cut START. Archive continuity is still
-            // validated on every read. V$TRX cannot be used as an allow-list here:
-            // it races with commits between choosing the LSN and reading metadata.
-            tx.recoverySuffix = recoveryBaselineLsn > 0 && eventType != EventType.START && row.startLsn() < recoveryBaselineLsn;
+            // Recovery drains captured writers; intent snapshots explicitly omit
+            // pre-baseline operations. Both reconstruct only the retained suffix,
+            // even when LogMiner omits its START. Archive continuity is still
+            // validated on every read.
+            tx.baselineSuffix = baselineLsn > 0 && eventType != EventType.START && row.startLsn() < baselineLsn;
             transactions.put(tx.id, tx);
             memoryBytes += metadata;
         }
@@ -200,7 +198,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
             reconstructionRequired = true;
         }
         tx.startLsn = Math.min(tx.startLsn, row.startLsn() > 0 ? row.startLsn() : row.lsn());
-        tx.startLsn = Math.max(tx.startLsn, recoveryBaselineLsn);
+        tx.startLsn = Math.max(tx.startLsn, baselineLsn);
         switch (eventType) {
             case COMMIT, XA_COMMIT -> {
                 tx.commitLsn = row.lsn();
@@ -214,7 +212,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
                 // savepoint, so neither START nor operation 36 alone ends a tx.
                 // Unknown marker forms remain pending rather than losing history.
                 tx.fullRollbackMarker = row.rollback() == 1 && "-1".equals(row.recordSetId());
-                if (tx.recoverySuffix && tx.fullRollbackMarker) {
+                if (tx.baselineSuffix && tx.fullRollbackMarker) {
                     tx.startRolledBack = true;
                 }
             }
@@ -415,7 +413,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         private final long metadataBytes;
         private long startLsn;
         private long commitLsn;
-        private boolean recoverySuffix;
+        private boolean baselineSuffix;
         private boolean fullRollbackMarker;
         private boolean startRolledBack;
         private boolean carried;

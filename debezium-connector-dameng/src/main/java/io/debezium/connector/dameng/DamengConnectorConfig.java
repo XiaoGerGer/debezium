@@ -88,7 +88,9 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
     public static final Field SNAPSHOT_LOCKING_MODE = Field.create(CommonConnectorConfig.SNAPSHOT_LOCKING_MODE_PROPERTY_NAME)
             .withDisplayName("Snapshot locking mode").withEnum(SnapshotLockingMode.class, SnapshotLockingMode.SHARED)
             .withWidth(Width.SHORT).withImportance(Importance.LOW)
-            .withDescription("Keep shared locks on captured tables until the complete schema and data snapshot finishes.");
+            .withDescription("Keep table locks until the snapshot finishes. Default shared drains writers and blocks DML. "
+                    + "Optional intent_shared permits concurrent DML in every snapshot and recovery mode. "
+                    + "It excludes pre-baseline operations of transactions that commit later; initial row scans are not a consistent full snapshot.");
     public static final Field CONNECTOR_ADAPTER = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "connection.adapter")
             .withDisplayName("Connector adapter").withEnum(ConnectorAdapter.class, ConnectorAdapter.LOG_MINER)
             .withWidth(Width.SHORT).withImportance(Importance.HIGH)
@@ -722,7 +724,8 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
     }
 
     public enum SnapshotLockingMode implements EnumeratedValue {
-        SHARED("shared");
+        SHARED("shared"),
+        INTENT_SHARED("intent_shared");
 
         private final String value;
 

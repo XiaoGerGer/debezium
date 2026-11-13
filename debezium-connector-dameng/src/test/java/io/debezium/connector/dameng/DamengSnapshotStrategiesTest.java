@@ -10,12 +10,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.ServiceLoader;
 
 import org.junit.jupiter.api.Test;
 
 import io.debezium.connector.dameng.snapshot.NeverSnapshotter;
 import io.debezium.connector.dameng.snapshot.SelectAllSnapshotQuery;
 import io.debezium.connector.dameng.snapshot.SharedSnapshotLock;
+import io.debezium.snapshot.spi.SnapshotLock;
 
 class DamengSnapshotStrategiesTest {
     @Test
@@ -26,6 +28,15 @@ class DamengSnapshotStrategiesTest {
         assertThat(lock.name()).isEqualTo("shared");
         assertThat(lock.tableLockingStatement(Duration.ofSeconds(5), "\"APP\".\"EVENTS\""))
                 .contains("LOCK TABLE \"APP\".\"EVENTS\" IN SHARE MODE");
+    }
+
+    @Test
+    void shouldDiscoverIntentSharedLockAndLockTheNamedTable() {
+        final var lock = ServiceLoader.load(SnapshotLock.class).stream().map(ServiceLoader.Provider::get)
+                .filter(provider -> provider.name().equals("intent_shared")).findFirst().orElseThrow();
+        lock.configure(Map.of());
+        assertThat(lock.tableLockingStatement(Duration.ofSeconds(5), "\"APP\".\"EVENTS\""))
+                .contains("LOCK TABLE \"APP\".\"EVENTS\" IN INTENT SHARE MODE");
     }
 
     @Test

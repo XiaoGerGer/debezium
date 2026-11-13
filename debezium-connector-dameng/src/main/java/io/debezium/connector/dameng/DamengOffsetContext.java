@@ -35,6 +35,8 @@ public final class DamengOffsetContext extends CommonOffsetContext<SourceInfo> {
     public static final String COMPATIBILITY_SIGNATURE_KEY = "compatibility_signature";
     public static final String RECOVERY_NONCE_KEY = "recovery_nonce";
     public static final String RECOVERY_BASELINE_LSN_KEY = "recovery_baseline_lsn";
+    public static final String SNAPSHOT_BASELINE_LSN_KEY = "snapshot_baseline_lsn";
+    private long snapshotBaselineLsn;
     private final Schema sourceInfoSchema;
     private String captureScope;
     private String captureScopeManifest;
@@ -82,6 +84,9 @@ public final class DamengOffsetContext extends CommonOffsetContext<SourceInfo> {
         result.put(CAPTURE_SCOPE_MANIFEST_KEY, captureScopeManifest);
         if (captureScopeGeneration != null) {
             result.put(CAPTURE_SCOPE_GENERATION_KEY, captureScopeGeneration);
+        }
+        if (snapshotBaselineLsn > 0) {
+            result.put(SNAPSHOT_BASELINE_LSN_KEY, snapshotBaselineLsn);
         }
         if (recoveryNonce != null) {
             result.put(RECOVERY_NONCE_KEY, recoveryNonce);
@@ -152,6 +157,18 @@ public final class DamengOffsetContext extends CommonOffsetContext<SourceInfo> {
 
     public long getRecoveryBaselineLsn() {
         return recoveryBaselineLsn;
+    }
+
+    /** Lower bound for reconstruction, independent of the current locking configuration. */
+    public long getTransactionBaselineLsn() {
+        return Math.max(snapshotBaselineLsn, recoveryBaselineLsn);
+    }
+
+    void setSnapshotBaselineLsn(long baselineLsn) {
+        if (baselineLsn <= 0) {
+            throw new ConnectException("Invalid Dameng snapshot baseline LSN");
+        }
+        snapshotBaselineLsn = baselineLsn;
     }
 
     public void setRecoveryBaseline(String nonce, long baselineLsn) {
@@ -325,6 +342,12 @@ public final class DamengOffsetContext extends CommonOffsetContext<SourceInfo> {
                 context.setRecoveryBaseline((String) offset.get(RECOVERY_NONCE_KEY), number(offset.get(RECOVERY_BASELINE_LSN_KEY)));
                 if (lsn < context.recoveryBaselineLsn || commitLsn < context.recoveryBaselineLsn) {
                     throw new ConnectException("Stored Dameng offset precedes its recovery baseline");
+                }
+            }
+            if (offset.containsKey(SNAPSHOT_BASELINE_LSN_KEY)) {
+                context.setSnapshotBaselineLsn(number(offset.get(SNAPSHOT_BASELINE_LSN_KEY)));
+                if (lsn < context.snapshotBaselineLsn || commitLsn < context.snapshotBaselineLsn) {
+                    throw new ConnectException("Stored Dameng offset precedes its snapshot baseline");
                 }
             }
             return context;

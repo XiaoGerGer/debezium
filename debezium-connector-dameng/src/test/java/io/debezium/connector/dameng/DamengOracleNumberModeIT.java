@@ -108,7 +108,7 @@ class DamengOracleNumberModeIT extends AbstractAsyncEngineConnectorTest {
                 .with("table.include.list", "SYSDBA\\.DBZ_ORA_NUM(_LATE)?")
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
-                .with("snapshot.mode", "initial")
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared")
                 .with("decimal.handling.mode", decimalMode)
                 .with("poll.interval.ms", 100)
                 .with("include.schema.changes", false)

@@ -96,7 +96,7 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
                 .with("table.include.list", SCHEMA + "\\." + table)
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", temporaryDirectory.resolve("schema-history.dat").toString())
-                .with("snapshot.mode", "initial")
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared")
                 .with("poll.interval.ms", 100)
                 .with("include.schema.changes", false)
                 .with("tombstones.on.delete", false)
@@ -355,7 +355,7 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
 
         @Test
         void shouldStopAfterAnInitialOnlySnapshot() throws Exception {
-            config = config.edit().with("snapshot.mode", "initial_only").build();
+            config = config.edit().with("snapshot.mode", "initial_only").with("snapshot.locking.mode", "shared").build();
             startAndVerifySnapshot();
             waitForSnapshotToBeCompleted("dameng", "dameng");
 

@@ -113,7 +113,7 @@ class DamengLexicalSettingsIT extends AbstractAsyncEngineConnectorTest {
                 .with("table.include.list", "SYSDBA\\.DBZ_LEXICAL")
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", temporaryDirectory.resolve("history.dat").toString())
-                .with("snapshot.mode", "initial")
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared")
                 .with("poll.interval.ms", 100)
                 .with("include.schema.changes", false)
                 .with("tombstones.on.delete", false)

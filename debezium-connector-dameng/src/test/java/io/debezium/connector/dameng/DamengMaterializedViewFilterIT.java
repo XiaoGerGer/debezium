@@ -95,7 +95,7 @@ class DamengMaterializedViewFilterIT extends AbstractAsyncEngineConnectorTest {
                 .with("schema.include.list", SCHEMA)
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
-                .with("snapshot.mode", "initial").with("poll.interval.ms", 100).with("offset.flush.interval.ms", 100)
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("poll.interval.ms", 100).with("offset.flush.interval.ms", 100)
                 .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
         // No table include/exclude pattern: MTAB$_ and MLOG$_ match the configured schema.
         startEngine();

@@ -68,7 +68,7 @@ class DamengPrimaryStandbyIT extends AbstractAsyncEngineConnectorTest {
                     .with("database.socket.timeout.ms", 15_000).with("database.query.timeout.ms", 10_000)
                     .with("schema.history.internal", FileSchemaHistory.class.getName())
                     .with("schema.history.internal.file.filename", directory.resolve("snapshot-history.dat").toString())
-                    .with("snapshot.mode", "initial").with("snapshot.max.duration.ms", 120_000)
+                    .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("snapshot.max.duration.ms", 120_000)
                     .with("max.queue.size", 64).with("max.batch.size", 32)
                     .with("poll.interval.ms", 100).with("offset.flush.interval.ms", 100)
                     .with("heartbeat.interval.ms", 100).with("retriable.restart.connector.wait.ms", 200)
@@ -142,7 +142,7 @@ class DamengPrimaryStandbyIT extends AbstractAsyncEngineConnectorTest {
                     .with("database.socket.timeout.ms", 15_000).with("database.query.timeout.ms", 10_000)
                     .with("schema.history.internal", FileSchemaHistory.class.getName())
                     .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
-                    .with("snapshot.mode", "initial").with("poll.interval.ms", 100).with("offset.flush.interval.ms", 100)
+                    .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("poll.interval.ms", 100).with("offset.flush.interval.ms", 100)
                     .with("heartbeat.interval.ms", 100).with("retriable.restart.connector.wait.ms", 200)
                     .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
             try {

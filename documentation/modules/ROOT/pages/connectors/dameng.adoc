@@ -24,7 +24,7 @@ Connector 通过 JDBC 读取结构和快照，通过 `DBMS_LOGMNR` 挖掘归档 
 部署前先确认四点：
 
 * 支持 `COMPATIBLE_MODE=0`、`2`、`4` 和 `7`，单个 Connector 只运行一个 Task。
-* 默认 `snapshot.mode=no_data`，不扫描存量行；需要首次全量时设置 `initial`。
+* 默认 `snapshot.mode=no_data`，不扫描存量行；需要首次全量时设置 `snapshot.mode=initial`，锁模式保持默认 `shared`。
 * 交付语义为至少一次，重启可能重发未确认的事件，下游需支持幂等处理。
 * 浮点精度、行外 LOB 和 LOCAL TIME ZONE 有已知限制，见 <<dameng-data-types,类型映射>>。
 
@@ -35,7 +35,7 @@ Connector 通过 JDBC 读取结构和快照，通过 `DBMS_LOGMNR` 挖掘归档 
 
 [source,text]
 ----
-初始快照：共享表锁 → 选择 LSN → 读取结构和可选存量行 → 释放锁
+初始快照：表锁（默认共享锁，可显式选择 IS） → 选择 LSN → 读取结构和可选存量行 → 释放锁
 持续采集：归档 REDO → LogMiner → 事务缓存 → 历史结构解码 → Kafka
 增量快照：主键分块读取 + 源表信号水位 + CDC 去重
 ----
@@ -524,14 +524,42 @@ restart 不会修复缺档、不支持 DDL 或资源上限，先按故障章节�
 未完成的初始快照可能在恢复时重新执行并重发已经输出的行。
 Connector 先发现并锁住捕获表，选择 `V$RLOG.CUR_LSN`，读取结构，按模式决定是否扫描行。
 选择 LSN 后再次检查匹配过滤器的新表；如发现新表，补锁并重新选择 LSN，再检查一次。最终检查之后的新表通过 DDL 流处理。
-整个快照事务结束并成功 rollback 后才释放共享表锁。此处 rollback 用于结束只读快照事务，不是回滚业务事务。
-普通查询不使用 Oracle `AS OF SCN`；一致性依赖这些锁，因此 `no_data` 建立结构基线也会短暂锁表。
+整个快照事务结束并成功 rollback 后才释放表锁。此处 rollback 用于结束只读快照事务，不是回滚业务事务。
+普通查询不使用 Oracle `AS OF SCN`；默认 `shared` 使用共享表锁，排空已有写事务，并阻止持锁期间的新写入。显式选择 `intent_shared` 使用 IS 锁，允许普通业务写入。
 
 `snapshot.max.duration.ms` 默认 10 分钟，覆盖锁等待、结构/数据读取和队列阻塞。
 超时中断快照并请求 JDBC abort，Task 失败，不会通过跳过表继续；实际断开会话及释放锁依赖驱动和数据库。
 主备模式在完成标记之前再次核对主库身份；切换打断初始快照后在新主库重新快照。
-当前仅允许 `snapshot.locking.mode=shared`、`snapshot.max.threads=1`。
+`snapshot.max.threads` 仅允许 `1`。`snapshot.locking.mode` 默认 `shared`；显式选择的 `shared` 或 `intent_shared` 同时用于 `initial`、`initial_only`、`no_data`（含旧别名 `never`）以及恢复重建。
 `snapshot.lock.timeout.ms` 的继承字段没有接入达梦锁语句，实际应结合 `database.query.timeout.ms` 和总快照预算设置超时。
+
+==== 使用意向共享锁
+
+若需要使用 IS 锁初始化结构并允许普通业务写入，须显式配置：
+
+[source,json]
+----
+{
+  "snapshot.mode": "no_data",
+  "snapshot.locking.mode": "intent_shared"
+}
+----
+
+此模式逐表执行 `LOCK TABLE ... IN INTENT SHARE MODE`，全部捕获表锁定后选择统一 LSN，并在读取、持久化完整结构和对象身份后随快照事务 rollback 释放锁。
+IS 锁允许并发 `INSERT`、`UPDATE`、`DELETE`，也允许 `CREATE INDEX`；修改表定义等冲突操作会等待锁释放。
+IS 仍然可能等待其他冲突锁，不能承诺对业务完全没有影响。
+主备模式仍在 PRIMARY 加锁，并等待 STANDBY 回放到所选边界。
+
+IS 不会排空初始化前已开始的写事务。采集边界按操作 LSN 定义：仅处理初始 LSN 起的日志，不保证完整包含所有在初始化后提交的事务。
+例如同一事务在基线前插入 A、基线后插入 B，然后提交，可能只输出 B。
+只在基线前写入、基线后提交的事务可能完全没有数据事件；跨越边界的事务元数据计数也只涵盖实际采集到的事件。
+Connector 将这个下界作为 `snapshot_baseline_lsn` 保存到 offset，重启及跨窗口重建均保留，避免回退到缺少对应历史结构的日志。
+更改锁模式不会补回之前遗漏的操作；后续增量快照可以回补仍存在的当前行，无法还原历史更新、已删除行或原始事务。
+
+`initial`、`initial_only` 及恢复流程同样遵守显式锁配置，不会自动切换为 `shared`。
+选择 `initial + intent_shared` 时，存量数据由普通 `SELECT` 读取，不是所选 LSN 时刻的闪回视图；扫描期间的并发增删改可能造成快照与增量重叠、遗漏或顺序异常，不提供一致全量快照保证。
+恢复使用 IS 锁也不会恢复边界之前的操作；`recovery.incremental.snapshot.auto.start` 仍单独控制是否安排当前行回补。
+`snapshot.locking.mode` 控制初始快照；后续扩大采集范围的结构准备仍使用 `shared`，保留排空相关写事务的保证。
 
 === 快照范围与采集范围
 
@@ -1124,7 +1152,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |===
 |参数 |默认值 |用途与限制
 |`snapshot.mode` |`no_data` |支持 initial、initial_only、no_data 和旧别名 never；详见快照章节。
-|`snapshot.locking.mode` |`shared` |共享锁保持到完整快照事务结束，不能配置 none。
+|`snapshot.locking.mode` |`shared` |所有初始快照及恢复流程遵守显式锁模式。`shared` 阻止持锁期间的 DML；`intent_shared` 允许 DML，但可能截断跨边界事务，且全量扫描不保证一致。不支持 `none`。
 |`snapshot.max.duration.ms` |`600000` |正整数，初始快照总预算，含锁、查询和队列等待；恢复 nonce 的结构基线也受此预算限制。
 |`snapshot.max.threads` |`1` |必须为 1，其他值拒绝。
 |`snapshot.include.collection.list` |所有已选中的表 |初始/恢复中的数据快照表正则列表，不改变 streaming 范围。
@@ -1302,7 +1330,7 @@ Worker 认证、业务 producer 认证和 history 客户端认证分别核对，
 `source.lsn` 可能被长事务固定；本地临时缓存不参与重启恢复。缺档、history 缺失或身份不匹配时停止，`no_data` 不会跳过故障位置。
 
 升级前保存 REST 配置、Worker 支持的 `GET /connectors/{name}/offsets` 结果和旧镜像。
-缺失 `compatibility_signature` 或 `capture_scope` 的旧 offset 不能手工补造；通常用新 Connector 名称、`topic.prefix`、history Topic 和显式 `snapshot.mode=initial` 建立基线。
+缺失 `compatibility_signature` 或 `capture_scope` 的旧 offset 不能手工补造；通常用新 Connector 名称、`topic.prefix`、history Topic，并显式设置 `snapshot.mode=initial`、`snapshot.locking.mode=shared` 建立基线。
 原生模式的旧 offset 若未在兼容签名中记录 `NUMBER_MODE`，也须建立新的采集基线。
 回滚镜像前也须确认旧插件能读取新 offset/history 格式。
 
@@ -1313,6 +1341,7 @@ Worker 认证、业务 producer 认证和 history 客户端认证分别核对，
 [source,json]
 ----
 {
+  "snapshot.locking.mode": "shared",
   "recovery.restart.nonce": "incident-20261105-01",
   "recovery.incremental.snapshot.auto.start": "false"
 }
@@ -1375,7 +1404,7 @@ open history 最多 128 条；锚点丢失、时间戳排序歧义、应用 LSN 
 [cols="2,5",options="header"]
 |===
 |连接 |职责
-|主库（`loginMode=1`） |信号表创建、命令和水位 INSERT/DELETE、heartbeat.action.query、初始快照共享锁。
+|主库（`loginMode=1`） |信号表创建、命令和水位 INSERT/DELETE、heartbeat.action.query、初始快照表锁（共享锁或 IS 锁）。
 |备库（`loginMode=2`） |LogMiner、结构和对象编号读取、初始与增量快照查询。
 |===
 
@@ -1433,17 +1462,17 @@ Exporter 只导出已配置的 JMX 属性，Grafana 使用导出指标和 record
 
 大多数计数/时间随指标实例或 JMX reset 清零；位置从实际状态重新采样。阶段统计不构成完整 CPU profile，未单独统计解析 CPU 或等待归档的总时长。
 
-=== 快照共享锁指标与日志
+=== 快照表锁指标与日志
 
 当前锁指标为 `SnapshotLockWaiting`、`SnapshotLocksHeld`、`LockedTableCount`、`SnapshotLockWaitDurationMillis`、`SnapshotMaxLockWaitDurationMillis`、`SnapshotLockHoldDurationMillis`。
-持锁时间从第一把共享锁成功开始，包含后续锁等待、结构/行读取、队列等待和 rollback 执行。获取耗时覆盖整个 LOCK TABLE JDBC 调用，不是纯数据库阻塞时间，两种耗时不能相加。
+持锁时间从第一把表锁成功开始，包含后续锁等待、结构/行读取、队列等待和 rollback 执行。获取耗时覆盖整个 LOCK TABLE JDBC 调用，不是纯数据库阻塞时间，两种耗时不能相加。
 成功 rollback 后当前值立即归零，最近结果通过 `LastSnapshotLockStatisticsAvailable`、`LastSnapshotLockedTableCount`、`LastSnapshotLockWaitDurationMillis`、`LastSnapshotMaxLockWaitDurationMillis`、`LastSnapshotLockHoldDurationMillis` 保留五分钟或直到下次快照。
 之后 availability=false、结果值归零；Grafana 应据 availability 显示“无近期结果”，不是“持锁耗时为零”。Prometheus 独立保留已采样历史。
 reset 清除完成结果，但保留尚未释放事务的活动锁状态；重启会清除内存中的最近结果。
 
 日志在每次加锁前 INFO 打印表名，成功后打印耗时，事务 rollback 成功后打印释放表数、累计/最大获取耗时及持锁时长。
 获取失败和 rollback 失败会 WARN；rollback 失败明确标记释放未确认，不发布成功完成结果，清理前保留最后观察的状态。
-增量快照不使用此类贯穿全表快照的共享锁，因此不能用这些指标度量增量查询全部数据库锁行为。
+增量快照不使用此类贯穿初始快照的表锁，因此不能用这些指标度量增量查询全部数据库锁行为。
 
 [id="dameng-incremental-snapshot-monitoring"]
 === 增量快照进度与性能指标
@@ -1675,7 +1704,7 @@ END;
 |现象 |优先核查 |处理原则
 |插件列表没有达梦 |plugin.path、解压层级、驱动/依赖、所有 Worker 是否更新 |先让完整类名出现在 connector-plugins，再创建任务。
 |Included connector type 不匹配 request type |validate URL 是否写了 dameng 简称；POST/PUT 对象层级 |使用完整类名，POST 包含 name/config，PUT config 只交配置对象。
-|Task RUNNING 但没有已有数据 |snapshot.mode、是否已有 offset、是否观察正确 Topic |默认 no_data 不扫描存量；需要时显式 initial 或增量快照，不删除 offset 试错。
+|Task RUNNING 但没有已有数据 |snapshot.mode、是否已有 offset、是否观察正确 Topic |默认 no_data 不扫描存量；需要时显式 initial + shared 或增量快照，不删除 offset 试错。
 |include 中的表没消息 |启动表清单/WARN、账号可见性和 SELECT、正则及大小写、事务是否提交 |先用同一 CDC 账号查表及元数据。不可见表不会因写在 include 中就自动获得权限。
 |ARCH_LSN 很大，source.lsn 不前进 |ScannedUpperLsn、OldestReplayLsn、OpenTransactions |长事务可能固定安全起点；分别判断扫描积压和恢复跨度，不把两个 LSN 直接当处理速度。
 |数据库有变化但 LatestArchivedLsn 未变 |归档策略、实际归档文件、磁盘空间 |只有已归档日志可挖；心跳和扩大窗口不会强制保证归档完成。

@@ -99,7 +99,7 @@ class DamengStandbyIT extends AbstractAsyncEngineConnectorTest {
                 stopConnector();
                 consumedLines.clear();
                 execute(environment, "INSERT INTO SYSDBA." + table + " VALUES(104,'explicitly skipped')");
-                final var recovery = config.edit().with("recovery.restart.nonce", "standby-latest").build();
+                final var recovery = config.edit().with("recovery.restart.nonce", "standby-latest").with("snapshot.locking.mode", "shared").build();
                 startEngine(recovery);
                 Awaitility.await().atMost(Duration.ofSeconds(45)).ignoreExceptions().untilAsserted(() -> {
                     final var offset = readLastCommittedOffset(recovery, new DamengPartition("dameng").getSourcePartition());
@@ -243,7 +243,7 @@ class DamengStandbyIT extends AbstractAsyncEngineConnectorTest {
             final String signal = table + "_SIGNAL";
             execute(environment, "CREATE TABLE SYSDBA." + table + " (ID INT PRIMARY KEY, LABEL VARCHAR(100))",
                     "INSERT INTO SYSDBA." + table + " VALUES(1,'initial')", "INSERT INTO SYSDBA." + table + " VALUES(2,'initial')");
-            final var config = configuration(environment, table).with("snapshot.mode", "initial")
+            final var config = configuration(environment, table).with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared")
                     .with("signal.data.collection", "SYSDBA." + signal)
                     .with("incremental.snapshot.chunk.size", 1).with("incremental.snapshot.watermarking.strategy", strategy).build();
             try {

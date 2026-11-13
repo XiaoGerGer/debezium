@@ -172,7 +172,7 @@ class DamengRecoveryTest {
 
     @Test
     void shouldSeedAutomaticSnapshotOnceAndPersistItsProgress() throws Exception {
-        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("snapshot.locking.mode", "shared")
                 .with("recovery.restart.nonce", "first").with("signal.data.collection", "APP.SIGNAL")
                 .with("recovery.incremental.snapshot.auto.start", true).build());
         final var recovery = recovery(config);
@@ -189,7 +189,7 @@ class DamengRecoveryTest {
 
     @Test
     void shouldRejectAutomaticBackfillWithoutKeysBeforePersistingAnything() {
-        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("snapshot.locking.mode", "shared")
                 .with("recovery.restart.nonce", "first").with("signal.data.collection", "APP.SIGNAL")
                 .with("recovery.incremental.snapshot.auto.start", true).build());
         final var noKey = TABLE.edit().setPrimaryKeyNames(List.of()).create();
@@ -209,7 +209,7 @@ class DamengRecoveryTest {
     }
 
     private static DamengConnectorConfig config(String nonce) {
-        return new DamengConnectorConfig(DamengTestConfiguration.configuration().with("recovery.restart.nonce", nonce).build());
+        return new DamengConnectorConfig(DamengTestConfiguration.configuration().with("snapshot.locking.mode", "shared").with("recovery.restart.nonce", nonce).build());
     }
 
     private static Table table(String name) {

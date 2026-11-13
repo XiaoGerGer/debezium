@@ -87,7 +87,7 @@ class DamengBitmapJoinIndexFilterIT extends AbstractAsyncEngineConnectorTest {
                 .with("schema.include.list", SCHEMA)
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
-                .with("snapshot.mode", "initial").with("poll.interval.ms", 100).with("offset.flush.interval.ms", 100)
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("poll.interval.ms", 100).with("offset.flush.interval.ms", 100)
                 .with("include.schema.changes", false).with("tombstones.on.delete", false).build();
         // Select the whole schema so the built-in filter must exclude the actual BMJ$_ table.
         startEngine();

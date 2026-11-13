@@ -51,6 +51,31 @@ class DamengOffsetContextTest {
         assertThatThrownBy(() -> new DamengOffsetContext.Loader(config).load(damaged)).hasMessageContaining("precedes");
     }
 
+    @Test
+    void shouldRetainSnapshotFloorOnRestartEvenWithDefaultLockingMode() {
+        final var stored = new HashMap<String, Object>(new DamengOffsetContext(config, 120).getOffset());
+        stored.put("snapshot_baseline_lsn", "100");
+        final var restored = new DamengOffsetContext.Loader(config).load(stored);
+        assertThat(restored.getOffset().get("snapshot_baseline_lsn")).isEqualTo(100L);
+        assertThat(restored.getRecoveryNonce()).isNull();
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = { -1, 0, 121 })
+    void shouldRejectInvalidSnapshotFloor(long baseline) {
+        final var stored = new HashMap<String, Object>(new DamengOffsetContext(config, 120).getOffset());
+        stored.put("snapshot_baseline_lsn", baseline);
+        assertThatThrownBy(() -> new DamengOffsetContext.Loader(config).load(stored)).hasMessageContaining("snapshot baseline");
+    }
+
+    @Test
+    void shouldRejectACommitPositionBeforeTheSnapshotFloor() {
+        final var stored = new HashMap<String, Object>(new DamengOffsetContext(config, 120).getOffset());
+        stored.put("snapshot_baseline_lsn", 100L);
+        stored.put("commit_lsn", 99L);
+        assertThatThrownBy(() -> new DamengOffsetContext.Loader(config).load(stored)).hasMessageContaining("snapshot baseline");
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = { false, true })
     void shouldLoadNumericAndStringOffsets(boolean strings) {

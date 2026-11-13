@@ -77,7 +77,7 @@ class DamengRestartNonceIT extends AbstractAsyncEngineConnectorTest {
                 .with("signal.data.collection", qualified(signal)).with("incremental.snapshot.chunk.size", 1)
                 .with("schema.history.internal", FileSchemaHistory.class.getName())
                 .with("schema.history.internal.file.filename", directory.resolve("history.dat").toString())
-                .with("snapshot.mode", "initial").with("poll.interval.ms", 100).with("heartbeat.interval.ms", 100)
+                .with("snapshot.mode", "initial").with("snapshot.locking.mode", "shared").with("poll.interval.ms", 100).with("heartbeat.interval.ms", 100)
                 .with("offset.flush.interval.ms", 100).with("include.schema.changes", false).with("tombstones.on.delete", false).build();
     }
 
@@ -100,9 +100,11 @@ class DamengRestartNonceIT extends AbstractAsyncEngineConnectorTest {
         }
     }
 
-    @Test
-    void shouldSkipDataByDefaultAndResumeSameNonceIncludingAfterRemovingIt() throws Exception {
-        config = config.edit().with("recovery.restart.nonce", "first").build();
+    @ParameterizedTest
+    @ValueSource(strings = { "shared", "intent_shared" })
+    void shouldSkipDataByDefaultAndResumeSameNonceIncludingAfterRemovingIt(String lock) throws Exception {
+        config = config.edit().with("recovery.restart.nonce", "first")
+                .with("snapshot.locking.mode", lock).build();
         startAndWait();
         assertNoData();
         insert(2);
@@ -127,8 +129,10 @@ class DamengRestartNonceIT extends AbstractAsyncEngineConnectorTest {
         assertThat(third.sourceOffset().get("recovery_baseline_lsn")).isEqualTo(baseline);
     }
 
-    @Test
-    void shouldPersistBaselineBeforeTheFirstBusinessRecordAndSurviveLostOffsetCheckpoint() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = { "shared", "intent_shared" })
+    void shouldPersistBaselineBeforeTheFirstBusinessRecordAndSurviveLostOffsetCheckpoint(String lock) throws Exception {
+        config = config.edit().with("snapshot.locking.mode", lock).build();
         startAndWait();
         final var old = nextData();
         stopConnector();
